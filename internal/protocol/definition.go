@@ -340,6 +340,27 @@ func (spec *DefinitionSpec) validateAcceptance() error {
 	return nil
 }
 
+// RequiredEnvNames is the union of every roster role's env allowlist, sorted
+// and deduplicated. Claim eligibility requires this set to be a subset of the
+// worker's advertised env names, so a job missing a variable fails at claim,
+// not N phases deep (R17, KTD10).
+func (spec *DefinitionSpec) RequiredEnvNames() []string {
+	seen := make(map[string]bool)
+	var names []string
+	for _, role := range spec.Roster {
+		for _, name := range role.Env {
+			name = strings.TrimSpace(name)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func builtinGateNames() []string {
 	names := make([]string, 0, len(builtinGates))
 	for name := range builtinGates {

@@ -24,6 +24,22 @@ const (
 	// uptime resumed is a dead worker (R5).
 	MissedHeartbeatsBeforeSweep = 3
 
+	// SweeperUptimeGap is the tick-to-tick gap beyond which the sweeper
+	// concludes the server itself was down (sleep, suspend) and resets every
+	// missed-heartbeat count. Misses are therefore only ever counted against
+	// server uptime, so whole-machine sleep never sweeps intact work (R5).
+	SweeperUptimeGap = 2 * HeartbeatInterval
+
+	// WorkerLivenessWindow is how stale a worker's last observed heartbeat may
+	// be while the worker still counts as live for claim eligibility (R4).
+	// Registration and attempt heartbeats both refresh it (KTD12).
+	WorkerLivenessWindow = 3 * HeartbeatInterval
+
+	// EmptyClaimTTL is how long an empty claim answer stays replayable under
+	// its request id. Past it the row is deleted (by sweep, or lazily by a
+	// replay) and the same request id may claim afresh (R4).
+	EmptyClaimTTL = time.Minute
+
 	// ParseBudgetPerEmission is how many times a single envelope emission may
 	// be re-prompted for a parse failure before the phase fails. Every
 	// gate-corrected emission re-enters parsing with a fresh budget of this
@@ -76,4 +92,14 @@ const (
 	// attempt-local JSONL; the SQLite copy is capped so a runaway emission
 	// cannot bloat the control-plane database (R7, R15).
 	MaxInvalidEnvelopeBytes = 64 << 10
+
+	// MaxRequestBodyBytes bounds every HTTP request body the control plane
+	// will read. Larger bodies fail with 413 before any handler logic (R20).
+	MaxRequestBodyBytes = 1 << 20
+
+	// MaxResultBytes caps an attempt completion's result payload.
+	MaxResultBytes = 64 << 10
+
+	// MaxErrorBytes caps an attempt completion's error text.
+	MaxErrorBytes = 16 << 10
 )

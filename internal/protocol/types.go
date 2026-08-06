@@ -125,14 +125,18 @@ type Run struct {
 
 // Job is the fan-out unit: one target repository of one run (R3). Failure,
 // retry, and cancellation happen here, never on the run.
+// CancellationRequested is the durable cancel flag for an active job: the
+// operator sets it, the worker observes it on its next heartbeat, and only
+// the worker performs the transition (R5).
 type Job struct {
-	ID         string    `json:"id"`
-	RunID      string    `json:"run_id"`
-	Repository string    `json:"repository"`
-	BaseSHA    string    `json:"base_sha"`
-	State      string    `json:"state"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID                    string    `json:"id"`
+	RunID                 string    `json:"run_id"`
+	Repository            string    `json:"repository"`
+	BaseSHA               string    `json:"base_sha"`
+	State                 string    `json:"state"`
+	CancellationRequested bool      `json:"cancellation_requested"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // Attempt is one worker execution of a job. Retry always creates a new
@@ -257,6 +261,73 @@ type WorkerRegistration struct {
 	EnvNames          []string            `json:"env_names"`
 	Runtimes          []RuntimeCapability `json:"runtimes"`
 	RetainedWorktrees []RetainedWorktree  `json:"retained_worktrees"`
+}
+
+// Worker is the control plane's record of a registered worker. ActiveCount
+// is computed (attempts currently leased by this worker), never stored.
+type Worker struct {
+	ID            string              `json:"id"`
+	Name          string              `json:"name"`
+	WorkerVersion string              `json:"worker_version"`
+	Capacity      int                 `json:"capacity"`
+	ActiveCount   int                 `json:"active_count"`
+	EnvNames      []string            `json:"env_names"`
+	Runtimes      []RuntimeCapability `json:"runtimes"`
+	RegisteredAt  time.Time           `json:"registered_at"`
+	LastHeartbeat time.Time           `json:"last_heartbeat"`
+}
+
+// ClaimRequest is one idempotent claim (R4). RequestID dedupes the request;
+// LeaseToken is the fencing token, stored server-side only as its SHA-256
+// digest. Replaying the same pair returns the identical answer; the same
+// RequestID with a different token is a conflict.
+type ClaimRequest struct {
+	RequestID  string `json:"request_id"`
+	LeaseToken string `json:"lease_token"`
+}
+
+// Claim is the answer to a successful claim: the leased attempt, its job,
+// and the run's frozen snapshot and parameters the worker executes against
+// (R2). An empty claim — nothing eligible — is the absence of a Claim, not a
+// zero value.
+type Claim struct {
+	Attempt    Attempt           `json:"attempt"`
+	Job        Job               `json:"job"`
+	Snapshot   string            `json:"snapshot"`
+	Parameters map[string]string `json:"parameters,omitempty"`
+}
+
+// StartAttemptRequest moves a claimed attempt preparing -> running, fenced by
+// the lease token (R6). RuntimeName/RuntimeVersion record the probed agent
+// CLI for the attempt's trace (KTD4).
+type StartAttemptRequest struct {
+	LeaseToken     string `json:"lease_token"`
+	RuntimeName    string `json:"runtime_name,omitempty"`
+	RuntimeVersion string `json:"runtime_version,omitempty"`
+}
+
+// HeartbeatRequest renews an attempt's lease (R5).
+type HeartbeatRequest struct {
+	LeaseToken string `json:"lease_token"`
+}
+
+// HeartbeatResponse is the renewal answer. Cancellation rides here: the
+// server never dials a worker (R5).
+type HeartbeatResponse struct {
+	LeaseExpiresAt        time.Time `json:"lease_expires_at"`
+	CancellationRequested bool      `json:"cancellation_requested"`
+}
+
+// CompleteAttemptRequest records an attempt's terminal outcome, fenced by the
+// lease token (R6). State must be a terminal attempt state the worker may
+// declare: accepted, accepted_unpublished, failed, or cancelled — never lost,
+// which only sweep assigns. A replay with the original token returns the
+// stored outcome unchanged.
+type CompleteAttemptRequest struct {
+	LeaseToken string `json:"lease_token"`
+	State      string `json:"state"`
+	Result     string `json:"result,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // Event is one trace event, dual-written to attempt-local JSONL and streamed
