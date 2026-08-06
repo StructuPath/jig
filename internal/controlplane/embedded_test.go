@@ -60,7 +60,12 @@ func admitDirectFixture(t *testing.T, store *Store, repoPath string) protocol.Jo
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := store.admitRun(ctx, definition.ID, definition.Generation, directSnapshot, nil, targets)
+	view, err := store.admitRun(ctx, preparedInvocation{
+		definitionID: definition.ID,
+		generation:   definition.Generation,
+		snapshot:     directSnapshot,
+		targets:      targets,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

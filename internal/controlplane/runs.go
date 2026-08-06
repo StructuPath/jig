@@ -64,11 +64,39 @@ type RunView struct {
 	Jobs []protocol.Job `json:"jobs"`
 }
 
+// preparedInvocation is an invocation whose every outside-world question has
+// already been answered — the definition read, the prompt composed, the base
+// SHAs pinned — leaving nothing but rows to write. It exists so admission can
+// be split across a slow half (network, no locks held) and a fast half (one
+// transaction), which is what lets a trigger commit its occurrence and its run
+// atomically without holding a write transaction open across `git ls-remote`
+// (U6).
+type preparedInvocation struct {
+	definitionID string
+	generation   int
+	snapshot     string
+	parameters   map[string]string
+	targets      []protocol.RunTarget
+}
+
 // InvokeDefinition admits one run: it freezes the definition's current
 // source, composes and freezes the prompt, pins a base SHA per target, and
 // fans out one job per target (R2, R3, KTD9).
 func (s *Store) InvokeDefinition(ctx context.Context, input RunInvocation) (RunView, error) {
-	var zero RunView
+	prepared, err := s.prepareInvocation(ctx, input)
+	if err != nil {
+		return RunView{}, err
+	}
+	return s.admitRun(ctx, prepared)
+}
+
+// prepareInvocation performs every step of admission that can fail for a
+// reason outside the database: the definition must exist, the prompt halves
+// must be unambiguous and composable, and each target must normalize and pin.
+// It touches the network (KTD9's one live-ref moment) and therefore never
+// runs inside a transaction.
+func (s *Store) prepareInvocation(ctx context.Context, input RunInvocation) (preparedInvocation, error) {
+	var zero preparedInvocation
 	definition, err := s.Definition(ctx, strings.TrimSpace(input.DefinitionID))
 	if err != nil {
 		return zero, err
@@ -81,7 +109,13 @@ func (s *Store) InvokeDefinition(ctx context.Context, input RunInvocation) (RunV
 	if err != nil {
 		return zero, err
 	}
-	return s.admitRun(ctx, definition.ID, definition.Generation, definition.Source, parameters, targets)
+	return preparedInvocation{
+		definitionID: definition.ID,
+		generation:   definition.Generation,
+		snapshot:     definition.Source,
+		parameters:   parameters,
+		targets:      targets,
+	}, nil
 }
 
 // ReadmitRunAtHead is the KTD9 escape hatch: a new run carrying the ORIGINAL
@@ -107,8 +141,13 @@ func (s *Store) ReadmitRunAtHead(ctx context.Context, runID string) (RunView, er
 	if err != nil {
 		return zero, err
 	}
-	return s.admitRun(ctx, previous.DefinitionID, previous.DefinitionGeneration,
-		previous.Snapshot, previous.Parameters, resolved)
+	return s.admitRun(ctx, preparedInvocation{
+		definitionID: previous.DefinitionID,
+		generation:   previous.DefinitionGeneration,
+		snapshot:     previous.Snapshot,
+		parameters:   previous.Parameters,
+		targets:      resolved,
+	})
 }
 
 // freezeParameters builds the run's frozen parameter map. A caller may pass
@@ -159,7 +198,7 @@ func (s *Store) resolveTargets(ctx context.Context, targets []InvocationTarget) 
 		seen[identity] = true
 		baseSHA := strings.TrimSpace(target.BaseSHA)
 		if baseSHA == "" {
-			baseSHA, err = s.resolveBaseSHA(ctx, identity, strings.TrimSpace(target.Ref))
+			baseSHA, err = s.resolveRefFor(ctx, identity, strings.TrimSpace(target.Ref))
 			if err != nil {
 				return nil, err
 			}
@@ -170,6 +209,18 @@ func (s *Store) resolveTargets(ctx context.Context, targets []InvocationTarget) 
 		resolved = append(resolved, protocol.RunTarget{Repository: identity, BaseSHA: baseSHA})
 	}
 	return resolved, nil
+}
+
+// resolveRefFor pins one target's base commit through the store's resolver.
+// The indirection exists for the same reason `now` does: pinning reaches the
+// network, and a test that admits a run for a repository this machine cannot
+// reach must be able to answer that question itself. Production leaves the
+// field nil and gets resolveBaseSHA.
+func (s *Store) resolveRefFor(ctx context.Context, identity, ref string) (string, error) {
+	if s.resolveRef != nil {
+		return s.resolveRef(ctx, identity, ref)
+	}
+	return s.resolveBaseSHA(ctx, identity, ref)
 }
 
 // resolveBaseSHA asks the repository itself what the ref points at right
@@ -212,55 +263,75 @@ func (s *Store) resolveBaseSHA(ctx context.Context, identity, ref string) (strin
 // mid-admission can never leave a run whose target set and job set disagree
 // (R3). Each job is created with its first attempt in `queued`, exactly as
 // EnqueueJob does — claim fills the worker and lease.
-func (s *Store) admitRun(
-	ctx context.Context, definitionID string, generation int, snapshot string,
-	parameters map[string]string, targets []protocol.RunTarget,
-) (RunView, error) {
+func (s *Store) admitRun(ctx context.Context, prepared preparedInvocation) (RunView, error) {
 	var zero RunView
-	if parameters == nil {
-		parameters = map[string]string{}
-	}
-	parametersJSON, err := json.Marshal(parameters)
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	targetsJSON, err := json.Marshal(targets)
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	runID, err := newID()
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	now := s.now().UnixMilli()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return zero, unavailable(err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO runs(id, definition_id, definition_generation, snapshot, parameters, targets,
-			state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
-	`, runID, definitionID, generation, snapshot, string(parametersJSON), string(targetsJSON),
-		now, now); err != nil {
-		return zero, unavailable(err)
-	}
-	jobIDs := make([]string, 0, len(targets))
-	for _, target := range targets {
-		jobID, err := insertJob(ctx, tx, runID, target, now)
-		if err != nil {
-			return zero, err
-		}
-		jobIDs = append(jobIDs, jobID)
+	runID, jobIDs, err := admitRunTx(ctx, tx, prepared, s.now().UnixMilli())
+	if err != nil {
+		return zero, err
 	}
 	if err := tx.Commit(); err != nil {
 		return zero, unavailable(err)
 	}
+	return s.runView(ctx, runID, jobIDs)
+}
+
+// admitRunTx is admission's whole body, written against a caller's
+// transaction. A trigger joins it so the occurrence that authorized the run
+// and the run itself commit together (R13): there is no instant in which a
+// run exists whose occurrence is not yet marked dispatched, so recovery can
+// re-drive an undispatched occurrence without ever producing a second run.
+func admitRunTx(
+	ctx context.Context, tx *sql.Tx, prepared preparedInvocation, nowMillis int64,
+) (string, []string, error) {
+	parameters := prepared.parameters
+	if parameters == nil {
+		parameters = map[string]string{}
+	}
+	parametersJSON, err := json.Marshal(parameters)
+	if err != nil {
+		return "", nil, unavailable(err)
+	}
+	targetsJSON, err := json.Marshal(prepared.targets)
+	if err != nil {
+		return "", nil, unavailable(err)
+	}
+	runID, err := newID()
+	if err != nil {
+		return "", nil, unavailable(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO runs(id, definition_id, definition_generation, snapshot, parameters, targets,
+			state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+	`, runID, prepared.definitionID, prepared.generation, prepared.snapshot,
+		string(parametersJSON), string(targetsJSON), nowMillis, nowMillis); err != nil {
+		return "", nil, unavailable(err)
+	}
+	jobIDs := make([]string, 0, len(prepared.targets))
+	for _, target := range prepared.targets {
+		jobID, err := insertJob(ctx, tx, runID, target, nowMillis)
+		if err != nil {
+			return "", nil, err
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+	return runID, jobIDs, nil
+}
+
+// runView reads back a freshly admitted run with its jobs in target order.
+func (s *Store) runView(ctx context.Context, runID string, jobIDs []string) (RunView, error) {
+	var zero RunView
 	view := RunView{Jobs: make([]protocol.Job, 0, len(jobIDs))}
-	if view.Run, err = s.Run(ctx, runID); err != nil {
+	run, err := s.Run(ctx, runID)
+	if err != nil {
 		return zero, err
 	}
+	view.Run = run
 	for _, jobID := range jobIDs {
 		job, err := s.Job(ctx, jobID)
 		if err != nil {

@@ -61,9 +61,11 @@ func NewHandler(store *Store, uiToken string, logger *slog.Logger) http.Handler 
 	mux.HandleFunc("GET /api/workers/{worker_id}/worktrees", api.workerWorktrees)
 	mux.HandleFunc("POST /api/workers/{worker_id}/worktrees/reconcile", api.reconcileWorktrees)
 	mux.HandleFunc("POST /api/worktrees/{attempt_id}/release", api.releaseWorktree)
-	// Publish routes register themselves from publish_ledger.go (U7), where
-	// their handlers live beside the fenced ledger they call.
+	// Publish routes register themselves from publish_ledger.go (U7), and the
+	// admission-trigger routes from schedule.go (U6), where their handlers
+	// live beside the store methods they call.
 	api.registerPublishRoutes(mux)
+	api.registerTriggerRoutes(mux)
 	return mux
 }
 

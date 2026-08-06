@@ -257,8 +257,13 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 	if err != nil {
 		return zero, err
 	}
-	view, err := store.admitRun(ctx, definition.ID, definition.Generation,
-		string(config.Source), config.Parameters, targets)
+	view, err := store.admitRun(ctx, preparedInvocation{
+		definitionID: definition.ID,
+		generation:   definition.Generation,
+		snapshot:     string(config.Source),
+		parameters:   config.Parameters,
+		targets:      targets,
+	})
 	if err != nil {
 		return zero, err
 	}

@@ -99,6 +99,12 @@ func finishJobs(t *testing.T, store *Store, states ...string) []protocol.Claim {
 				t.Fatalf("start attempt: %v", err)
 			}
 		}
+		if state == protocol.AttemptAccepted {
+			// `accepted` is a conjunction that includes proof of publish (R12),
+			// and the store enforces it: an aggregation test that wants an
+			// accepted job has to publish for it.
+			proveThePublish(t, store, claim, tokenA)
+		}
 		if _, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
 			LeaseToken: tokenA, State: state,
 		}); err != nil {
