@@ -311,7 +311,13 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 		Claim:     *claim,
 		TracePath: tracePath,
 		Persist: func(event protocol.Event) error {
-			return store.AppendEvents(ctx, attemptID, []protocol.Event{event})
+			// Detached for the same reason completion is: the events an
+			// interrupted attempt emits while unwinding — rollback, boundary
+			// enforcement, the terminal phase events — are exactly the ones
+			// the record needs, and on the caller's cancelled context every
+			// one of them would fail to reach the events table while still
+			// reaching the JSONL trace.
+			return store.AppendEvents(completionCtx, attemptID, []protocol.Event{event})
 		},
 		FreshenLease: func(ctx context.Context) error {
 			_, err := store.Heartbeat(ctx, attemptID, protocol.HeartbeatRequest{LeaseToken: token})
@@ -621,6 +627,12 @@ func (s *Store) reclaimAbandonedDirectRuns(ctx context.Context, dataDir string) 
 		candidates = append(candidates, value)
 	}
 	if err := rows.Close(); err != nil {
+		return nil, unavailable(err)
+	}
+	// A truncated candidate list is indistinguishable from a complete one
+	// unless the iteration error is asked for: reclamation would silently
+	// skip the abandoned attempts it exists to find.
+	if err := rows.Err(); err != nil {
 		return nil, unavailable(err)
 	}
 

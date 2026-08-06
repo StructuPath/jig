@@ -232,6 +232,18 @@ func (w *Worker) runAttempt(ctx context.Context, claim *protocol.Claim, token st
 		manifest.Lifecycle = manifestRunning
 		return nil
 	}); err != nil {
+		// The attempt is already running server-side. Abandoning it here would
+		// leave the ledger row running until the sweeper called it lost, so the
+		// terminal state is reported before returning, and the worktree is
+		// retained because a manifest we cannot write is a manifest disposal
+		// cannot trust.
+		outcome := Outcome{State: protocol.AttemptFailed,
+			Error: boundedText("record running lifecycle: "+err.Error(), protocol.MaxErrorBytes)}
+		if _, completeErr := w.completeAttempt(ctx, lease, outcome); completeErr != nil {
+			err = errors.Join(err, completeErr)
+		}
+		w.retainAfterAttempt(ctx, claim.Attempt.ID,
+			"attempt manifest could not record the running lifecycle: "+err.Error())
 		return nil, err
 	}
 
@@ -241,6 +253,16 @@ func (w *Worker) runAttempt(ctx context.Context, claim *protocol.Claim, token st
 		manifest.TerminalState = outcome.State
 		return nil
 	}); err != nil {
+		// The runner finished and its outcome exists: report it rather than
+		// discard it, then retain, because the manifest no longer describes
+		// what happened and disposal reasons from the manifest.
+		w.logger.Warn("attempt_manifest_completion_failed",
+			"attempt_id", claim.Attempt.ID, "error", err)
+		if _, completeErr := w.completeAttempt(ctx, lease, outcome); completeErr != nil {
+			err = errors.Join(err, completeErr)
+		}
+		w.retainAfterAttempt(ctx, claim.Attempt.ID,
+			"attempt manifest could not record completion: "+err.Error())
 		return nil, err
 	}
 	attempt, err := w.completeAttempt(ctx, lease, outcome)

@@ -439,6 +439,19 @@ func (store *manifestStore) validate(manifest attemptManifest) error {
 	if manifest.Branch != attemptBranch(manifest.JobID, manifest.AttemptNumber) {
 		return errors.New("attempt manifest branch does not match its job and attempt")
 	}
+	// The process group is a signal target, so it is validated as one on every
+	// read and write: reconciliation negates this number and hands it to
+	// kill(2), where 1 means "every process this user may signal" and 0 means
+	// "jig's own group". Zero alone is the unrecorded state; anything else
+	// below minimumSignallableProcessGroup is corruption, and a manifest that
+	// advertises a live process must carry a group id that can name one.
+	if manifest.ProcessGroupID != 0 && !signallableProcessGroup(manifest.ProcessGroupID) {
+		return fmt.Errorf("attempt manifest process group %d can never name a real group",
+			manifest.ProcessGroupID)
+	}
+	if manifest.ProcessActive && !signallableProcessGroup(manifest.ProcessGroupID) {
+		return errors.New("attempt manifest advertises a live process without a signallable group id")
+	}
 	if !manifestLifecycles[manifest.Lifecycle] {
 		return fmt.Errorf("attempt manifest lifecycle %q is invalid", manifest.Lifecycle)
 	}

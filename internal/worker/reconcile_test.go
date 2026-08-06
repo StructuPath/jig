@@ -6,9 +6,11 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -153,5 +155,128 @@ func TestReconcileNeverSignalsARecordedGroupWhosePidNoLongerMatches(t *testing.T
 	}
 	if manifest.ProcessActive {
 		t.Fatal("the manifest still advertises a process group that could not be verified")
+	}
+}
+
+// A recorded group id of 1 becomes kill(-1, SIGTERM) — every process the
+// operator's user may signal — and 0 becomes kill(0, ...), jig's own group.
+// Neither can ever be an attempt's agent group, so no identity check can
+// redeem them and nothing may reach the syscall with one. Three layers say so
+// independently: the range predicate the signal path gates on, the identity
+// check that never even inspects such a value, and manifest validation that
+// refuses to hand one back off disk.
+func TestAProcessGroupIdAtOrBelowOneIsNeverSignalled(t *testing.T) {
+	for _, groupID := range []int64{-1, 0, 1} {
+		if signallableProcessGroup(groupID) {
+			t.Errorf("process group %d is treated as signallable; "+
+				"stopProcessGroup would negate it into a machine-wide kill", groupID)
+		}
+		manifest := attemptManifest{ProcessGroupID: groupID, ProcessActive: true}
+		ours, reason := processGroupIsOurs(context.Background(), manifest)
+		if ours {
+			t.Errorf("process group %d was claimed as ours", groupID)
+		}
+		if !strings.Contains(reason, "can never name an attempt's own group") {
+			t.Errorf("process group %d was refused for %q, want the range reason "+
+				"(it must be refused before any identity check runs)", groupID, reason)
+		}
+	}
+	// The gate must not be so wide that a real group is skipped.
+	if !signallableProcessGroup(2) {
+		t.Error("process group 2 is a real, signallable group id")
+	}
+}
+
+// The same three values must be unrepresentable in a manifest, so a zeroed or
+// hand-edited field never becomes a signal target on a later restart.
+func TestAManifestCannotCarryAnUnsignallableProcessGroup(t *testing.T) {
+	store := newManifestStore(t.TempDir(), "11111111-1111-4111-8111-111111111111")
+	base := attemptManifest{
+		SchemaVersion: manifestSchemaVersion,
+		WorkerID:      store.workerID,
+		JobID:         "22222222-2222-4222-8222-222222222222",
+		AttemptID:     "33333333-3333-4333-8333-333333333333",
+		AttemptNumber: 1,
+		Repository:    "github.com/example/repo",
+		RepositoryDir: filepath.Join(store.dataDirectory, "repos", "entry"),
+		BaseSHA:       strings.Repeat("a", 40),
+		Lifecycle:     manifestRunning,
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	}
+	base.WorktreePath = filepath.Join(store.dataDirectory, "worktrees", base.AttemptID)
+	base.Branch = attemptBranch(base.JobID, base.AttemptNumber)
+	if err := store.validate(base); err != nil {
+		t.Fatalf("the fixture manifest is not otherwise valid: %v", err)
+	}
+
+	for _, groupID := range []int64{-1, 1} {
+		manifest := base
+		manifest.ProcessGroupID = groupID
+		if err := store.validate(manifest); err == nil {
+			t.Errorf("a manifest carrying process group %d validated", groupID)
+		}
+	}
+	// Zero is the unrecorded state and stays legal — but not while the
+	// manifest claims a process is live.
+	unrecorded := base
+	if err := store.validate(unrecorded); err != nil {
+		t.Errorf("an unrecorded process group must stay valid: %v", err)
+	}
+	unrecorded.ProcessActive = true
+	if err := store.validate(unrecorded); err == nil {
+		t.Error("a manifest advertising a live process with group id 0 validated")
+	}
+	live := base
+	live.ProcessGroupID = 4242
+	live.ProcessActive = true
+	if err := store.validate(live); err != nil {
+		t.Errorf("a real live process group must stay valid: %v", err)
+	}
+}
+
+// End to end: a manifest that reaches disk carrying process_group_id 1 —
+// corruption, a bad merge, an operator's editor — must not make
+// reconciliation signal anything, and must not make it delete anything
+// either.
+func TestReconcileSignalsNothingForACorruptedProcessGroupOnDisk(t *testing.T) {
+	h := newHarness(t)
+	dataDir := filepath.Join(t.TempDir(), "worker")
+	_, attemptID := claimOneAttempt(t, h, dataDir)
+
+	manifestPath := filepath.Join(dataDir, "attempts", attemptID+".json")
+	body, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	worktreePath, _ := raw["worktree_path"].(string)
+	raw["process_group_id"] = 1
+	raw["process_active"] = true
+	corrupted, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, corrupted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newTestWorker(t, h, dataDir, 1, RunnerFunc(
+		func(context.Context, *PreparedAttempt) Outcome {
+			return Outcome{State: protocol.AttemptFailed, Error: "unused"}
+		}))
+	report, err := restarted.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(report.StoppedProcessGroups) != 0 {
+		t.Fatalf("reconcile stopped %v — group id 1 would have signalled every "+
+			"process the operator may signal", report.StoppedProcessGroups)
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		t.Fatalf("reconcile deleted the worktree behind an unreadable manifest: %v", err)
 	}
 }

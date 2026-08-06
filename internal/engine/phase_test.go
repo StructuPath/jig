@@ -1246,3 +1246,188 @@ phases:
 		t.Fatal("a runtime error was counted as a subprocess death")
 	}
 }
+
+// ---- scenario: attempt-terminal exits are not a boundary loophole (R10) ----
+
+// The ceiling, the send ladder, and cancellation end the ATTEMPT from inside a
+// live agent phase. Enforcement runs on those exits too, or an agent that
+// writes where it may not and then burns the clock leaves the write behind in
+// a worktree that cleanup retains precisely because it is dirty.
+func TestAnAttemptEndingOnItsCeilingStillEnforcesTheWriteBoundary(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		Files: map[string]string{"src/ok.txt": "allowed", "stray.txt": "outside the allowlist"},
+		Hang:  true,
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+		config.AttemptCeiling = 100 * time.Millisecond
+		config.NoOutputTimeout = time.Minute // the ceiling must fire first
+	})
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "stray.txt")); !os.IsNotExist(err) {
+		t.Fatal("an out-of-allowlist write survived an attempt that ended on its ceiling")
+	}
+	if !sink.has(protocol.EventError, "write_boundary_breach") {
+		t.Fatal("no write_boundary_breach trace event on the ceiling exit")
+	}
+	if !strings.Contains(outcome.Error, "ceiling") {
+		t.Fatalf("error %q lost the terminal cause that ended the attempt", outcome.Error)
+	}
+	if !strings.Contains(outcome.Error, "outside its write allowlist") {
+		t.Fatalf("error %q does not report the breach found on the way out", outcome.Error)
+	}
+	// The authorized write is left alone: this exit is terminal, never
+	// retried, so there is nothing to roll the whole tree back for.
+	if _, err := os.Stat(filepath.Join(repo, "src", "ok.txt")); err != nil {
+		t.Fatalf("the allowed write was discarded on the way out: %v", err)
+	}
+}
+
+func TestACancelledAttemptStillEnforcesTheWriteBoundary(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		Files: map[string]string{"stray.txt": "outside the allowlist"},
+		Hang:  true,
+	})
+	cancelled := make(chan struct{})
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(cancelled)
+	}()
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	attempt := testAttempt(snapshot, nil, repo)
+	attempt.Cancelled = cancelled
+	outcome := runner.Execute(context.Background(), attempt)
+	if _, err := os.Stat(filepath.Join(repo, "stray.txt")); !os.IsNotExist(err) {
+		t.Fatal("an out-of-allowlist write survived a cancelled attempt")
+	}
+	if !sink.has(protocol.EventError, "write_boundary_breach") {
+		t.Fatal("no write_boundary_breach trace event on the cancellation exit")
+	}
+	// A breach outranks the cancellation: R10's abort is the verdict, and it
+	// still carries the cause that ended the attempt.
+	if outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed (the breach aborts)", outcome.State)
+	}
+	if !strings.Contains(outcome.Error, "during phase") ||
+		!strings.Contains(outcome.Error, "outside its write allowlist") {
+		t.Fatalf("error %q must carry both the cancellation and the breach", outcome.Error)
+	}
+}
+
+// ---- scenario: prompt paths cannot leave the worktree (R10, KTD11) ---------
+
+// A role's prompt path is definition data, but the FILE lives in the worktree
+// an earlier phase was allowed to write. A lexical IsLocal check plus
+// os.ReadFile would follow a planted symlink and hand the target's contents to
+// the next agent CLI.
+func TestAPromptPathSymlinkedOutsideTheWorktreeIsRefused(t *testing.T) {
+	repo := initRepo(t)
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "id_rsa")
+	if err := os.WriteFile(secret, []byte("PRIVATE KEY MATERIAL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(repo, "prompts", "system.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	// One scripted step, so a prompt read that DID escape would be observable
+	// as the send it enables. The fix means that send never happens.
+	fake := enginetest.New(enginetest.Step{
+		Text: envelope(map[string]any{"status": "success", "summary": "read the prompt"}),
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := `name: t
+roster:
+  builder:
+    model: test-model
+    system_prompt_path: prompts/system.md
+    user_prompt: "Do the work."
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	if !strings.Contains(outcome.Error, "read prompt") {
+		t.Fatalf("error %q does not name the refused prompt read", outcome.Error)
+	}
+	if strings.Contains(outcome.Error, "PRIVATE KEY MATERIAL") {
+		t.Fatal("the escaped file's contents leaked into the attempt record")
+	}
+	for _, call := range fake.Calls() {
+		if strings.Contains(call.Options.SystemPrompt, "PRIVATE KEY MATERIAL") {
+			t.Fatal("the escaped file's contents reached the agent's system prompt")
+		}
+	}
+}
+
+// ---- scenario: a gate that records nothing must not pass (R9) --------------
+
+// GateReport.Passed() is "no violations", so a gate whose only input is an
+// envelope field the agent omitted would wave that agent through. The claim
+// IS what diff_matches_claims checks: no claim is a failed check.
+func TestDiffMatchesClaimsRefusesAnEnvelopeThatOmitsChangedFiles(t *testing.T) {
+	repo := initRepo(t)
+	silent := envelope(map[string]any{"status": "success", "summary": "wrote it"})
+	claimedType := envelope(map[string]any{"status": "success", "summary": "wrote it",
+		"changed_files": "out.txt"})
+	honest := envelope(map[string]any{"status": "success", "summary": "wrote it",
+		"changed_files": []any{"out.txt"}})
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"out.txt": "data"}, Text: silent},
+		enginetest.Step{Text: claimedType},
+		enginetest.Step{Text: honest},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + oneWriterRoster + `
+phases:
+  - name: build
+    kind: agent
+    owner: writer
+    gates:
+      - {name: diff_matches_claims}
+acceptance: [all_phases_passed]
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	if got := sink.count(protocol.EventGateFail, "diff_matches_claims"); got != 2 {
+		t.Fatalf("diff_matches_claims failed %d time(s), want 2 (omitted, then not a list)", got)
+	}
+	if got := sink.count(protocol.EventGatePass, "diff_matches_claims"); got != 1 {
+		t.Fatalf("diff_matches_claims passed %d time(s), want 1", got)
+	}
+	if fake.Remaining() != 0 {
+		t.Fatalf("unconsumed scripted steps: %d — the gate waved an emission through", fake.Remaining())
+	}
+	calls := fake.Calls()
+	if !strings.Contains(calls[1].Prompt, "changed_files") {
+		t.Fatalf("correction prompt does not name the missing claim: %.200q", calls[1].Prompt)
+	}
+}

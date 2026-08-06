@@ -29,6 +29,12 @@ type repoCache struct {
 
 	mutex   sync.Mutex
 	entries map[string]*repoEntry
+	// building holds the .clone-* directory names this process is currently
+	// cloning into. Entry mutexes are per-identity, so two uncached
+	// repositories materialize concurrently at capacity above one; without
+	// this set each one's enforceLimit would delete the other's half-built
+	// clone and fail an attempt for a reason having nothing to do with it.
+	building map[string]bool
 }
 
 // repoEntry is one cached bare repository. Its mutex serializes fetches and
@@ -42,7 +48,11 @@ type repoEntry struct {
 }
 
 func newRepoCache(root string) *repoCache {
-	return &repoCache{root: root, entries: make(map[string]*repoEntry)}
+	return &repoCache{
+		root:     root,
+		entries:  make(map[string]*repoEntry),
+		building: make(map[string]bool),
+	}
 }
 
 // entry returns the cache entry for one registered repository identity,
@@ -105,7 +115,11 @@ func (c *repoCache) materializeLocked(ctx context.Context, entry *repoEntry, rep
 	if err != nil {
 		return fmt.Errorf("create temporary clone directory: %w", err)
 	}
-	defer os.RemoveAll(temporary)
+	c.claimBuild(temporary)
+	defer func() {
+		c.releaseBuild(temporary)
+		_ = os.RemoveAll(temporary)
+	}()
 	buildDir := filepath.Join(temporary, "repository")
 	steps := [][]string{
 		{"init", "--bare", buildDir},
@@ -128,8 +142,32 @@ func (c *repoCache) materializeLocked(ctx context.Context, entry *repoEntry, rep
 	return nil
 }
 
+// claimBuild and releaseBuild bracket one in-flight clone, so a concurrent
+// enforceLimit can tell this process's live temporary directory from a
+// previous process's abandoned one.
+func (c *repoCache) claimBuild(temporary string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.building[filepath.Base(temporary)] = true
+}
+
+func (c *repoCache) releaseBuild(temporary string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	delete(c.building, filepath.Base(temporary))
+}
+
+func (c *repoCache) buildInFlight(name string) bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.building[name]
+}
+
 // enforceLimit bounds the cache by counting installed entries on disk, and
-// removes interrupted .clone-* leftovers while it is there.
+// reclaims interrupted .clone-* leftovers while it is there. "Interrupted"
+// means a previous process's: a clone this process is building into is
+// skipped, because deleting it would break a concurrent materialization of a
+// different repository under its own entry mutex.
 func (c *repoCache) enforceLimit() error {
 	entries, err := os.ReadDir(c.root)
 	if err != nil {
@@ -138,6 +176,9 @@ func (c *repoCache) enforceLimit() error {
 	installed := 0
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), ".clone-") {
+			if c.buildInFlight(entry.Name()) {
+				continue
+			}
 			if err := os.RemoveAll(filepath.Join(c.root, entry.Name())); err != nil {
 				return fmt.Errorf("remove interrupted clone: %w", err)
 			}

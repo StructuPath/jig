@@ -309,3 +309,69 @@ func TestADirectRunReleasesAForeignQueuedJobInsteadOfFailingIt(t *testing.T) {
 		t.Fatalf("%d queued job(s) leaked from the failed direct run", stragglers)
 	}
 }
+
+// An interrupted run keeps emitting: rollback, boundary enforcement, and the
+// terminal phase events all happen while the engine unwinds, AFTER the
+// interrupt. Those are the events the record most needs, and persisting them
+// on the caller's cancelled context drops exactly them — the JSONL trace keeps
+// the line, the events table does not, and the two stop agreeing.
+func TestAnInterruptedDirectRunPersistsTheEventsItEmitsWhileUnwinding(t *testing.T) {
+	dataDir := t.TempDir()
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var unwinding []error
+	config := directConfig(dataDir, repoPath, func(_ context.Context, execution DirectExecution) DirectOutcome {
+		// Before the interrupt: the ordinary path.
+		unwinding = append(unwinding, execution.Persist(protocol.Event{
+			Seq: 1, Type: protocol.EventPhaseStart, Phase: "build"}))
+		// The operator's Ctrl-C lands here.
+		cancel()
+		for _, event := range []protocol.Event{
+			{Seq: 2, Type: protocol.EventError, Phase: "build", Name: "rollback_failed"},
+			{Seq: 3, Type: protocol.EventError, Phase: "build", Name: "write_boundary_breach"},
+			{Seq: 4, Type: protocol.EventPhaseEnd, Phase: "build"},
+		} {
+			unwinding = append(unwinding, execution.Persist(event))
+		}
+		return DirectOutcome{State: protocol.AttemptCancelled, Error: "the direct run was interrupted"}
+	})
+
+	result, err := DirectRun(ctx, config)
+	if err != nil {
+		t.Fatalf("DirectRun: %v", err)
+	}
+	for i, persistErr := range unwinding {
+		if persistErr != nil {
+			t.Fatalf("Persist(event %d) failed after the interrupt: %v", i+1, persistErr)
+		}
+	}
+	if result.Attempt.State != protocol.AttemptCancelled {
+		t.Fatalf("attempt state = %q, want cancelled", result.Attempt.State)
+	}
+
+	store, err := Open(context.Background(), filepath.Join(dataDir, "jig.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events, err := store.AttemptEvents(context.Background(), result.Attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("stored events = %d, want 4 — the interrupt cost the record its unwinding events", len(events))
+	}
+	for _, name := range []string{"rollback_failed", "write_boundary_breach"} {
+		found := false
+		for _, event := range events {
+			if event.Name == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("event %q emitted after the interrupt never reached the events table", name)
+		}
+	}
+}
