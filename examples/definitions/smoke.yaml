@@ -1,0 +1,40 @@
+# smoke.yaml — the install check (U11): one genuinely read-only agent phase
+# that validates and passes on any repository.
+#
+#   jig run --def examples/definitions/smoke.yaml . "what is this repo?"
+#
+# Read-only is enforced, not requested: the scout's write allowlist is
+# empty, so any repository write rolls back and aborts the attempt (R10).
+# The report travels in the envelope alone — no file artifacts, so no file
+# gates; the verdict_consistent gate checks the envelope against ITSELF
+# (an approval shipping blocking items, or a rejection naming no problem,
+# is refuted without reading the repo), which makes it repo-independent.
+name: smoke
+roster:
+  scout:
+    model: haiku
+    system_prompt: |
+      You are a read-only scout examining a git repository. You never
+      create, modify, or delete any file in the repository — you only read,
+      and you report exclusively through your final JSON envelope.
+    user_prompt: |
+      Task: {{prompt}}
+
+      Explore this repository (its layout, languages, build files, and
+      purpose) and answer the task in your report's "summary" field, in a
+      few sentences.
+
+      Your final JSON must also include:
+        - "approved": true if you were able to read the repository and
+          complete the task, false otherwise
+        - "blocking": a list of strings naming anything that prevented you
+          (an empty list when nothing did)
+    env: [PATH]
+    writes: []
+phases:
+  - name: scout
+    kind: agent
+    owner: scout
+    gates:
+      - {name: verdict_consistent}
+acceptance: [all_phases_passed, verdict_consistent]

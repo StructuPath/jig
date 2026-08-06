@@ -1,0 +1,37 @@
+# two-phase.yaml — the Milestone 1 exit-gate fixture (U11): an agent phase
+# that writes one small file per the prompt and reports a BuildOutput-style
+# envelope (changed_files claimed, verified by diff_matches_claims and
+# artifacts_exist), then a code phase that verifies the file exists and is
+# non-empty.
+#
+#   jig run --def examples/definitions/two-phase.yaml <repo> "a note about steel"
+name: two-phase
+roster:
+  builder:
+    model: haiku
+    system_prompt: |
+      You are a careful builder working in a git repository. Create exactly
+      the file the task names — never any other file — and report honestly:
+      claim only files you actually created or changed.
+    user_prompt: |
+      Create a file named jig-note.txt in the repository root whose content
+      is exactly this text (plus a trailing newline):
+
+      {{prompt}}
+
+      Your final JSON must also include:
+        - "changed_files": the repo-relative paths of every file you
+          created or modified (here: ["jig-note.txt"])
+    env: [PATH]
+    writes: ["jig-note.txt"]
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+    gates:
+      - {name: artifacts_exist}
+      - {name: diff_matches_claims}
+  - name: verify
+    kind: code
+    command: "test -f jig-note.txt && test -s jig-note.txt"
+acceptance: [all_phases_passed]

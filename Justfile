@@ -12,6 +12,12 @@ build:
 test:
     go test -timeout 5m ./...
 
+# Run the claim/heartbeat/sweep interleaving suite, the worker integration
+# suite, and the phase-engine suite under the race detector (U2 + U3 + U4
+# verification).
+test-race:
+    go test -race -timeout 10m ./internal/controlplane/... ./internal/worker/... ./internal/engine/... ./internal/runtime/...
+
 # Run Go static analysis.
 vet:
     go vet ./...

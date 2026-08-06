@@ -24,6 +24,48 @@ const (
 	// uptime resumed is a dead worker (R5).
 	MissedHeartbeatsBeforeSweep = 3
 
+	// SweeperUptimeGap is the tick-to-tick gap beyond which the sweeper
+	// concludes the server itself was down (sleep, suspend) and resets every
+	// missed-heartbeat count. Misses are therefore only ever counted against
+	// server uptime, so whole-machine sleep never sweeps intact work (R5).
+	SweeperUptimeGap = 2 * HeartbeatInterval
+
+	// WorkerLivenessWindow is how stale a worker's last observed heartbeat may
+	// be while the worker still counts as live for claim eligibility (R4).
+	// Registration and attempt heartbeats both refresh it (KTD12).
+	WorkerLivenessWindow = 3 * HeartbeatInterval
+
+	// RegistrationInterval is how often the worker re-registers. Registration
+	// is also the idle liveness heartbeat (KTD12): claims never refresh
+	// liveness, so this must stay comfortably inside WorkerLivenessWindow.
+	RegistrationInterval = HeartbeatInterval
+
+	// ClaimPollInterval is how often an idle worker with free capacity polls
+	// for work after an empty claim answer.
+	ClaimPollInterval = 2 * time.Second
+
+	// WorkerRequestTimeout bounds every worker→server HTTP request.
+	WorkerRequestTimeout = 15 * time.Second
+
+	// GitCommandTimeout bounds every git invocation the worker runs. A git
+	// command that cannot finish inside it is treated as failed, never waited
+	// on indefinitely.
+	GitCommandTimeout = 60 * time.Second
+
+	// MaxCachedRepositories caps the worker's on-demand managed repository
+	// cache (U3). At the cap, a claim for an uncached repository fails its
+	// preparation rather than growing disk without bound.
+	MaxCachedRepositories = 32
+
+	// MaxRetentionReasonBytes caps a retained-worktree reason everywhere it
+	// is persisted — manifest, registration payload, ledger row.
+	MaxRetentionReasonBytes = 1000
+
+	// EmptyClaimTTL is how long an empty claim answer stays replayable under
+	// its request id. Past it the row is deleted (by sweep, or lazily by a
+	// replay) and the same request id may claim afresh (R4).
+	EmptyClaimTTL = time.Minute
+
 	// ParseBudgetPerEmission is how many times a single envelope emission may
 	// be re-prompted for a parse failure before the phase fails. Every
 	// gate-corrected emission re-enters parsing with a fresh budget of this
@@ -76,4 +118,31 @@ const (
 	// attempt-local JSONL; the SQLite copy is capped so a runaway emission
 	// cannot bloat the control-plane database (R7, R15).
 	MaxInvalidEnvelopeBytes = 64 << 10
+
+	// MaxTranscriptDigestBytes caps the transcript digest replayed into a
+	// fresh session when a runtime cannot resume sessions (R7). The digest
+	// keeps the most recent exchanges up to this size; definition validation
+	// warns that correction cost is elevated for such a role.
+	MaxTranscriptDigestBytes = 16 << 10
+
+	// MaxCommandOutputTailBytes caps the output tail a code phase's adapter
+	// envelope or a tests_pass gate carries as evidence (R8, R9). The full
+	// output lives in the attempt trace; the envelope keeps the tail an agent
+	// can act on.
+	MaxCommandOutputTailBytes = 4 << 10
+
+	// MaxEventPayloadBytes caps one trace event's payload everywhere the
+	// engine emits it (KTD8). Oversized payloads are truncated with a marker,
+	// never dropped.
+	MaxEventPayloadBytes = 64 << 10
+
+	// MaxRequestBodyBytes bounds every HTTP request body the control plane
+	// will read. Larger bodies fail with 413 before any handler logic (R20).
+	MaxRequestBodyBytes = 1 << 20
+
+	// MaxResultBytes caps an attempt completion's result payload.
+	MaxResultBytes = 64 << 10
+
+	// MaxErrorBytes caps an attempt completion's error text.
+	MaxErrorBytes = 16 << 10
 )

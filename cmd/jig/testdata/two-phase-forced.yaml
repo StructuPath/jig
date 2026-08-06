@@ -1,0 +1,55 @@
+# two-phase-forced.yaml — the exit-gate forcing variant (U11, run #2 of the
+# Milestone 1 gate): the same two-phase fixture, with two engine-level traps
+# so the FIRST emission genuinely fails and both correction loops must
+# recover. The agent is never told to emit a malformed report and then
+# comply — the traps live in the definition, outside the agent's knowledge
+# or control:
+#
+#   - Parse-correction trap: the reporting template's "status" value is
+#     "done", which the envelope contract rejects (status must be the
+#     literal success or fail). An agent following the template emits an
+#     invalid envelope; the parse-correction re-prompt (naming the error
+#     and the required fields) must recover it in the same live session
+#     (R7).
+#
+#   - Gate-correction trap: a tests_pass gate requires jig-note.txt to
+#     contain the exact line "Reviewed-by: jig" — a requirement stated
+#     ONLY here in the definition, never in any prompt the agent sees. The
+#     first emission therefore cannot pass it; the gate-correction
+#     re-prompt (carrying the failing command and its exit status as the
+#     violation note) must drive the agent to satisfy the requirement and
+#     re-emit (R9). Deterministic by construction: the agent cannot dodge
+#     a check it has never heard of.
+name: two-phase-forced
+roster:
+  builder:
+    model: haiku
+    system_prompt: |
+      You are a careful builder working in a git repository. Create exactly
+      the file the task names — never any other file, under any
+      circumstances. If a validation message reports a problem, fix the
+      problem and then re-emit only your report JSON.
+    user_prompt: |
+      Create a file named jig-note.txt in the repository root. Its first
+      line must be exactly this text:
+
+      {{prompt}}
+
+      When you are done, report using EXACTLY this JSON template, changing
+      only the summary and notes_for_next_agent text:
+
+      {"status": "done", "summary": "<one line>", "artifacts": ["jig-note.txt"], "changed_files": ["jig-note.txt"], "notes_for_next_agent": "<one line>"}
+    env: [PATH]
+    writes: ["jig-note.txt"]
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+    gates:
+      - {name: artifacts_exist}
+      - {name: diff_matches_claims}
+      - {name: tests_pass, command: "grep -qx 'Reviewed-by: jig' jig-note.txt"}
+  - name: verify
+    kind: code
+    command: "test -f jig-note.txt && test -s jig-note.txt"
+acceptance: [all_phases_passed]
