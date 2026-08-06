@@ -35,6 +35,32 @@ const (
 	// Registration and attempt heartbeats both refresh it (KTD12).
 	WorkerLivenessWindow = 3 * HeartbeatInterval
 
+	// RegistrationInterval is how often the worker re-registers. Registration
+	// is also the idle liveness heartbeat (KTD12): claims never refresh
+	// liveness, so this must stay comfortably inside WorkerLivenessWindow.
+	RegistrationInterval = HeartbeatInterval
+
+	// ClaimPollInterval is how often an idle worker with free capacity polls
+	// for work after an empty claim answer.
+	ClaimPollInterval = 2 * time.Second
+
+	// WorkerRequestTimeout bounds every worker→server HTTP request.
+	WorkerRequestTimeout = 15 * time.Second
+
+	// GitCommandTimeout bounds every git invocation the worker runs. A git
+	// command that cannot finish inside it is treated as failed, never waited
+	// on indefinitely.
+	GitCommandTimeout = 60 * time.Second
+
+	// MaxCachedRepositories caps the worker's on-demand managed repository
+	// cache (U3). At the cap, a claim for an uncached repository fails its
+	// preparation rather than growing disk without bound.
+	MaxCachedRepositories = 32
+
+	// MaxRetentionReasonBytes caps a retained-worktree reason everywhere it
+	// is persisted — manifest, registration payload, ledger row.
+	MaxRetentionReasonBytes = 1000
+
 	// EmptyClaimTTL is how long an empty claim answer stays replayable under
 	// its request id. Past it the row is deleted (by sweep, or lazily by a
 	// replay) and the same request id may claim afresh (R4).

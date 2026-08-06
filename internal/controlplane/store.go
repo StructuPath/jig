@@ -231,8 +231,10 @@ func verifyActiveLease(value leaseState, token string, nowMillis int64) error {
 
 // RegisterWorker upserts the single implicit worker (KTD12). Registration
 // carries env-var names only — never values (R17) — and refreshes liveness:
-// a re-registration is also a heartbeat. Retained-worktree reconciliation
-// from the registration payload is U3.
+// a re-registration is also a heartbeat. The payload's retained worktrees
+// upsert into the control-plane ledger in the same transaction (R16), which
+// is what feeds the claim transaction's per-repository skip-over cap (R4);
+// reports for attempts this worker does not own are skipped, never written.
 func (s *Store) RegisterWorker(ctx context.Context, workerID string, input protocol.WorkerRegistration) (protocol.Worker, error) {
 	workerID = strings.TrimSpace(workerID)
 	if workerID == "" || len(workerID) > 200 {
@@ -258,7 +260,12 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 		return protocol.Worker{}, unavailable(err)
 	}
 	now := s.now().UnixMilli()
-	if _, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return protocol.Worker{}, unavailable(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workers(id, name, worker_version, capacity, env_names_json, runtimes_json, registered_at, last_heartbeat)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -270,6 +277,12 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 			last_heartbeat = excluded.last_heartbeat
 	`, workerID, input.Name, input.WorkerVersion, input.Capacity,
 		string(envJSON), string(runtimesJSON), now, now); err != nil {
+		return protocol.Worker{}, unavailable(err)
+	}
+	if _, err := s.applyRetainedWorktrees(ctx, tx, workerID, input.RetainedWorktrees); err != nil {
+		return protocol.Worker{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return protocol.Worker{}, unavailable(err)
 	}
 	return s.Worker(ctx, workerID)

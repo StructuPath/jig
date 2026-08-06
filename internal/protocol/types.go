@@ -248,6 +248,54 @@ type RetainedWorktree struct {
 	Reason     string `json:"reason"`
 }
 
+// Worktree ledger states (R16). A row leaves `retained` only through the
+// operator release action or a reconciliation that proves the disk copy gone.
+const (
+	WorktreeRetained = "retained"
+	WorktreeReleased = "released"
+	WorktreeLost     = "lost"
+)
+
+// WorktreeLedgerEntry is one control-plane retained-worktree ledger row
+// (R16). The ledger is server-side truth for claim skip-over (R4) and the
+// operator release surface; worker disk is reconciled against it at start.
+type WorktreeLedgerEntry struct {
+	AttemptID  string    `json:"attempt_id"`
+	WorkerID   string    `json:"worker_id"`
+	Repository string    `json:"repository"`
+	Path       string    `json:"path"`
+	Reason     string    `json:"reason"`
+	State      string    `json:"state"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// WorktreeReconciliationReport is the worker's start-time disk truth (R16),
+// compared bidirectionally against the ledger: Retained rows upsert,
+// MissingAttemptIDs name retained ledger rows whose disk copy is gone (the
+// server marks them lost), and OrphanPaths are on-disk worktrees with no
+// manifest — reported for the operator, never deleted by anyone.
+type WorktreeReconciliationReport struct {
+	Retained          []RetainedWorktree `json:"retained"`
+	MissingAttemptIDs []string           `json:"missing_attempt_ids"`
+	OrphanPaths       []string           `json:"orphan_paths"`
+}
+
+// WorktreeReconciliationResult answers a reconciliation report with the
+// worker's full ledger view after the report was applied. OrphanPaths echoes
+// the acknowledged orphans so the worker's report is provably received.
+type WorktreeReconciliationResult struct {
+	Ledger      []WorktreeLedgerEntry `json:"ledger"`
+	OrphanPaths []string              `json:"orphan_paths"`
+}
+
+// WorktreeReleaseRequest is the operator release action (R16). Confirm must
+// be explicitly true — release deletes retained work, so it is gated on an
+// inspection confirmation, never a bare POST.
+type WorktreeReleaseRequest struct {
+	Confirm bool `json:"confirm"`
+}
+
 // WorkerRegistration is what the single implicit worker sends at start
 // (KTD12). EnvNames advertises available env-var *names only* — never
 // values — so claim eligibility can fail a job missing a required name

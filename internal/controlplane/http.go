@@ -45,6 +45,9 @@ func NewHandler(store *Store, uiToken string, logger *slog.Logger) http.Handler 
 	mux.HandleFunc("POST /api/attempts/{attempt_id}/complete", api.completeAttempt)
 	mux.HandleFunc("POST /api/jobs/{job_id}/retry", api.retryJob)
 	mux.HandleFunc("POST /api/jobs/{job_id}/cancel", api.cancelJob)
+	mux.HandleFunc("GET /api/workers/{worker_id}/worktrees", api.workerWorktrees)
+	mux.HandleFunc("POST /api/workers/{worker_id}/worktrees/reconcile", api.reconcileWorktrees)
+	mux.HandleFunc("POST /api/worktrees/{attempt_id}/release", api.releaseWorktree)
 	return mux
 }
 
@@ -162,6 +165,53 @@ func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (a *API) workerWorktrees(w http.ResponseWriter, r *http.Request) {
+	entries, err := a.store.WorkerWorktrees(r.Context(), r.PathValue("worker_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (a *API) reconcileWorktrees(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	var input protocol.WorktreeReconciliationReport
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	workerID := r.PathValue("worker_id")
+	result, err := a.store.ReconcileWorktrees(r.Context(), workerID, input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	// Orphans are worker disk with no manifest: nobody deletes them, the
+	// operator learns about them here (R16).
+	for _, orphan := range input.OrphanPaths {
+		a.logger.Warn("orphan_worktree_reported", "worker_id", workerID, "path", orphan)
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *API) releaseWorktree(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	var input protocol.WorktreeReleaseRequest
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	entry, err := a.store.ReleaseWorktree(r.Context(), r.PathValue("attempt_id"), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
 }
 
 // prepareMutation gates every state-changing route (R20): Origin fencing
