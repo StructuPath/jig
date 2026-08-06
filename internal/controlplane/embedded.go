@@ -769,10 +769,25 @@ func (s *Store) AppendEvents(ctx context.Context, attemptID string, events []pro
 		if err != nil {
 			return unavailable(err)
 		}
-		if _, err := tx.ExecContext(ctx, `
+		result, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO events(attempt_id, seq, type, phase, payload, payload_bytes, server_time)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, attemptID, event.Seq, event.Type, event.Phase, body, len(body), now); err != nil {
+		`, attemptID, event.Seq, event.Type, event.Phase, body, len(body), now)
+		if err != nil {
+			return unavailable(err)
+		}
+		// Project only what this call actually inserted, so a replay adds no
+		// second copy of the evidence. Direct runs reach the same gate and
+		// envelope views as the worker path (ingest.go) rather than degrading
+		// to the attempt result alone.
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return unavailable(err)
+		}
+		if inserted == 0 {
+			continue
+		}
+		if err := projectEvidence(ctx, tx, attemptID, event, now); err != nil {
 			return unavailable(err)
 		}
 	}
