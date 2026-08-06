@@ -13,7 +13,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,54 +252,13 @@ func (e *repoEntry) hasCommit(ctx context.Context, sha string) bool {
 // ---- identity handling -----------------------------------------------------
 
 // normalizeRepositoryIdentity canonicalizes a registered repository identity
-// or origin URL to a comparable form: "host/owner/repo" for remote URLs and
-// scp-style SSH remotes, "file:///canonical/path" for local repositories.
+// or origin URL to the comparable form jobs carry. The algorithm lives in
+// protocol because the control plane must produce EXACTLY this string at
+// admission (U5) — the retained-worktree cap, the publish ledger, and this
+// cache all match on string equality, so two implementations would be two
+// chances to disagree.
 func normalizeRepositoryIdentity(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", errors.New("repository identity is empty")
-	}
-	if prefix, path, found := strings.Cut(value, ":"); found && strings.Contains(prefix, "@") {
-		at := strings.LastIndex(prefix, "@")
-		host := prefix[at+1:]
-		if host == "" || path == "" {
-			return "", errors.New("SSH repository identity is malformed")
-		}
-		return normalizeHostPath(host, path), nil
-	}
-	parsed, err := url.Parse(value)
-	if err == nil && parsed.Scheme != "" {
-		if parsed.Scheme == "file" {
-			canonical, err := filepath.EvalSymlinks(parsed.Path)
-			if err != nil {
-				return "", fmt.Errorf("canonicalize file repository: %w", err)
-			}
-			return "file://" + filepath.ToSlash(canonical), nil
-		}
-		if parsed.Hostname() == "" || parsed.Path == "" {
-			return "", errors.New("repository identity URL is malformed")
-		}
-		return normalizeHostPath(parsed.Host, parsed.Path), nil
-	}
-	if filepath.IsAbs(value) {
-		canonical, err := filepath.EvalSymlinks(value)
-		if err != nil {
-			return "", fmt.Errorf("canonicalize repository path: %w", err)
-		}
-		return "file://" + filepath.ToSlash(canonical), nil
-	}
-	// Bare host/path identities like "github.com/owner/repo".
-	if host, path, found := strings.Cut(value, "/"); found && strings.Contains(host, ".") && path != "" {
-		return normalizeHostPath(host, path), nil
-	}
-	return "", fmt.Errorf("repository identity %q is not a recognized form", value)
-}
-
-func normalizeHostPath(host, path string) string {
-	path = strings.TrimPrefix(path, "/")
-	path = strings.TrimSuffix(path, "/")
-	path = strings.TrimSuffix(path, ".git")
-	return strings.ToLower(host) + "/" + path
+	return protocol.NormalizeRepositoryIdentity(value)
 }
 
 func remoteIdentityComparisonKey(value string) string {
@@ -316,27 +274,9 @@ func sameRemoteIdentity(left, right string) bool {
 
 // cloneSourceForIdentity derives the only clone source the worker will use
 // from the job's registered repository identity — never from any other
-// input. Local identities clone from their path; github.com identities
-// clone over HTTPS; anything else is refused.
+// input. Shared with admission (U5) through protocol.
 func cloneSourceForIdentity(repository string) (string, error) {
-	repository = strings.TrimSpace(repository)
-	if strings.HasPrefix(repository, "file://") {
-		return strings.TrimPrefix(repository, "file://"), nil
-	}
-	if filepath.IsAbs(repository) {
-		return repository, nil
-	}
-	identity, err := normalizeRepositoryIdentity(repository)
-	if err != nil {
-		return "", err
-	}
-	if strings.HasPrefix(identity, "file://") {
-		return strings.TrimPrefix(identity, "file://"), nil
-	}
-	if strings.HasPrefix(identity, "github.com/") {
-		return "https://" + identity + ".git", nil
-	}
-	return "", fmt.Errorf("repository identity %q has no derivable clone source", repository)
+	return protocol.CloneSourceForIdentity(repository)
 }
 
 func cacheDirectoryName(identityKey string) string {

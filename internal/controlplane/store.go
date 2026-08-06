@@ -500,6 +500,12 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 	`, input.State, now, lease.jobID); err != nil {
 		return protocol.Attempt{}, unavailable(err)
 	}
+	// The run aggregate rides the same transaction as the job state it
+	// summarizes (R12): there is no window in which a run's state disagrees
+	// with its jobs (U5).
+	if err := applyRunAggregationForJob(ctx, tx, lease.jobID, now); err != nil {
+		return protocol.Attempt{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return protocol.Attempt{}, unavailable(err)
 	}
@@ -561,6 +567,11 @@ func (s *Store) RetryJob(ctx context.Context, jobID string) (protocol.Job, error
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return protocol.Job{}, conflict("retry_conflict", "the job left the failed state during retry")
 	}
+	// A retried job is live again, so its run returns to `active` — the
+	// aggregate is recomputed, never latched (R12, U5).
+	if err := applyRunAggregationForJob(ctx, tx, jobID, now); err != nil {
+		return protocol.Job{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return protocol.Job{}, unavailable(err)
 	}
@@ -605,6 +616,9 @@ func (s *Store) CancelJob(ctx context.Context, jobID string) (protocol.Job, erro
 		`, now, jobID); err != nil {
 			return protocol.Job{}, unavailable(err)
 		}
+	}
+	if err := applyRunAggregationForJob(ctx, tx, jobID, now); err != nil {
+		return protocol.Job{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return protocol.Job{}, unavailable(err)
