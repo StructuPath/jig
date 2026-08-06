@@ -617,16 +617,19 @@ func TestBindingToANonLoopbackAddressWithoutTheOptInFlagRefusesToStart(t *testin
 }
 
 // Startup resolves a name in two places — the R20 loopback refusal and the
-// bind itself. Both must answer to the caller's context: a resolver that
-// cannot answer promptly is a startup that hangs, not a startup that fails.
-func TestServerStartupResolutionAnswersToItsContext(t *testing.T) {
+// bind itself. Both take the caller's context so a resolver that cannot
+// answer promptly is a startup that fails rather than one that hangs.
+//
+// Only the bind is asserted. Name resolution is deliberately not: a hosts
+// file entry for "localhost" is answered without a context-aware lookup on
+// platforms using the pure-Go resolver, so NewServer legitimately succeeds
+// on a dead context there while the cgo resolver path returns its error.
+// Asserting that difference tests the platform's resolver, not jig.
+func TestServerStartupBindAnswersToItsContext(t *testing.T) {
 	store, _ := newTestStore(t)
 	dead, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := NewServer(dead, store, ServerConfig{Address: "localhost:0"}); err == nil {
-		t.Fatal("NewServer resolved the listen host without consulting its context")
-	}
 	server, err := NewServer(context.Background(), store, ServerConfig{Address: "localhost:0"})
 	if err != nil {
 		t.Fatalf("NewServer localhost: %v", err)
