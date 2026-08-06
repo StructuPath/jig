@@ -119,6 +119,23 @@ const (
 	// cannot bloat the control-plane database (R7, R15).
 	MaxInvalidEnvelopeBytes = 64 << 10
 
+	// MaxTranscriptDigestBytes caps the transcript digest replayed into a
+	// fresh session when a runtime cannot resume sessions (R7). The digest
+	// keeps the most recent exchanges up to this size; definition validation
+	// warns that correction cost is elevated for such a role.
+	MaxTranscriptDigestBytes = 16 << 10
+
+	// MaxCommandOutputTailBytes caps the output tail a code phase's adapter
+	// envelope or a tests_pass gate carries as evidence (R8, R9). The full
+	// output lives in the attempt trace; the envelope keeps the tail an agent
+	// can act on.
+	MaxCommandOutputTailBytes = 4 << 10
+
+	// MaxEventPayloadBytes caps one trace event's payload everywhere the
+	// engine emits it (KTD8). Oversized payloads are truncated with a marker,
+	// never dropped.
+	MaxEventPayloadBytes = 64 << 10
+
 	// MaxRequestBodyBytes bounds every HTTP request body the control plane
 	// will read. Larger bodies fail with 413 before any handler logic (R20).
 	MaxRequestBodyBytes = 1 << 20

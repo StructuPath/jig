@@ -113,6 +113,20 @@ func (noEngineRunner) Run(context.Context, *PreparedAttempt) Outcome {
 	return Outcome{State: protocol.AttemptFailed, Error: "no phase engine is wired (U4)"}
 }
 
+// RecordProcessGroup records an attempt's live subprocess group into its
+// manifest (U4). The phase engine reports each agent process group as it
+// starts and stops — the manifest's ProcessGroupID/ProcessActive fields are
+// what start-time reconciliation uses to stop orphaned groups a crashed
+// worker left behind.
+func (w *Worker) RecordProcessGroup(attemptID string, processGroupID int64, active bool) error {
+	_, err := w.manifests.update(attemptID, func(manifest *attemptManifest) error {
+		manifest.ProcessGroupID = processGroupID
+		manifest.ProcessActive = active
+		return nil
+	})
+	return err
+}
+
 // Config configures the single implicit worker.
 type Config struct {
 	// ServerURL is the control plane's http://host:port address.
