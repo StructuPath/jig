@@ -1,8 +1,8 @@
 // jig is a local-first software factory: one binary that runs repeatable,
 // phased coding-agent workflows against Git repositories.
 //
-// U1 ships the subcommand skeleton only; serve (U2/U6/U8), worker (U3/U4),
-// run (U11), and def (U5) wire in with their units.
+// run (U11) is wired: the serverless direct harness. serve (U2/U6/U8),
+// worker (U3/U4), and def (U5) wire in with their units.
 package main
 
 import (
@@ -29,7 +29,9 @@ func run(args []string) int {
 		return 2
 	}
 	switch args[0] {
-	case "serve", "worker", "run", "def":
+	case "run":
+		return runCommand(args[1:], os.Stdout, os.Stderr)
+	case "serve", "worker", "def":
 		fmt.Fprintf(os.Stderr, "jig %s: not implemented\n", args[0])
 		return 1
 	case "help", "-h", "--help":
