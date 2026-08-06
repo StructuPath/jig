@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -54,6 +55,12 @@ const (
 	// terminationGrace is how long TERM gets before KILL when stopping the
 	// process group.
 	terminationGrace = 3 * time.Second
+
+	// streamDrainGrace bounds how long the stream capture may keep running
+	// after the CLI has exited and its process group has been stopped. Only a
+	// descendant that escaped the group can still hold the write end by then,
+	// and no wait on it could ever end on its own.
+	streamDrainGrace = 5 * time.Second
 
 	// anchorSelfTerminationGrace is how long the anchor gives its own group
 	// after the parent-death watchdog fires, before killing it outright. It
@@ -215,35 +222,64 @@ func (a *Adapter) StartOrContinue(
 		abandon()
 		return nil, fmt.Errorf("open claude stdin: %w", err)
 	}
-	stdout, err := command.StdoutPipe()
+	// stdout and stderr are descriptors jig owns rather than pipes exec
+	// manages, because it is exec's ownership of them that ties process exit
+	// to stream EOF in both directions: Cmd.Wait closes the StdoutPipe read
+	// end the moment the process exits (cutting the reader off mid-stream and
+	// losing the terminal `result` line), and Cmd.Wait blocks on the copier
+	// behind a non-*os.File Stderr, which cannot finish while any descendant
+	// still holds the inherited descriptor. With both streams on our own
+	// descriptors, Wait observes the CLI's exit and nothing else, and the
+	// stream drain is ours to bound.
+	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		abandon()
 		return nil, fmt.Errorf("open claude stdout: %w", err)
 	}
-	stderrTail := &tailBuffer{limit: protocol.MaxErrorBytes}
-	command.Stderr = stderrTail
-	if err := command.Start(); err != nil {
+	command.Stdout = stdoutWriter
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
 		abandon()
-		return nil, fmt.Errorf("start claude: %w", err)
+		return nil, fmt.Errorf("open claude stderr: %w", err)
+	}
+	command.Stderr = stderrWriter
+	stderrTail := &tailBuffer{limit: protocol.MaxErrorBytes}
+	startErr := command.Start()
+	// The child owns the write ends now. The parent's copies must go, or
+	// neither stream can ever reach EOF — exec closes only the descriptors it
+	// created itself.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
+	if startErr != nil {
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
+		abandon()
+		return nil, fmt.Errorf("start claude: %w", startErr)
 	}
 	session.Sends++
 
 	handle := &claudeHandle{
-		command:    command,
-		anchor:     anchor,
-		watchdog:   watchdog,
-		groupID:    groupID,
-		resumedID:  resumedID,
-		events:     make(chan runtime.Event, eventChannelDepth),
-		done:       make(chan struct{}),
-		stopped:    make(chan struct{}),
-		stderrTail: stderrTail,
+		command:      command,
+		anchor:       anchor,
+		watchdog:     watchdog,
+		groupID:      groupID,
+		resumedID:    resumedID,
+		events:       make(chan runtime.Event, eventChannelDepth),
+		done:         make(chan struct{}),
+		stderrDone:   make(chan struct{}),
+		stopped:      make(chan struct{}),
+		stdoutReader: stdoutReader,
+		stderrReader: stderrReader,
+		stderrTail:   stderrTail,
 	}
 	go func() {
 		_, writeErr := io.WriteString(stdin, prompt)
 		handle.setPromptError(errors.Join(writeErr, stdin.Close()))
 	}()
-	go handle.consume(stdout)
+	go handle.consume(stdoutReader)
+	go handle.captureStderr(stderrReader)
 	// The send dies with its context. Without this, a cancelled context left
 	// the CLI running with nobody waiting on it — an agent editing the
 	// operator's repository past the end of the run that authorized it.
@@ -270,12 +306,19 @@ type claudeHandle struct {
 	groupID  int
 	// resumedID is the session this send was told to continue, empty on a
 	// creating send. Result compares it against what the CLI reports back.
-	resumedID  string
-	events     chan runtime.Event
-	done       chan struct{}
+	resumedID string
+	events    chan runtime.Event
+	done      chan struct{}
+	// stderrDone closes when the stderr capture goroutine has finished.
+	stderrDone chan struct{}
 	stopped    chan struct{}
 	stopOnce   sync.Once
-	stderrTail *tailBuffer
+	// stdoutReader and stderrReader are the read ends jig owns. Closing them
+	// is what bounds the drain when a descendant outlives the CLI still
+	// holding the write end.
+	stdoutReader *os.File
+	stderrReader *os.File
+	stderrTail   *tailBuffer
 
 	mutex       sync.Mutex
 	killed      bool
@@ -446,17 +489,24 @@ func (h *claudeHandle) emit(event runtime.Event) {
 // ErrKilled; a clean exit without a result event is an error, never an
 // empty envelope.
 func (h *claudeHandle) Result() (runtime.Result, error) {
-	// Drain before Wait, never after: Cmd.Wait closes the read end of the
-	// stdout pipe as soon as the process exits, so waiting first can cut
-	// consume off mid-stream and lose the terminal `result` line still sitting
-	// in the pipe — reported downstream as "claude returned no terminal result
-	// event", a phase failure with no cause in the transcript. consume ends at
-	// EOF on its own, so this needs no help from Wait.
-	<-h.done
+	// Wait first, then drain — safe here only because both streams are on
+	// descriptors jig owns, so Wait closes nothing the reader is using and
+	// cannot cut consume off mid-stream (which would lose the terminal
+	// `result` line still sitting in the pipe and surface downstream as
+	// "claude returned no terminal result event": a phase failure with no
+	// cause in the transcript).
+	//
+	// Waiting on the process rather than on EOF is what keeps shutdown
+	// independent of the stream. A descendant that inherited stdout and
+	// outlived the CLI holds the write end open, so EOF never arrives on its
+	// own; blocking on it here left Result hanging for a CLI that had already
+	// exited, with the group still alive and nobody stopping it.
 	waitErr := h.command.Wait()
 	// The CLI is gone; release the group. The anchor ignores TERM by design,
-	// so this is the one place it dies.
+	// so this is the one place it dies. This is also what frees the inherited
+	// descriptor: any descendant still holding stdout is in this group.
 	h.stopEverything(0)
+	h.drainStream()
 	_ = h.anchor.Wait()
 
 	h.mutex.Lock()
@@ -484,6 +534,39 @@ func (h *claudeHandle) Result() (runtime.Result, error) {
 			ErrSessionDiscontinuity, h.resumedID, h.result.SessionID)
 	}
 	return h.result, h.finalErr
+}
+
+// drainStream finishes the stream capture after the CLI has exited and the
+// group has been released, and bounds how long that can take.
+//
+// With the group gone the readers normally reach EOF immediately, and the
+// grace window is never spent. It exists for the one case the group teardown
+// cannot reach: a descendant that left the group (its own setpgid/setsid)
+// while still holding the inherited write end. Closing the read end from
+// under the reader ends the capture rather than waiting on a descriptor that
+// may never be released.
+//
+// The final wait is unbounded on purpose: at that point consume can only be
+// blocked publishing to the event channel, and every caller of Result must
+// drain Events — the same contract that made the previous `<-h.done` legal.
+func (h *claudeHandle) drainStream() {
+	timer := time.NewTimer(streamDrainGrace)
+	defer timer.Stop()
+	select {
+	case <-h.done:
+	case <-timer.C:
+	}
+	_ = h.stdoutReader.Close()
+	_ = h.stderrReader.Close()
+	<-h.done
+	<-h.stderrDone
+}
+
+// captureStderr keeps the bounded stderr tail. It reads through a descriptor
+// jig owns, so Cmd.Wait never blocks on it.
+func (h *claudeHandle) captureStderr(reader io.Reader) {
+	defer close(h.stderrDone)
+	_, _ = io.Copy(h.stderrTail, reader)
 }
 
 // stopGroup TERMs the process group, waits up to grace, then KILLs it. ESRCH

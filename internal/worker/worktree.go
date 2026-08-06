@@ -222,36 +222,64 @@ func (w *Worker) removeWorktree(ctx context.Context, manifest attemptManifest, f
 // would answer "not registered" for every worktree — turning the check that
 // exists because "git reporting success is not the same as the worktree being
 // gone" into one that can never fail.
+//
+// A path that cannot be canonicalized is reported as an error, never as an
+// absence. This function is the proof half of removeWorktree, and its caller
+// reads false as "the registration is gone"; a swallowed resolution failure
+// would make "I could not tell" indistinguishable from "it is not there" and
+// let cleanup be declared complete on no evidence at all.
 func worktreeRegistered(ctx context.Context, repositoryDir, path string) (bool, error) {
 	stdout, err := runGit(ctx, repositoryDir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return false, err
 	}
-	want := resolvedWorktreePath(path)
+	want, err := resolvedWorktreePath(path)
+	if err != nil {
+		return false, fmt.Errorf("canonicalize worktree path %s: %w", path, err)
+	}
+	var unresolved error
 	for _, line := range strings.Split(stdout, "\n") {
 		value, found := strings.CutPrefix(line, "worktree ")
 		if !found {
 			continue
 		}
-		absolute, absErr := filepath.Abs(strings.TrimSpace(value))
+		listed := strings.TrimSpace(value)
+		absolute, absErr := filepath.Abs(listed)
 		if absErr != nil {
+			unresolved = errors.Join(unresolved,
+				fmt.Errorf("listed worktree %q: %w", listed, absErr))
 			continue
 		}
-		if resolvedWorktreePath(absolute) == want {
+		resolved, resolveErr := resolvedWorktreePath(absolute)
+		if resolveErr != nil {
+			unresolved = errors.Join(unresolved,
+				fmt.Errorf("listed worktree %s: %w", absolute, resolveErr))
+			continue
+		}
+		if resolved == want {
 			return true, nil
 		}
+	}
+	if unresolved != nil {
+		// Not matching entries that could not be canonicalized is not proof
+		// that none of them is ours.
+		return false, fmt.Errorf(
+			"git's worktree list could not be canonicalized: %w", unresolved)
 	}
 	return false, nil
 }
 
 // resolvedWorktreePath canonicalizes a worktree path through its parent
 // directory, so it still resolves after the worktree itself has been deleted
-// — which is exactly when worktreeRegistered runs.
-func resolvedWorktreePath(path string) string {
+// — which is exactly when worktreeRegistered runs. A parent that cannot be
+// resolved yields an error rather than the unresolved input: comparing an
+// unresolved path against a resolved one answers "different" for paths that
+// are in fact the same.
+func resolvedWorktreePath(path string) (string, error) {
 	path = filepath.Clean(path)
 	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
-		return path
+		return "", err
 	}
-	return filepath.Join(parent, filepath.Base(path))
+	return filepath.Join(parent, filepath.Base(path)), nil
 }

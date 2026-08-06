@@ -62,8 +62,17 @@ const (
 // signallableProcessGroup reports whether a recorded group id could possibly
 // name an attempt's own process group. Everything at or below 1 is
 // unverifiable by construction: no identity check can make -1, 0, or 1 ours.
+//
+// The value must also survive the int64 -> int conversion every signal path
+// performs, because on a 32-bit build that conversion truncates — and a
+// truncated id is not merely the wrong group. 4294967296 truncates to 0,
+// 4294967297 to 1, 4294967298 to 2: the machine-wide `kill(-1, ...)` and
+// jig's-own-group cases this predicate exists to refuse, reintroduced
+// silently *after* the range check has already passed. An id this platform
+// cannot represent names no local process group, so it is refused rather
+// than reinterpreted.
 func signallableProcessGroup(groupID int64) bool {
-	return groupID >= minimumSignallableProcessGroup
+	return groupID >= minimumSignallableProcessGroup && int64(int(groupID)) == groupID
 }
 
 // ReconcileReport is what one startup reconciliation observed and did.
@@ -317,7 +326,9 @@ func inspectProcessGroupLeader(ctx context.Context, pid int64) (groupID int64, s
 // caller's on purpose: this function negates its argument, so a group id of 1
 // would become `kill(-1, SIGTERM)` — every process the operator's user may
 // signal. That is one bad integer away from destroying the machine's session,
-// and it must not depend on any caller remembering to check first.
+// and it must not depend on any caller remembering to check first. The gate
+// covers the narrowing below as well, so pgid is the recorded value and not a
+// truncation of it.
 func stopProcessGroup(groupID int64) {
 	if !signallableProcessGroup(groupID) {
 		return
