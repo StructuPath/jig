@@ -32,7 +32,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/StructuPath/jig/internal/protocol"
@@ -43,9 +45,32 @@ import (
 // upsert the same worker row instead of accumulating ghosts (KTD12).
 const directWorkerID = "embedded-direct"
 
-// maxDirectClaimAttempts bounds the claim loop that skips over stale queued
-// jobs a crashed earlier direct run may have left behind.
+// directWorkerCapacity is how many direct runs may hold an attempt against
+// one data directory at once. All `jig run` processes share the embedded
+// worker row (KTD12), so its capacity is the concurrency of the whole direct
+// path, not of one process: at capacity 1 a single abandoned attempt made
+// every later run unclaimable. Abandoned slots are reclaimed at startup
+// (reclaimAbandonedDirectRuns), so the capacity can never wedge either.
+const directWorkerCapacity = 8
+
+// maxDirectClaimAttempts bounds the claim loop that skips over queued jobs
+// an interrupted earlier direct run left behind.
 const maxDirectClaimAttempts = 8
+
+// directClaimLockTimeout bounds the wait for the data directory's
+// enqueue-and-claim lock. Concurrent direct runs hold it for one enqueue plus
+// one claim, so anything near this bound is a stuck process, not contention.
+const directClaimLockTimeout = 60 * time.Second
+
+// directClaimLockPoll is how often a waiter retries the claim lock.
+const directClaimLockPoll = 25 * time.Millisecond
+
+// directAttemptStaleAfter is how long past its lease expiry a leased
+// embedded-worker attempt with NO liveness marker must be before startup
+// reclaims it. Markers cover every run this build starts; the wall clock is
+// the backstop for an attempt whose marker was never written or was deleted
+// out from under it.
+const directAttemptStaleAfter = 4 * protocol.LeaseDuration
 
 // DirectOutcome is what the injected executor declares when the chain
 // finishes — the worker Outcome shape without the import (KTD1). State must
@@ -138,7 +163,8 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 	}
 
 	tracesDir := filepath.Join(config.DataDir, "traces")
-	for _, dir := range []string{config.DataDir, tracesDir} {
+	markerDir := directMarkerDir(config.DataDir)
+	for _, dir := range []string{config.DataDir, tracesDir, markerDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return zero, fmt.Errorf("create data directory: %w", err)
 		}
@@ -148,6 +174,12 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 		return zero, err
 	}
 	defer store.Close()
+
+	// Completion must survive cancellation: a Ctrl-C'd run still has to leave
+	// its attempt terminal, or the next run inherits a wedged data directory.
+	// The store writes after execution therefore ride a context detached from
+	// the caller's (R5's "an attempt is never left leased by a live process").
+	completionCtx := context.WithoutCancel(ctx)
 
 	// Env eligibility is checked here with a named answer instead of letting
 	// the claim transaction silently skip the only job (R17): the operator
@@ -167,10 +199,44 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 			spec.Name, strings.Join(missing, ", "))
 	}
 
+	// Enqueue-and-claim is a critical section across direct runs against one
+	// data directory. Serializing it is what makes the orphan heuristic below
+	// safe: while the lock is held, every OTHER queued job is either a job an
+	// interrupted run abandoned (its liveness marker has no holder) or a job
+	// this path did not create at all (no marker — the server path's).
+	claimLock, err := lockDirectClaim(ctx, config.DataDir)
+	if err != nil {
+		return zero, err
+	}
+	claimLockHeld := true
+	releaseClaimLock := func() {
+		if claimLockHeld {
+			claimLockHeld = false
+			claimLock.release()
+		}
+	}
+	defer releaseClaimLock()
+
+	// Self-healing (R5's direct-path half): an ungraceful death — Ctrl-C
+	// before the signal handler, kill -9, a panic — leaves an attempt leased
+	// by a process that no longer exists. Startup reclaims exactly those,
+	// evidenced by a liveness marker with no live holder, so the data
+	// directory can never wedge permanently.
+	if reclaimed, err := store.reclaimAbandonedDirectRuns(ctx, config.DataDir); err != nil {
+		// Reclamation is hygiene, not the run: a failure is surfaced and the
+		// run proceeds (it will simply see the slot still taken).
+		config.Logger.Warn("direct_run_reclaim_failed", "error", err)
+	} else {
+		for _, value := range reclaimed {
+			config.Logger.Info("state_change", "resource_type", "attempt",
+				"resource_id", value.AttemptID, "job_id", value.JobID, "new_state", protocol.AttemptLost)
+		}
+	}
+
 	if _, err := store.RegisterWorker(ctx, directWorkerID, protocol.WorkerRegistration{
 		Name:          "embedded direct runner",
 		WorkerVersion: "jig-run",
-		Capacity:      1,
+		Capacity:      directWorkerCapacity,
 		EnvNames:      config.BaseEnvNames,
 		Runtimes:      []protocol.RuntimeCapability{config.Capability},
 	}); err != nil {
@@ -190,11 +256,24 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 	if err != nil {
 		return zero, err
 	}
-
-	claim, token, err := store.claimDirectJob(ctx, job.ID)
+	// The marker publishes this process as the job's live owner before the
+	// job can ever be seen queued by another run, and holds until this run
+	// exits — however it exits.
+	marker, err := acquireDirectMarker(config.DataDir, job.ID)
 	if err != nil {
+		store.abandonQueuedDirectJob(completionCtx, job.ID, config.Logger)
 		return zero, err
 	}
+	defer marker.release()
+
+	claim, token, err := store.claimDirectJob(ctx, config.DataDir, job.ID)
+	if err != nil {
+		// Never leave our own job queued behind a failed claim: an unowned
+		// queued job is exactly the leak that made repeated runs pile up.
+		store.abandonQueuedDirectJob(completionCtx, job.ID, config.Logger)
+		return zero, err
+	}
+	releaseClaimLock()
 	attemptID := claim.Attempt.ID
 	if _, err := store.StartAttempt(ctx, attemptID, protocol.StartAttemptRequest{
 		LeaseToken:     token,
@@ -206,8 +285,10 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 
 	// The lease still fences the direct path (R6): CompleteAttempt refuses an
 	// expired lease, and real-CLI phases run far longer than LeaseDuration, so
-	// a background heartbeat renews it — the same rhythm the worker keeps.
-	beatCtx, stopBeats := context.WithCancel(ctx)
+	// a background heartbeat renews it — the same rhythm the worker keeps. It
+	// rides the detached context so an interrupted run keeps its lease alive
+	// through teardown and can still record its own cancellation.
+	beatCtx, stopBeats := context.WithCancel(completionCtx)
 	defer stopBeats()
 	go func() {
 		ticker := time.NewTicker(protocol.HeartbeatInterval)
@@ -239,7 +320,16 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 	})
 	stopBeats()
 
-	attempt, err := store.CompleteAttempt(ctx, attemptID, protocol.CompleteAttemptRequest{
+	// An interrupted run still owes the store a verdict. Cancellation is the
+	// honest one when the executor could not declare a terminal state itself.
+	if ctx.Err() != nil && !isWorkerDeclarableState(outcome.State) {
+		outcome.State = protocol.AttemptCancelled
+		if outcome.Error == "" {
+			outcome.Error = "the direct run was interrupted: " + ctx.Err().Error()
+		}
+	}
+
+	attempt, err := store.CompleteAttempt(completionCtx, attemptID, protocol.CompleteAttemptRequest{
 		LeaseToken: token,
 		State:      outcome.State,
 		Result:     outcome.Result,
@@ -248,21 +338,38 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 	if err != nil {
 		return zero, fmt.Errorf("record outcome (engine said %s): %w", outcome.State, err)
 	}
-	if err := store.finishDirectRun(ctx, runID, attempt.State); err != nil {
+	if err := store.finishDirectRun(completionCtx, runID, attempt.State); err != nil {
 		return zero, err
 	}
-	job, err = store.Job(ctx, job.ID)
+	job, err = store.Job(completionCtx, job.ID)
 	if err != nil {
 		return zero, err
 	}
 	return DirectRunResult{RunID: runID, Job: job, Attempt: attempt, TracePath: tracePath}, nil
 }
 
-// claimDirectJob claims until it holds THE job this run enqueued. A crashed
-// earlier direct run can leave an older queued job in the store; FIFO would
-// hand that one over first, so any foreign claim is completed as failed —
-// explicitly, with its cause — and the loop claims again.
-func (s *Store) claimDirectJob(ctx context.Context, jobID string) (*protocol.Claim, string, error) {
+// isWorkerDeclarableState reports whether a state is one a worker (or the
+// injected executor) may declare at completion — the CompleteAttempt
+// vocabulary, which excludes `lost` (only sweep declares that).
+func isWorkerDeclarableState(state string) bool {
+	switch state {
+	case protocol.AttemptAccepted, protocol.AttemptAcceptedUnpublished,
+		protocol.AttemptFailed, protocol.AttemptCancelled:
+		return true
+	}
+	return false
+}
+
+// claimDirectJob claims until it holds THE job this run enqueued. FIFO can
+// hand an older queued job over first; what happens to that job depends on
+// evidence, never on assumption:
+//
+//   - a job whose liveness marker has no holder was abandoned by an
+//     interrupted direct run — it is failed explicitly, with its cause;
+//   - anything else (another live run's job, a server-path job with no
+//     marker at all) is put back exactly as it was found and the claim is
+//     abandoned. A direct run never destroys work it cannot prove is dead.
+func (s *Store) claimDirectJob(ctx context.Context, dataDir, jobID string) (*protocol.Claim, string, error) {
 	for range maxDirectClaimAttempts {
 		token, err := mintDirectLeaseToken()
 		if err != nil {
@@ -286,15 +393,321 @@ func (s *Store) claimDirectJob(ctx context.Context, jobID string) (*protocol.Cla
 		if claim.Job.ID == jobID {
 			return claim, token, nil
 		}
+		owned, err := directRunAlive(dataDir, claim.Job.ID)
+		if err != nil {
+			return nil, "", err
+		}
+		if owned {
+			if releaseErr := s.releaseDirectClaim(ctx, claim.Attempt.ID, token); releaseErr != nil {
+				return nil, "", releaseErr
+			}
+			return nil, "", fmt.Errorf(
+				"job %s is queued ahead of this run and owned by another live run or the server path; "+
+					"it was released untouched — retry once it is claimed", claim.Job.ID)
+		}
 		if _, err := s.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
 			LeaseToken: token,
 			State:      protocol.AttemptFailed,
-			Error:      "orphaned queued job claimed and failed by a later direct run",
+			Error:      "queued job abandoned by an interrupted direct run; failed by a later direct run",
 		}); err != nil {
+			return nil, "", err
+		}
+		if err := removeDirectMarker(dataDir, claim.Job.ID); err != nil {
 			return nil, "", err
 		}
 	}
 	return nil, "", fmt.Errorf("could not claim job %s within %d claims", jobID, maxDirectClaimAttempts)
+}
+
+// releaseDirectClaim puts a claim back: the attempt returns to `queued` with
+// no worker and no lease, and its job returns to `queued`. Both writes are
+// guarded on the state and the lease digest we hold, so a release can never
+// disturb an attempt someone else already moved on.
+func (s *Store) releaseDirectClaim(ctx context.Context, attemptID, token string) error {
+	now := s.now().UnixMilli()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer tx.Rollback()
+	var jobID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT job_id FROM attempts WHERE id = ?`, attemptID).Scan(&jobID); err != nil {
+		return unavailable(err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE attempts SET state = 'queued', worker_id = NULL, lease_digest = NULL, lease_expires_at = NULL
+		WHERE id = ? AND state = 'preparing' AND lease_digest = ?
+	`, attemptID, digestToken(token))
+	if err != nil {
+		return unavailable(err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return conflict("release_conflict", "the claim to release is no longer ours to release")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = 'queued', updated_at = ? WHERE id = ? AND state = 'active'
+	`, now, jobID); err != nil {
+		return unavailable(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
+// abandonQueuedDirectJob cancels a job this run enqueued but never claimed.
+// Without it, every failed claim would leave one more unowned queued job in
+// the store for the next run to trip over.
+func (s *Store) abandonQueuedDirectJob(ctx context.Context, jobID string, logger *slog.Logger) {
+	if _, err := s.CancelJob(ctx, jobID); err != nil {
+		logger.Warn("direct_run_job_abandon_failed", "job_id", jobID, "error", err)
+	}
+}
+
+// ---- direct-run liveness ---------------------------------------------------
+//
+// A direct run's liveness is a flock-held marker file named for the job it
+// enqueued. The lock lives on the open file description, so it is released by
+// the kernel however the process dies — SIGKILL included — which is what lets
+// a later run tell "still running" from "abandoned" without trusting a pid
+// (pids recycle; a held flock does not).
+
+// directMarkerDir is where per-job liveness markers live.
+func directMarkerDir(dataDir string) string { return filepath.Join(dataDir, "direct-runs") }
+
+func directMarkerPath(dataDir, jobID string) string {
+	return filepath.Join(directMarkerDir(dataDir), jobID+".lock")
+}
+
+// directMarker is one held liveness marker.
+type directMarker struct {
+	file *os.File
+	path string
+}
+
+// acquireDirectMarker creates and locks this run's marker. A marker that is
+// already held means an id collision, which cannot happen for a freshly
+// minted job id — so it is an error, never a silent overwrite.
+func acquireDirectMarker(dataDir, jobID string) (*directMarker, error) {
+	if err := os.MkdirAll(directMarkerDir(dataDir), 0o700); err != nil {
+		return nil, fmt.Errorf("create direct-run marker directory: %w", err)
+	}
+	path := directMarkerPath(dataDir, jobID)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create direct-run marker: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("hold direct-run marker %s: %w", path, err)
+	}
+	if err := file.Truncate(0); err == nil {
+		_, _ = file.WriteString(strconv.Itoa(os.Getpid()) + "\n")
+	}
+	return &directMarker{file: file, path: path}, nil
+}
+
+// release drops the marker. Closing alone would suffice for the lock; the
+// file goes too so a data directory does not accumulate dead markers.
+func (m *directMarker) release() {
+	if m == nil || m.file == nil {
+		return
+	}
+	_ = os.Remove(m.path)
+	_ = m.file.Close()
+}
+
+func removeDirectMarker(dataDir, jobID string) error {
+	if err := os.Remove(directMarkerPath(dataDir, jobID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove direct-run marker: %w", err)
+	}
+	return nil
+}
+
+// directRunAlive reports whether a live process still owns the job's marker.
+// A missing marker answers TRUE — "not provably dead": jobs this path never
+// created (the server path's) have no marker, and destroying them is exactly
+// the mistake this function exists to prevent.
+func directRunAlive(dataDir, jobID string) (bool, error) {
+	file, err := os.OpenFile(directMarkerPath(dataDir, jobID), os.O_RDWR, 0o600)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return true, fmt.Errorf("inspect direct-run marker: %w", err)
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return true, nil
+		}
+		return true, fmt.Errorf("test direct-run marker: %w", err)
+	}
+	// We took the lock, so nobody held it: the owner is gone.
+	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	return false, nil
+}
+
+// directClaimLock is the data directory's enqueue-and-claim mutex.
+type directClaimLock struct{ file *os.File }
+
+func lockDirectClaim(ctx context.Context, dataDir string) (*directClaimLock, error) {
+	path := filepath.Join(dataDir, "direct-claim.lock")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open direct claim lock: %w", err)
+	}
+	deadline := time.Now().Add(directClaimLockTimeout)
+	for {
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return &directClaimLock{file: file}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			file.Close()
+			return nil, fmt.Errorf("take direct claim lock: %w", err)
+		}
+		if ctx.Err() != nil {
+			file.Close()
+			return nil, ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			file.Close()
+			return nil, fmt.Errorf(
+				"another direct run held the claim lock on %s for longer than %s", dataDir, directClaimLockTimeout)
+		}
+		time.Sleep(directClaimLockPoll)
+	}
+}
+
+func (l *directClaimLock) release() {
+	if l == nil || l.file == nil {
+		return
+	}
+	_ = syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	_ = l.file.Close()
+}
+
+// ---- startup reclamation ---------------------------------------------------
+
+// reclaimAbandonedDirectRuns marks terminal every job of this data directory
+// whose direct run is provably gone: its liveness marker exists with no
+// holder, or (the backstop) its attempt is leased by the embedded worker,
+// carries no marker at all, and its lease has been expired far longer than
+// any live run would allow. Jobs with a live owner and jobs this path never
+// created are never touched.
+func (s *Store) reclaimAbandonedDirectRuns(ctx context.Context, dataDir string) ([]LostAttempt, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.id, a.job_id, a.worker_id, a.lease_expires_at
+		FROM attempts a JOIN jobs j ON j.id = a.job_id
+		WHERE a.state IN ('queued', 'preparing', 'running') AND j.state IN ('queued', 'active')
+	`)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	type candidate struct {
+		attemptID, jobID string
+		workerID         sql.NullString
+		expiry           sql.NullInt64
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var value candidate
+		if err := rows.Scan(&value.attemptID, &value.jobID, &value.workerID, &value.expiry); err != nil {
+			rows.Close()
+			return nil, unavailable(err)
+		}
+		candidates = append(candidates, value)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, unavailable(err)
+	}
+
+	staleBefore := s.now().Add(-directAttemptStaleAfter).UnixMilli()
+	var reclaimed []LostAttempt
+	var failures []error
+	for _, value := range candidates {
+		_, markerErr := os.Stat(directMarkerPath(dataDir, value.jobID))
+		reason := ""
+		switch {
+		case markerErr == nil:
+			alive, err := directRunAlive(dataDir, value.jobID)
+			if err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			if alive {
+				continue
+			}
+			reason = "the direct run that owned this job is gone (its liveness marker has no holder)"
+		case errors.Is(markerErr, os.ErrNotExist):
+			// No marker: only the embedded worker's own leased attempts are
+			// ours to judge, and only on wall-clock evidence.
+			if value.workerID.String != directWorkerID || !value.expiry.Valid || value.expiry.Int64 > staleBefore {
+				continue
+			}
+			reason = fmt.Sprintf(
+				"the embedded worker's attempt has been leased with no live owner for more than %s", directAttemptStaleAfter)
+		default:
+			failures = append(failures, fmt.Errorf("inspect direct-run marker: %w", markerErr))
+			continue
+		}
+		if err := s.loseAbandonedAttempt(ctx, value.attemptID, value.jobID, reason); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if err := removeDirectMarker(dataDir, value.jobID); err != nil {
+			failures = append(failures, err)
+		}
+		reclaimed = append(reclaimed, LostAttempt{AttemptID: value.attemptID, JobID: value.jobID})
+	}
+	return reclaimed, errors.Join(failures...)
+}
+
+// loseAbandonedAttempt marks one abandoned attempt `lost` and its job and run
+// failed, in one transaction. `lost` — not `failed` — because no worker token
+// declared this outcome: the same vocabulary sweep uses server-side (R5).
+func (s *Store) loseAbandonedAttempt(ctx context.Context, attemptID, jobID, reason string) error {
+	now := s.now().UnixMilli()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+		UPDATE attempts SET state = 'lost', error = ?, completed_at = ?
+		WHERE id = ? AND state IN ('queued', 'preparing', 'running')
+	`, boundedError(reason), now, attemptID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		// The attempt moved on between our read and this write: leave it alone.
+		return tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = 'failed', updated_at = ? WHERE id = ? AND state IN ('queued', 'active')
+	`, now, jobID); err != nil {
+		return unavailable(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE runs SET state = 'failed', updated_at = ?
+		WHERE id = (SELECT run_id FROM jobs WHERE id = ?) AND state = 'active'
+	`, now, jobID); err != nil {
+		return unavailable(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
+func boundedError(value string) string {
+	if len(value) > protocol.MaxErrorBytes {
+		return value[:protocol.MaxErrorBytes]
+	}
+	return value
 }
 
 // mintDirectLeaseToken mints the embedded worker's fencing token — same

@@ -35,16 +35,25 @@ func (r commandResult) Passed() bool {
 // runShellCommand executes one definition command via `sh -c` in dir with
 // the given environment and timeout. The command gets its own process group
 // so a timeout kills everything it spawned, not just the shell.
+//
+// env is REQUIRED. A nil env means Go hands the child jig's own os.Environ()
+// — every API key the operator exported, and their real HOME — which is
+// exactly the containment KTD10 and KTD11 exist to remove. Commands run in
+// the worktree an agent just wrote (a `go test` gate executes agent-authored
+// code), so inheritance must fail loudly rather than silently return.
 func runShellCommand(
 	ctx context.Context, dir, command string, env []string, timeout time.Duration,
 ) commandResult {
+	if env == nil {
+		return commandResult{ExitCode: -1, StartError: "refusing to run a command with an " +
+			"inherited environment: every jig subprocess environment is composed explicitly " +
+			"from the role allowlist plus the ephemeral HOME (KTD10, KTD11)"}
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	shell := exec.Command("/bin/sh", "-c", command)
 	shell.Dir = dir
-	if env != nil {
-		shell.Env = env
-	}
+	shell.Env = env
 	shell.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	tail := &tailWriter{limit: protocol.MaxCommandOutputTailBytes}
 	shell.Stdout = tail

@@ -24,7 +24,14 @@ type gateContext struct {
 	worktree string
 	envelope parsedEnvelope
 	command  string // tests_pass only
-	timeout  timeoutConfig
+	// env is the complete subprocess environment a gate command runs with:
+	// the owning role's allowlist plus the attempt's ephemeral HOME (KTD10,
+	// KTD11). A gate command runs in the worktree the agent just wrote — a
+	// `go test` or `npm test` gate executes agent-authored code — so it is
+	// contained exactly like the agent that wrote it, never with jig's own
+	// environment and the operator's real HOME.
+	env     []string
+	timeout timeoutConfig
 }
 
 // runGate dispatches one configured gate by registry name. Names were
@@ -188,7 +195,7 @@ func gateVerdictConsistent(gc gateContext) protocol.GateReport {
 // evidence the agent can act on.
 func gateTestsPass(gc gateContext) protocol.GateReport {
 	var report protocol.GateReport
-	result := runShellCommand(gc.ctx, gc.worktree, gc.command, nil, gc.timeout.phase)
+	result := runShellCommand(gc.ctx, gc.worktree, gc.command, gc.env, gc.timeout.phase)
 	note := fmt.Sprintf("exit %d", result.ExitCode)
 	if result.TimedOut {
 		note = "timed out"

@@ -5,6 +5,7 @@ package engine_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -990,5 +991,258 @@ acceptance: [all_phases_passed]
 	t.Logf("outcome: %s %s (trace: %s)", outcome.State, outcome.Error, tracePath)
 	if outcome.State != protocol.AttemptAcceptedUnpublished {
 		t.Fatalf("live smoke: state = %q (%s)", outcome.State, outcome.Error)
+	}
+}
+
+// ---- scenario: gate containment (KTD10, KTD11) -----------------------------
+
+// A gate command runs `go test`/`npm test` inside the worktree the agent just
+// wrote, so it executes agent-authored code. It gets the role's environment
+// and the ephemeral HOME, never jig's own environment and the operator's real
+// dotfiles.
+func TestGateCommandsRunUnderTheRoleAllowlistAndTheEphemeralHome(t *testing.T) {
+	repo := initRepo(t)
+	scratchRoot := t.TempDir()
+	dump := filepath.Join(t.TempDir(), "gate-env.txt")
+	fake := enginetest.New(enginetest.Step{
+		Text: envelope(map[string]any{"status": "success", "summary": "done"}),
+	})
+	runner := newTestRunner(t, fake, &recordingSink{}, func(config *engine.Config) {
+		config.ScratchRoot = scratchRoot
+	})
+
+	snapshot := "name: t\n" + oneWriterRoster + `
+phases:
+  - name: build
+    kind: agent
+    owner: writer
+    gates:
+      - {name: tests_pass, command: "env > '` + dump + `'"}
+acceptance: [all_phases_passed]
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+
+	body, err := os.ReadFile(dump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		if name, value, found := strings.Cut(line, "="); found {
+			values[name] = value
+		}
+	}
+	// `sh` itself contributes these three; everything else must have been
+	// composed by the engine.
+	allowed := map[string]bool{
+		"PATH": true, "FOO": true, "HOME": true,
+		"XDG_CONFIG_HOME": true, "XDG_CACHE_HOME": true,
+		"XDG_DATA_HOME": true, "XDG_STATE_HOME": true,
+		"PWD": true, "SHLVL": true, "_": true,
+	}
+	for name := range values {
+		if !allowed[name] {
+			t.Errorf("gate subprocess env carries %q, which is not the allowlist plus the HOME/XDG family", name)
+		}
+	}
+	if values["FOO"] != "bar" {
+		t.Errorf("allowlisted FOO = %q, want bar", values["FOO"])
+	}
+	if _, leaked := values["SECRET"]; leaked {
+		t.Error("SECRET leaked into the gate subprocess env")
+	}
+	if !strings.HasPrefix(values["HOME"], scratchRoot) {
+		t.Fatalf("gate subprocess HOME = %q, want the jig-managed ephemeral home under %q",
+			values["HOME"], scratchRoot)
+	}
+	if realHome, _ := os.UserHomeDir(); values["HOME"] == realHome {
+		t.Fatal("gate subprocess HOME is the operator's real home")
+	}
+	if !strings.HasPrefix(values["XDG_CONFIG_HOME"], values["HOME"]) {
+		t.Errorf("XDG_CONFIG_HOME = %q, want it inside the ephemeral HOME", values["XDG_CONFIG_HOME"])
+	}
+}
+
+// ---- scenario: boundary enforcement on the failure path (R10) --------------
+
+// A phase that fails on parse exhaustion still had a live agent in the
+// worktree: its out-of-allowlist writes must not survive into the retained
+// worktree or the next phase.
+func TestAPhaseFailingOnItsParseBudgetLeavesNoOutOfAllowlistWrites(t *testing.T) {
+	repo := initRepo(t)
+	steps := []enginetest.Step{{
+		Files: map[string]string{"src/ok.txt": "allowed", "stray.txt": "sneaky"},
+		Text:  "not json at all",
+	}}
+	for i := 0; i < protocol.ParseBudgetPerEmission; i++ {
+		steps = append(steps, enginetest.Step{Text: "still not json " + fmt.Sprint(i)})
+	}
+	fake := enginetest.New(steps...)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "stray.txt")); !os.IsNotExist(err) {
+		t.Fatal("an out-of-allowlist write survived a phase that failed on its parse budget")
+	}
+	if !strings.Contains(outcome.Error, "never produced a valid envelope") {
+		t.Fatalf("error %q lost the original failure", outcome.Error)
+	}
+	if !strings.Contains(outcome.Error, "outside its write allowlist") {
+		t.Fatalf("error %q does not report the breach found on the failure path", outcome.Error)
+	}
+	if !sink.has(protocol.EventError, "write_boundary_breach") {
+		t.Fatal("no write_boundary_breach trace event on the failure path")
+	}
+	if fake.Remaining() != 0 {
+		t.Fatalf("unconsumed scripted steps: %d", fake.Remaining())
+	}
+}
+
+// ---- scenario: the send ladder is really bounded ---------------------------
+
+func TestASendLadderDesignedToBurnItselfStopsAtTheEnforcedBound(t *testing.T) {
+	repo := initRepo(t)
+	const cap = 3
+	steps := make([]enginetest.Step, 0, cap)
+	for i := 0; i < cap; i++ {
+		steps = append(steps, enginetest.Step{Text: "never parseable " + fmt.Sprint(i)})
+	}
+	fake := enginetest.New(steps...)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+		config.MaxAttemptSends = cap
+	})
+
+	// Every budget is raised so the parse × gate × crash × repair ladder would
+	// otherwise run for hundreds of sends.
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+    gates:
+      - {name: artifacts_exist, budget: 9}
+    on_fail: {when: "status == fail", run: fix, then: rerun-self, budget: 9}
+  - {name: fix, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	if !strings.Contains(outcome.Error, "send budget") {
+		t.Fatalf("error %q is not the send-budget terminal cause", outcome.Error)
+	}
+	if !sink.has(protocol.EventError, "attempt_send_budget_exhausted") {
+		t.Fatal("the send bound did not get its own terminal event")
+	}
+	if fake.Remaining() != 0 {
+		t.Fatalf("the ladder stopped early or late: %d unconsumed steps", fake.Remaining())
+	}
+}
+
+// ---- scenario: the result payload always parses ----------------------------
+
+// Cutting serialized JSON at MaxResultBytes always yields JSON that does not
+// parse, which destroys the acceptance evidence and the changed_paths U7
+// consumes. Oversized inputs must degrade to a smaller VALID document.
+func TestOversizedEnvelopesStillYieldParseableResultJSONWithChangedPaths(t *testing.T) {
+	repo := initRepo(t)
+	const phases = 12
+	evidence := strings.Repeat("e", 12<<10)
+
+	var steps []enginetest.Step
+	chain := ""
+	for i := 0; i < phases; i++ {
+		fields := map[string]any{
+			"status": "success", "summary": "phase " + fmt.Sprint(i), "evidence": evidence,
+		}
+		step := enginetest.Step{Text: envelope(fields)}
+		if i == 0 {
+			step.Files = map[string]string{"out.txt": "content"}
+		}
+		steps = append(steps, step)
+		chain += fmt.Sprintf("  - {name: p%d, kind: agent, owner: writer}\n", i)
+	}
+	fake := enginetest.New(steps...)
+	runner := newTestRunner(t, fake, &recordingSink{}, nil)
+
+	snapshot := "name: t\n" + oneWriterRoster + "\nphases:\n" + chain + "acceptance: [all_phases_passed]\n"
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	if len(outcome.Result) > protocol.MaxResultBytes {
+		t.Fatalf("result payload is %d bytes, over the %d cap", len(outcome.Result), protocol.MaxResultBytes)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(outcome.Result), &summary); err != nil {
+		t.Fatalf("result payload does not parse: %v\n%.400q", err, outcome.Result)
+	}
+	if truncated, _ := summary["truncated"].(bool); !truncated {
+		t.Fatalf("an oversized summary was not marked truncated: %v", summary["truncated"])
+	}
+	paths, ok := summary["changed_paths"].([]any)
+	if !ok || len(paths) == 0 || paths[0] != "out.txt" {
+		t.Fatalf("changed_paths did not survive truncation: %v", summary["changed_paths"])
+	}
+	if _, present := summary["acceptance"]; !present {
+		t.Fatal("the acceptance verdict did not survive truncation")
+	}
+}
+
+// ---- scenario: the runtime's own error flag (R7) ---------------------------
+
+// A CLI can exit 0 and still have failed — auth rejected, rate limited. Its
+// error prose is not an envelope, and re-prompting it 3x per emission, then
+// gate-correcting, then counting deaths, then rerunning the repair edge is a
+// retry storm with the wrong diagnosis.
+func TestARuntimeErrorEndsThePhaseWithoutWalkingTheParseLadder(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		IsError: true,
+		Text:    "API Error: 401 {\"error\":{\"message\":\"invalid x-api-key\"}}",
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+    on_fail: {when: "status == fail", run: fix, then: rerun-self, budget: 2}
+  - {name: fix, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	if !strings.Contains(outcome.Error, "runtime reported a terminal error") {
+		t.Fatalf("error %q does not diagnose the runtime error", outcome.Error)
+	}
+	if !strings.Contains(outcome.Error, "invalid x-api-key") {
+		t.Fatalf("error %q does not surface the CLI's own message", outcome.Error)
+	}
+	// Exactly one send: no parse ladder, no gate correction, no death retry,
+	// no repair-edge rerun.
+	if calls := fake.Calls(); len(calls) != 1 {
+		t.Fatalf("sends = %d, want 1 — the runtime error was retried", len(calls))
+	}
+	if got := sink.count(protocol.EventLog, "invalid_envelope"); got != 0 {
+		t.Fatalf("invalid_envelope events = %d, want 0 — error prose was fed to the parser", got)
+	}
+	if sink.count(protocol.EventPhaseDeath, "") != 0 {
+		t.Fatal("a runtime error was counted as a subprocess death")
 	}
 }

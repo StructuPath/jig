@@ -8,19 +8,33 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/StructuPath/jig/internal/runtime"
 )
 
+// stubScript stands in for the CLI. It echoes back the session id it was
+// given (--session-id or --resume), the way the real CLI does, so session
+// continuity is observable; STUB_MODE=coldstart makes it answer under a
+// different session instead.
 const stubScript = `#!/bin/sh
 case "$1" in
   --version) echo "9.9.9 (Claude Code)"; exit 0 ;;
 esac
 printf '%s\n' "$@" > "$STUB_DIR/args"
+SESSION=""
+PREVIOUS=""
+for ARGUMENT in "$@"; do
+  case "$PREVIOUS" in
+    --session-id|--resume) SESSION="$ARGUMENT" ;;
+  esac
+  PREVIOUS="$ARGUMENT"
+done
 cat > "$STUB_DIR/prompt"
 env > "$STUB_DIR/environment"
 case "$STUB_MODE" in
@@ -30,9 +44,11 @@ case "$STUB_MODE" in
     printf '%s\n' '{"type":"result","result":"boom","is_error":true,"session_id":"sid-err"}' ;;
   noresult)
     printf '%s\n' '{"type":"system","subtype":"init"}' ;;
+  coldstart)
+    printf '{"type":"result","result":"cold start","is_error":false,"session_id":"a-different-session"}\n' ;;
   *)
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"x.txt"}},{"type":"text","text":"working on it"}]}}'
-    printf '%s\n' '{"type":"result","result":"hello from stub","is_error":false,"total_cost_usd":0.5,"session_id":"sid-123","usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":2}}'
+    printf '{"type":"result","result":"hello from stub","is_error":false,"total_cost_usd":0.5,"session_id":"%s","usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":2}}\n' "$SESSION"
     ;;
 esac
 `
@@ -137,7 +153,7 @@ func TestFirstSendCreatesTheSessionAndTheSecondResumesIt(t *testing.T) {
 		t.Error("the worker's own environment leaked into the subprocess")
 	}
 
-	if result.Text != "hello from stub" || result.SessionID != "sid-123" || result.IsError {
+	if result.Text != "hello from stub" || result.SessionID != session.NativeID || result.IsError {
 		t.Fatalf("result = %+v", result)
 	}
 	if result.Usage.CostUSD != 0.5 || result.Usage.TotalTokens != 12 || result.Usage.ContextTokens != 14 {
@@ -208,6 +224,161 @@ func TestKillStopsTheWholeProcessGroupAndResultReportsKilled(t *testing.T) {
 
 func drainQuietly(handle runtime.Handle) {
 	for range handle.Events() {
+	}
+}
+
+// waitForGroupExit polls a process group until nothing in it remains.
+func waitForGroupExit(t *testing.T, groupID int64, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(int(-groupID), 0); err != nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("process group %d still has live members", groupID)
+}
+
+// waitForStub blocks until the stub CLI has actually started.
+func waitForStub(t *testing.T, stubDir string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(stubDir, "prompt")); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the stub CLI never started")
+}
+
+// Cancelling the send's context is the signal path: `jig run` cancels on
+// SIGINT and nothing else is left to stop a bypassPermissions agent that is
+// editing the operator's repository in place.
+func TestCancellingTheContextStopsTheWholeProcessGroupIncludingTheAnchor(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	stubDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handle, err := adapter.StartOrContinue(ctx, &runtime.Session{Key: "attempt-ctx"}, "hang please",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(stubDir, "hang")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupID := handle.ProcessGroupID()
+	if groupID <= 0 {
+		t.Fatal("no process group to stop")
+	}
+	waitForStub(t, stubDir)
+
+	cancel()
+	finished := make(chan error, 1)
+	go func() {
+		drainQuietly(handle)
+		_, resultErr := handle.Result()
+		finished <- resultErr
+	}()
+	select {
+	case resultErr := <-finished:
+		if !errors.Is(resultErr, runtime.ErrKilled) {
+			t.Fatalf("result error = %v, want ErrKilled", resultErr)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("cancelling the context left the send (and its process group) running")
+	}
+	waitForGroupExit(t, groupID, 5*time.Second)
+}
+
+// The anchor is the group's dead-man's switch: if jig dies without
+// unwinding, the closed watchdog pipe must take the anchor AND its group
+// down. Otherwise every interrupted send leaks an immortal anchor.
+func TestTheProcessGroupAnchorDiesWithItsParentAndTakesTheGroupWithIt(t *testing.T) {
+	anchor := exec.Command("/bin/sh", "-c", anchorScript)
+	anchor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	watchdog, err := anchor.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := anchor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	groupID := int64(anchor.Process.Pid)
+
+	// A long-running member of the same group stands in for the agent CLI.
+	member := exec.Command("/bin/sh", "-c", "sleep 60")
+	member.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: int(groupID)}
+	if err := member.Start(); err != nil {
+		t.Fatal(err)
+	}
+	memberExit := make(chan error, 1)
+	go func() { memberExit <- member.Wait() }()
+
+	// Closing the watchdog is exactly what jig's death does to it.
+	if err := watchdog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	anchorExit := make(chan error, 1)
+	go func() { anchorExit <- anchor.Wait() }()
+	select {
+	case <-anchorExit:
+	case <-time.After(20 * time.Second):
+		_ = syscall.Kill(int(-groupID), syscall.SIGKILL)
+		t.Fatal("the anchor survived its parent — one leaked process per interrupted send")
+	}
+	select {
+	case <-memberExit:
+	case <-time.After(20 * time.Second):
+		_ = syscall.Kill(int(-groupID), syscall.SIGKILL)
+		t.Fatal("the anchor died without stopping the rest of its group")
+	}
+	waitForGroupExit(t, groupID, 5*time.Second)
+}
+
+// A --resume that silently cold starts loses the whole conversation. It gets
+// its own diagnostic instead of N context-free corrections downstream.
+func TestAResumeAnsweredUnderADifferentSessionIsSurfaced(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	stubDir := t.TempDir()
+	session := &runtime.Session{Key: "attempt-resume", NativeID: "session-we-asked-to-resume", Sends: 1}
+	handle, err := adapter.StartOrContinue(context.Background(), session, "correct this",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(stubDir, "coldstart")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainQuietly(handle)
+	result, err := handle.Result()
+	if !errors.Is(err, ErrSessionDiscontinuity) {
+		t.Fatalf("error = %v, want ErrSessionDiscontinuity", err)
+	}
+	for _, want := range []string{"session-we-asked-to-resume", "a-different-session"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("diagnostic %q does not name %q", err, want)
+		}
+	}
+	if result.SessionID != "a-different-session" {
+		t.Fatalf("result = %+v, want the CLI's own session id recorded", result)
+	}
+}
+
+// The same check must stay quiet on the healthy path: a resume answered
+// under the session it was given is continuity, not a diagnostic.
+func TestAResumeAnsweredUnderTheSameSessionIsNotADiagnostic(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	stubDir := t.TempDir()
+	session := &runtime.Session{Key: "attempt-resume-ok", NativeID: "live-session", Sends: 1}
+	handle, err := adapter.StartOrContinue(context.Background(), session, "correct this",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(stubDir, "ok")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainQuietly(handle)
+	result, err := handle.Result()
+	if err != nil {
+		t.Fatalf("a faithful resume reported %v", err)
+	}
+	if result.SessionID != "live-session" {
+		t.Fatalf("result = %+v, want the resumed session id", result)
 	}
 }
 

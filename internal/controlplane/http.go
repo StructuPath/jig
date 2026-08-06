@@ -1,10 +1,14 @@
 // http.go — the control plane's HTTP surface (U2). JSON in, JSON out,
 // bounded request bodies, and browser-origin fencing on every state-changing
-// route (R20): a request carrying an Origin header must present either the
-// server's own origin or the per-process UI token. Requests without an
-// Origin header (the worker, curl) pass — the check exists to stop foreign
-// web pages from driving a loopback control plane through the operator's
-// browser, not to authenticate local clients.
+// route (R20): a request carrying an Origin header must first present a
+// trustworthy Host authority (loopback, never a resolved name — see
+// hostAuthorityIsTrusted, which closes the DNS-rebinding hole where an
+// attacker's domain resolves to 127.0.0.1 and Origin/Host agree with each
+// other but not with reality), then either the server's own origin or the
+// per-process UI token. Requests without an Origin header (the worker,
+// curl) pass — the check exists to stop foreign web pages from driving a
+// loopback control plane through the operator's browser, not to
+// authenticate local clients.
 package controlplane
 
 import (
@@ -14,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -214,12 +219,24 @@ func (a *API) releaseWorktree(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry)
 }
 
-// prepareMutation gates every state-changing route (R20): Origin fencing
-// plus a bounded request body. It never authenticates originless clients —
-// loopback binding is the perimeter; this check closes the browser hole in
-// it.
+// prepareMutation gates every state-changing route (R20): a trusted Host
+// authority, Origin fencing, and a bounded request body. It never
+// authenticates originless clients — loopback binding is the perimeter;
+// these checks close the browser hole in it.
 func (a *API) prepareMutation(w http.ResponseWriter, r *http.Request) bool {
 	if origin := r.Header.Get("Origin"); origin != "" && !a.uiTokenPresented(r) {
+		// r.Host is attacker-controlled under DNS rebinding: a page served
+		// from evil.test, whose name the attacker points at 127.0.0.1,
+		// makes the browser send both Origin and Host as "evil.test:port".
+		// sameAuthority below would agree they match and wave the request
+		// through same-origin. Reject on the Host authority itself first —
+		// it must name loopback, never an attacker's domain — before
+		// trusting any comparison against it.
+		if !hostAuthorityIsTrusted(r) {
+			writeError(w, &ServiceError{Code: "untrusted_host_authority",
+				Message: "state-changing requests must target a loopback host", Status: 403})
+			return false
+		}
 		parsed, err := url.Parse(origin)
 		if err != nil || parsed.Scheme != "http" || !sameAuthority(parsed.Host, r.Host) {
 			writeError(w, &ServiceError{Code: "cross_origin_request",
@@ -239,6 +256,65 @@ func (a *API) uiTokenPresented(r *http.Request) bool {
 
 func sameAuthority(left, right string) bool {
 	return strings.EqualFold(strings.TrimSuffix(left, "."), strings.TrimSuffix(right, "."))
+}
+
+// hostAuthorityIsTrusted reports whether r.Host names loopback rather than
+// an attacker's DNS-rebound domain (R20). The hostname must be a loopback
+// IP literal (127.0.0.0/8, ::1) or "localhost" — never resolved, so a
+// rebound name can never satisfy it by any DNS trick. When Host carries a
+// port and the server's own listener port is known from the connection
+// (net/http sets LocalAddrContextKey per accepted connection; direct
+// ServeHTTP calls in tests do not), that port must match too, closing the
+// door on a same-machine service masquerading on a different loopback port.
+// A portless Host is accepted on the hostname check alone.
+func hostAuthorityIsTrusted(r *http.Request) bool {
+	host, port, hasPort := splitHostAuthority(r.Host)
+	if !isLoopbackHostname(host) {
+		return false
+	}
+	if !hasPort {
+		return true
+	}
+	if expected, ok := listenerPort(r); ok && expected != port {
+		return false
+	}
+	return true
+}
+
+// splitHostAuthority splits a Host header value into hostname and port.
+// Unlike net.SplitHostPort it tolerates a portless authority ("127.0.0.1",
+// "[::1]", "localhost") by falling back to the whole value with brackets
+// trimmed.
+func splitHostAuthority(hostHeader string) (host, port string, hasPort bool) {
+	if h, p, err := net.SplitHostPort(hostHeader); err == nil {
+		return h, p, true
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(hostHeader, "["), "]"), "", false
+}
+
+// isLoopbackHostname reports whether host is a loopback IP literal or the
+// literal name "localhost". It never resolves — resolution is exactly the
+// step DNS rebinding subverts.
+func isLoopbackHostname(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(host, "localhost")
+}
+
+// listenerPort reports the port the server actually accepted this
+// connection on, when known.
+func listenerPort(r *http.Request) (string, bool) {
+	addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if !ok {
+		return "", false
+	}
+	_, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return "", false
+	}
+	return port, true
 }
 
 // decodeJSON reads exactly one JSON value with unknown fields rejected. A

@@ -38,6 +38,26 @@ import (
 // is the definition behaving, so acceptance treats it as passed.
 const phaseStatusSkipped = "skipped"
 
+// defaultMaxAttemptSends is the enforced ceiling on prompt sends inside ONE
+// attempt. Every send is checked against it before the subprocess starts, and
+// exceeding it ends the attempt with its own terminal cause.
+//
+// TODO(protocol): WorstCaseSendCount understates the ladder. The constant in
+// internal/protocol declares gate_budget × parse_budget = 6 and is referenced
+// by no code; the ladder the engine actually walks is
+// parse(budget+1 emissions) × gate(budget+1 emissions) × crash
+// re-entries(budget+1) × repair edge(budget+1 self runs plus budget target
+// dispatches) — roughly 252 sends for a single phase at budget 3, and more
+// once several phases carry edges. Until that constant is corrected (it lives
+// in a package this pass does not own) the real bound is the one enforced
+// here.
+const defaultMaxAttemptSends = 64
+
+// maxPhaseEnvelopeBytes caps the envelope blob one phase result may embed in
+// the attempt summary, so the summary is bounded by capping its INPUTS rather
+// than by cutting the serialized JSON afterwards.
+const maxPhaseEnvelopeBytes = 8 << 10
+
 // timeoutConfig is the attempt's three clocks (R11): the per-phase wall
 // clock, the no-output watchdog, and the per-attempt ceiling.
 type timeoutConfig struct {
@@ -73,6 +93,9 @@ type Config struct {
 	PhaseTimeout    time.Duration
 	NoOutputTimeout time.Duration
 	AttemptCeiling  time.Duration
+	// MaxAttemptSends bounds prompt sends across the whole attempt. Zero
+	// means defaultMaxAttemptSends.
+	MaxAttemptSends int
 }
 
 // Runner is the phase engine: one per worker, stateless across attempts.
@@ -102,6 +125,9 @@ func New(config Config) (*Runner, error) {
 	}
 	if config.AttemptCeiling == 0 {
 		config.AttemptCeiling = protocol.MaxAttemptDuration
+	}
+	if config.MaxAttemptSends == 0 {
+		config.MaxAttemptSends = defaultMaxAttemptSends
 	}
 	return &Runner{config: config}, nil
 }
@@ -206,6 +232,10 @@ type execution struct {
 	seededRoles  map[string]bool
 	phaseEntries map[string]int
 	touchedPaths map[string]bool
+	// sends counts every prompt send this attempt has issued, across phases,
+	// parse corrections, gate corrections, crash re-entries, and repair
+	// dispatches alike — the one number the whole ladder is bounded by.
+	sends int
 }
 
 // ---- attempt-level control -------------------------------------------------
@@ -218,6 +248,7 @@ const (
 	endAborted
 	endCancelled
 	endCeiling
+	endSendBudget
 )
 
 type chainEnd struct {
@@ -249,6 +280,13 @@ func (e *execution) run(ctx context.Context) worker.Outcome {
 			map[string]any{"ceiling": e.timeouts.ceiling.String()})
 		return worker.Outcome{State: protocol.AttemptFailed,
 			Error: "attempt wall-clock ceiling exceeded", Result: e.summaryJSON(nil)}
+	case endSendBudget:
+		// Its own terminal cause, like the ceiling: the correction ladder ran
+		// out of budget, which is neither a phase that failed nor a clock.
+		e.emit.emit(protocol.EventError, "", "attempt_send_budget_exhausted",
+			map[string]any{"max_sends": e.runner.config.MaxAttemptSends, "sends": e.sends})
+		return worker.Outcome{State: protocol.AttemptFailed,
+			Error: end.diagnostic, Result: e.summaryJSON(nil)}
 	case endAborted, endFailed:
 		return worker.Outcome{State: protocol.AttemptFailed,
 			Error: end.diagnostic, Result: e.summaryJSON(nil)}
@@ -281,25 +319,122 @@ func acceptanceDiagnostic(acceptance acceptanceResult) string {
 // summaryJSON is the Outcome.Result payload: phase results, acceptance
 // evidence, computed changed paths (U7 stages exactly these, never -A), and
 // the explicit no-publish marker.
+//
+// The size bound is applied to the INPUTS, never to the serialized bytes.
+// Cutting a JSON document at a byte offset always produces a document that
+// does not parse, which destroys the acceptance evidence and the
+// changed_paths U7 consumes — the payload arrives, and nothing downstream can
+// read any of it. So: cap each embedded envelope first, then marshal; and if
+// the result is still over, degrade to a smaller VALID object that still
+// carries the verdict and the changed paths.
 func (e *execution) summaryJSON(acceptance *acceptanceResult) string {
 	var paths []string
 	for path := range e.touchedPaths {
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+
 	summary := map[string]any{
-		"phases":        e.results,
+		"phases":        boundedResults(e.results),
 		"changed_paths": paths,
 		"publish":       "not_attempted",
 	}
 	if acceptance != nil {
 		summary["acceptance"] = acceptance
 	}
-	body, err := json.Marshal(summary)
-	if err != nil {
-		return ""
+	if body, err := json.Marshal(summary); err == nil && len(body) <= protocol.MaxResultBytes {
+		return string(body)
 	}
-	return truncateText(string(body), protocol.MaxResultBytes)
+	return degradedSummaryJSON(e.results, paths, acceptance)
+}
+
+// boundedResults caps every phase result's variable-length content so the
+// summary's size is a property of its inputs. The envelope is replaced by a
+// valid JSON object carrying its prefix, never by a truncated fragment — a
+// json.RawMessage cut mid-object fails to marshal at all.
+func boundedResults(results []protocol.PhaseResult) []protocol.PhaseResult {
+	bounded := make([]protocol.PhaseResult, len(results))
+	for i, result := range results {
+		result.Envelope = boundedEnvelope(result.Envelope)
+		result.Error = truncateText(result.Error, maxPhaseEnvelopeBytes)
+		bounded[i] = result
+	}
+	return bounded
+}
+
+func boundedEnvelope(raw json.RawMessage) json.RawMessage {
+	if len(raw) <= maxPhaseEnvelopeBytes {
+		return raw
+	}
+	marker, err := json.Marshal(map[string]any{
+		"truncated": true,
+		"bytes":     len(raw),
+		"prefix":    string(raw[:maxPhaseEnvelopeBytes]),
+	})
+	if err != nil {
+		return json.RawMessage(`{"truncated":true}`)
+	}
+	return marker
+}
+
+// degradedSummaryJSON is what a summary too large even with bounded envelopes
+// degrades to: valid JSON carrying a truncation marker, the per-phase
+// verdicts, the acceptance result, and changed_paths. If even that does not
+// fit, changed_paths is halved until it does — the marker says so, and the
+// document parses at every step.
+func degradedSummaryJSON(
+	results []protocol.PhaseResult, paths []string, acceptance *acceptanceResult,
+) string {
+	type verdict struct {
+		Phase        string `json:"phase"`
+		Kind         string `json:"kind"`
+		Status       string `json:"status"`
+		PhaseAttempt int    `json:"phase_attempt"`
+		Error        string `json:"error,omitempty"`
+	}
+	verdicts := make([]verdict, len(results))
+	for i, result := range results {
+		verdicts[i] = verdict{
+			Phase: result.Phase, Kind: result.Kind, Status: result.Status,
+			PhaseAttempt: result.PhaseAttempt, Error: truncateText(result.Error, 512),
+		}
+	}
+	degraded := map[string]any{
+		"truncated":         true,
+		"truncation_reason": "attempt summary exceeded MaxResultBytes; per-phase envelopes dropped",
+		"phases":            verdicts,
+		"changed_paths":     paths,
+		"publish":           "not_attempted",
+	}
+	if acceptance != nil {
+		degraded["acceptance"] = acceptance
+	}
+	if body, err := json.Marshal(degraded); err == nil && len(body) <= protocol.MaxResultBytes {
+		return string(body)
+	}
+
+	kept := paths
+	for {
+		minimal := map[string]any{
+			"truncated":               true,
+			"truncation_reason":       "attempt summary exceeded MaxResultBytes; phase detail dropped",
+			"changed_paths":           kept,
+			"changed_paths_truncated": len(kept) < len(paths),
+			"changed_paths_total":     len(paths),
+			"publish":                 "not_attempted",
+		}
+		if acceptance != nil {
+			minimal["acceptance"] = map[string]any{"passed": acceptance.Passed}
+		}
+		body, err := json.Marshal(minimal)
+		if err != nil {
+			return `{"truncated":true,"publish":"not_attempted"}`
+		}
+		if len(body) <= protocol.MaxResultBytes || len(kept) == 0 {
+			return string(body)
+		}
+		kept = kept[:len(kept)/2]
+	}
 }
 
 func (e *execution) cancelled() bool {
@@ -448,6 +583,7 @@ const (
 	phaseAborted // write-boundary breach: the attempt dies, never retried
 	phaseCancelled
 	phaseCeiling
+	phaseSendBudget // the attempt's send ladder hit its enforced bound
 )
 
 type phaseRun struct {
@@ -465,6 +601,24 @@ func (run phaseRun) attemptEnd() *chainEnd {
 		return &chainEnd{endCancelled, run.failure}
 	case phaseCeiling:
 		return &chainEnd{endCeiling, run.failure}
+	case phaseSendBudget:
+		return &chainEnd{endSendBudget, run.failure}
+	}
+	return nil
+}
+
+// terminalSend maps a non-OK send outcome that ends the ATTEMPT onto the
+// phase run it forces. sendDeath and sendRuntimeError are absent on purpose:
+// they end the phase, not the attempt, and their handling needs the
+// per-entry death/fail closures.
+func terminalSend(kind sendEnd, detail string) *phaseRun {
+	switch kind {
+	case sendCancelled:
+		return &phaseRun{outcome: phaseCancelled, failure: detail}
+	case sendCeiling:
+		return &phaseRun{outcome: phaseCeiling}
+	case sendBudget:
+		return &phaseRun{outcome: phaseSendBudget, failure: detail}
 	}
 	return nil
 }
@@ -528,11 +682,13 @@ func (e *execution) runGates(
 	ctx context.Context, phase protocol.PhaseSpec, envelope parsedEnvelope, attempt int,
 ) protocol.GateReport {
 	var merged protocol.GateReport
+	env := e.phaseEnv(phase)
 	for _, gate := range phase.Gates {
 		report := runGate(gateContext{
 			ctx:      ctx,
 			worktree: e.attempt.WorktreePath,
 			envelope: envelope,
+			env:      env,
 			timeout:  e.timeouts,
 		}, gate)
 		e.gateReports[gate.Name] = report
@@ -550,6 +706,22 @@ func (e *execution) runGates(
 	return merged
 }
 
+// phaseEnv composes the environment for everything this phase runs jig-side:
+// its code command and its gates alike. PATH is always allowed so a command
+// can resolve; everything else comes from the owning role's allowlist, and
+// the HOME/XDG family always points at the attempt's ephemeral home (KTD10,
+// KTD11). Code phases run trusted frozen-definition commands but still get
+// the ephemeral HOME so nothing they spawn reads operator dotfiles; gate
+// commands run in the worktree the agent just wrote, which makes them
+// agent-influenced code and gets them the same containment.
+func (e *execution) phaseEnv(phase protocol.PhaseSpec) []string {
+	allow := []string{"PATH"}
+	if phase.Owner != "" {
+		allow = append(allow, e.spec.Roster[phase.Owner].Env...)
+	}
+	return subprocessEnv(e.runner.config.BaseEnv, allow, e.scratch.home)
+}
+
 func (e *execution) mergeFields(fields map[string]any) {
 	for key, value := range fields {
 		e.fieldView[key] = value
@@ -565,14 +737,7 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 		"kind": phase.Kind, "phase_attempt": entry, "command": phase.Command,
 	})
 
-	// Code phases run trusted frozen-definition commands, not agents; they
-	// still get the ephemeral HOME so nothing they spawn reads operator
-	// dotfiles, plus PATH so the command resolves (KTD11).
-	allow := []string{"PATH"}
-	if phase.Owner != "" {
-		allow = append(allow, e.spec.Roster[phase.Owner].Env...)
-	}
-	env := subprocessEnv(e.runner.config.BaseEnv, allow, e.scratch.home)
+	env := e.phaseEnv(phase)
 	// Cancellation during a code phase kills the command's process group via
 	// context cancellation, then reports cancelled rather than a phase fail.
 	commandCtx, stopCommand := context.WithCancel(ctx)
@@ -649,6 +814,41 @@ func (e *execution) failInfra(phase, detail string) phaseRun {
 	return phaseRun{outcome: phaseFailed, failure: fmt.Sprintf("phase %q: %s", phase, detail)}
 }
 
+// enforceWriteBoundary compares the worktree against the pre-phase snapshot
+// (R10). A non-nil terminal is the run the phase must return: an engine
+// failure when the comparison itself broke, or the abort when the role
+// overstepped — the phase result is recorded here in that case, so callers
+// must not record their own. Every exit from an agent phase entry that had a
+// live subprocess goes through this, success and failure alike.
+func (e *execution) enforceWriteBoundary(
+	ctx context.Context, phase protocol.PhaseSpec, entry int, started time.Time,
+	before treeSnapshot, writes []string,
+) (touched []string, terminal *phaseRun) {
+	touched, breaches, err := enforceBoundary(ctx, e.attempt.WorktreePath, before, writes)
+	if err != nil {
+		run := e.failInfra(phase.Name, "write-boundary enforcement: "+err.Error())
+		return nil, &run
+	}
+	if len(breaches) == 0 {
+		return touched, nil
+	}
+	e.emit.emit(protocol.EventError, phase.Name, "write_boundary_breach", map[string]any{
+		"role": phase.Owner, "writes": writes, "breaches": breaches,
+	})
+	e.recordResult(protocol.PhaseResult{
+		Phase: phase.Name, Kind: phase.Kind, Status: protocol.EnvelopeFail,
+		PhaseAttempt: entry, Error: "write boundary breach", StartedAt: &started,
+	})
+	var paths []string
+	for _, item := range breaches {
+		paths = append(paths, item.Path+" — "+item.Outcome)
+	}
+	run := phaseRun{outcome: phaseAborted, failure: fmt.Sprintf(
+		"phase %q: role %q modified %d path(s) outside its write allowlist: %s",
+		phase.Name, phase.Owner, len(breaches), strings.Join(paths, "; "))}
+	return nil, &run
+}
+
 // runAgentPhaseAttempt is one entry of an agent phase: snapshot, prompt,
 // the nested parse/gate correction loops, boundary enforcement, envelope
 // persistence. died=true means the subprocess was killed or crashed and the
@@ -714,7 +914,17 @@ func (e *execution) runAgentPhaseAttempt(
 		})
 		return phaseRun{outcome: phaseFailed, failure: detail}, true
 	}
+	// A phase that fails on parse exhaustion, gate-budget exhaustion, or a
+	// terminal runtime error has still had a live agent in the worktree. The
+	// boundary is enforced here too, or breaching writes survive into the
+	// retained worktree and the next phase — a failed phase is not a phase
+	// that wrote nothing (R10).
 	fail := func(detail string) (phaseRun, bool) {
+		if _, terminal := e.enforceWriteBoundary(
+			ctx, phase, entry, started, before, role.Writes); terminal != nil {
+			terminal.failure = detail + " — and " + terminal.failure
+			return *terminal, false
+		}
 		e.recordResult(protocol.PhaseResult{
 			Phase: phase.Name, Kind: phase.Kind, Status: protocol.EnvelopeFail,
 			PhaseAttempt: entry, Error: detail, StartedAt: &started,
@@ -730,10 +940,12 @@ func (e *execution) runAgentPhaseAttempt(
 	switch sendEndKind {
 	case sendDeath:
 		return death(sendDetail)
-	case sendCancelled:
-		return phaseRun{outcome: phaseCancelled, failure: sendDetail}, false
-	case sendCeiling:
-		return phaseRun{outcome: phaseCeiling}, false
+	case sendRuntimeError:
+		return fail(sendDetail)
+	default:
+		if terminal := terminalSend(sendEndKind, sendDetail); terminal != nil {
+			return *terminal, false
+		}
 	}
 
 	// Gate-correction loop with the parse budget NESTED inside: every
@@ -749,10 +961,10 @@ func (e *execution) runAgentPhaseAttempt(
 		switch parseEnd {
 		case sendDeath:
 			return death(parseDetail)
-		case sendCancelled:
-			return phaseRun{outcome: phaseCancelled, failure: parseDetail}, false
-		case sendCeiling:
-			return phaseRun{outcome: phaseCeiling}, false
+		default:
+			if terminal := terminalSend(parseEnd, parseDetail); terminal != nil {
+				return *terminal, false
+			}
 		}
 		if !ok {
 			return fail(parseDetail)
@@ -770,35 +982,21 @@ func (e *execution) runAgentPhaseAttempt(
 		switch sendEndKind {
 		case sendDeath:
 			return death(sendDetail)
-		case sendCancelled:
-			return phaseRun{outcome: phaseCancelled, failure: sendDetail}, false
-		case sendCeiling:
-			return phaseRun{outcome: phaseCeiling}, false
+		case sendRuntimeError:
+			return fail(sendDetail)
+		default:
+			if terminal := terminalSend(sendEndKind, sendDetail); terminal != nil {
+				return *terminal, false
+			}
 		}
 	}
 
 	// Permission is checked after every send is done and before the envelope
 	// is accepted: an agent does not get to report success on a phase in
 	// which it wrote somewhere it was not allowed to (R10).
-	touched, breaches, err := enforceBoundary(ctx, e.attempt.WorktreePath, before, role.Writes)
-	if err != nil {
-		return e.failInfra(phase.Name, "write-boundary enforcement: "+err.Error()), false
-	}
-	if len(breaches) > 0 {
-		e.emit.emit(protocol.EventError, phase.Name, "write_boundary_breach", map[string]any{
-			"role": phase.Owner, "writes": role.Writes, "breaches": breaches,
-		})
-		e.recordResult(protocol.PhaseResult{
-			Phase: phase.Name, Kind: phase.Kind, Status: protocol.EnvelopeFail,
-			PhaseAttempt: entry, Error: "write boundary breach", StartedAt: &started,
-		})
-		var paths []string
-		for _, item := range breaches {
-			paths = append(paths, item.Path+" — "+item.Outcome)
-		}
-		return phaseRun{outcome: phaseAborted, failure: fmt.Sprintf(
-			"phase %q: role %q modified %d path(s) outside its write allowlist: %s",
-			phase.Name, phase.Owner, len(breaches), strings.Join(paths, "; "))}, false
+	touched, terminal := e.enforceWriteBoundary(ctx, phase, entry, started, before, role.Writes)
+	if terminal != nil {
+		return *terminal, false
 	}
 	for _, path := range touched {
 		e.touchedPaths[path] = true
@@ -884,6 +1082,16 @@ const (
 	sendDeath
 	sendCancelled
 	sendCeiling
+	// sendBudget: the attempt's enforced send ceiling was reached before this
+	// send started. Terminal for the attempt — the ladder is the cost.
+	sendBudget
+	// sendRuntimeError: the runtime reported its own terminal error (R7).
+	// A CLI can exit 0 and still have failed — auth rejected, rate limited —
+	// and the prose it returns is not an envelope. Re-prompting it 3× per
+	// emission, gate-correcting, counting deaths, and rerunning the repair
+	// edge against a rate limit is a retry storm with the wrong diagnosis, so
+	// this ends the PHASE with no parse ladder at all.
+	sendRuntimeError
 )
 
 // agentSender owns one phase attempt's sends: session continuity (or its
@@ -901,6 +1109,15 @@ type agentSender struct {
 }
 
 func (s *agentSender) send(ctx context.Context, prompt string) (runtime.Result, sendEnd, string) {
+	// Checked BEFORE the subprocess starts: the send that would exceed the
+	// bound is the one that must not happen.
+	if s.execution.sends >= s.runner.config.MaxAttemptSends {
+		return runtime.Result{}, sendBudget, fmt.Sprintf(
+			"attempt send budget (%d) exhausted in phase %q",
+			s.runner.config.MaxAttemptSends, s.phase)
+	}
+	s.execution.sends++
+
 	session := s.sessionFor(s.role)
 	if !s.capability.CanResume && session.Sends > 0 {
 		// The runtime cannot resume: replay a bounded transcript digest into
@@ -956,6 +1173,16 @@ func (s *agentSender) send(ctx context.Context, prompt string) (runtime.Result, 
 	result, err := handle.Result()
 	if err != nil {
 		return runtime.Result{}, sendDeath, "agent subprocess: " + err.Error()
+	}
+	if result.IsError {
+		// The runtime's own terminal-error flag, checked before anything tries
+		// to read an envelope out of the text. What comes back here is the
+		// CLI's diagnosis — "invalid API key", "rate limit exceeded" — and
+		// re-prompting it cannot make it parse.
+		return result, sendRuntimeError, fmt.Sprintf(
+			"runtime reported a terminal error (exit %d): %s",
+			result.ExitCode,
+			truncateText(strings.TrimSpace(result.Text), protocol.MaxCommandOutputTailBytes))
 	}
 	s.spend.InputTokens += result.Usage.InputTokens
 	s.spend.OutputTokens += result.Usage.OutputTokens

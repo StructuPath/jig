@@ -36,6 +36,12 @@ type Step struct {
 	Hang bool
 	// Crash ends the send with a process error and no result.
 	Crash bool
+	// IsError sets the runtime's own terminal-error flag on the result — the
+	// CLI that exits 0 and returns error prose (auth rejected, rate limited)
+	// rather than an envelope. Text carries the CLI's message.
+	IsError bool
+	// ExitCode is the reported process exit status.
+	ExitCode int
 	// Usage is the send's reported accounting.
 	Usage runtime.Usage
 }
@@ -201,7 +207,12 @@ func (h *handle) Result() (runtime.Result, error) {
 	if h.step.Crash {
 		return runtime.Result{}, fmt.Errorf("scripted crash: agent subprocess exited without a result")
 	}
-	return runtime.Result{Text: h.step.Text, Usage: h.step.Usage}, nil
+	return runtime.Result{
+		Text:     h.step.Text,
+		IsError:  h.step.IsError,
+		ExitCode: h.step.ExitCode,
+		Usage:    h.step.Usage,
+	}, nil
 }
 
 // EnvelopeText renders a bare JSON envelope — a convenience for scripts.

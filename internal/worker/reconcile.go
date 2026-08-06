@@ -4,8 +4,14 @@
 // are compared in both directions: a manifest whose worktree survives is
 // retained (never deleted on restart), a manifest whose worktree vanished
 // marks its ledger row lost, and an on-disk worktree with no manifest is an
-// orphan — reported to the operator, touched by nobody. U3 stops no
-// processes because none exist before U4.
+// orphan — reported to the operator, touched by nobody.
+//
+// Reconciliation also stops the agent process groups a crashed worker left
+// running (U4's write side records them). Stopping is identity-gated: pids
+// recycle, so a recorded group is signalled only when the OS still shows its
+// leader leading that exact group and started inside the window the manifest
+// records. Anything less certain is left alone and reported — killing a
+// stranger's process is worse than leaking one of ours.
 //
 // Disposal after a completed attempt fails closed: delete only what is
 // provably worthless (clean at base) or provably published (remote-ref
@@ -19,9 +25,30 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/StructuPath/jig/internal/protocol"
+)
+
+const (
+	// processTerminationGrace is how long a recorded process group gets after
+	// TERM before it is KILLed.
+	processTerminationGrace = 3 * time.Second
+
+	// processTerminationPoll is how often the grace window is re-checked.
+	processTerminationPoll = 25 * time.Millisecond
+
+	// processIdentitySlack absorbs the one-second resolution of the OS start
+	// time and the gap between a process starting and its manifest write.
+	processIdentitySlack = 30 * time.Second
+
+	// processStartLayout parses `ps -o lstart=` on both supported platforms.
+	processStartLayout = "Mon Jan 2 15:04:05 2006"
 )
 
 // ReconcileReport is what one startup reconciliation observed and did.
@@ -34,6 +61,9 @@ type ReconcileReport struct {
 	MissingAttemptIDs []string
 	// OrphanPaths exist on disk with no manifest. Reported, never deleted.
 	OrphanPaths []string
+	// StoppedProcessGroups are the agent process groups this reconciliation
+	// verified as ours and stopped.
+	StoppedProcessGroups []int64
 	// ReleasedAttemptIDs had an operator-released ledger row; their worktrees
 	// were removed under operator confirmation.
 	ReleasedAttemptIDs []string
@@ -60,6 +90,9 @@ func (w *Worker) Reconcile(ctx context.Context) (ReconcileReport, error) {
 		// whatever they covered stays on disk untouched (fail closed).
 		w.logger.Warn("manifest_load_incomplete", "error", loadErr)
 	}
+	// Processes first: an agent still writing into a worktree must be stopped
+	// before anything reasons about that worktree's contents.
+	report.StoppedProcessGroups = w.stopRecordedProcessGroups(ctx, manifests)
 	ledger, err := w.client.Worktrees(ctx)
 	if err != nil {
 		return report, fmt.Errorf("read worktree ledger: %w", err)
@@ -157,6 +190,116 @@ func (w *Worker) Reconcile(ctx context.Context) (ReconcileReport, error) {
 	}
 	report.Ledger = result.Ledger
 	return report, nil
+}
+
+// ---- process-group reconciliation (U4's read side) -------------------------
+
+// stopRecordedProcessGroups stops every agent process group a previous worker
+// process recorded as live. Each candidate is identity-checked first: a
+// recorded group id is just a number, and by the time we read it the pid may
+// belong to someone else's shell. Only a leader that still leads that exact
+// group AND started inside the manifest's own lifetime is ours to signal.
+// Either way the flag is cleared, so one unverifiable manifest cannot make
+// every later reconciliation re-examine it forever.
+func (w *Worker) stopRecordedProcessGroups(ctx context.Context, manifests []attemptManifest) []int64 {
+	var stopped []int64
+	for _, manifest := range manifests {
+		if !manifest.ProcessActive || manifest.ProcessGroupID <= 0 {
+			continue
+		}
+		groupID := manifest.ProcessGroupID
+		ours, reason := processGroupIsOurs(ctx, manifest)
+		if ours {
+			stopProcessGroup(groupID)
+			stopped = append(stopped, groupID)
+			w.logger.Info("orphan_process_group_stopped",
+				"attempt_id", manifest.AttemptID, "process_group_id", groupID)
+		} else {
+			// Not provably ours: never signalled. A recycled pid belongs to
+			// someone else, and this is the line where that is decided.
+			w.logger.Info("orphan_process_group_skipped",
+				"attempt_id", manifest.AttemptID, "process_group_id", groupID, "reason", reason)
+		}
+		if _, err := w.manifests.update(manifest.AttemptID, func(value *attemptManifest) error {
+			value.ProcessActive = false
+			return nil
+		}); err != nil {
+			w.logger.Warn("process_group_clear_failed",
+				"attempt_id", manifest.AttemptID, "error", err)
+		}
+	}
+	return stopped
+}
+
+// processGroupIsOurs answers whether the recorded group's leader is still the
+// process this manifest recorded, and says why when it is not.
+func processGroupIsOurs(ctx context.Context, manifest attemptManifest) (bool, string) {
+	groupID, started, found, err := inspectProcessGroupLeader(ctx, manifest.ProcessGroupID)
+	switch {
+	case err != nil:
+		return false, "process identity could not be read: " + err.Error()
+	case !found:
+		return false, "the recorded group leader no longer exists"
+	case groupID != manifest.ProcessGroupID:
+		return false, fmt.Sprintf("pid %d now leads group %d, not %d",
+			manifest.ProcessGroupID, groupID, manifest.ProcessGroupID)
+	}
+	earliest := manifest.CreatedAt.Add(-processIdentitySlack)
+	latest := manifest.UpdatedAt.Add(processIdentitySlack)
+	if started.Before(earliest) || started.After(latest) {
+		return false, fmt.Sprintf("pid %d started at %s, outside this attempt's lifetime (%s..%s) — recycled",
+			manifest.ProcessGroupID, started.UTC().Format(time.RFC3339),
+			earliest.UTC().Format(time.RFC3339), latest.UTC().Format(time.RFC3339))
+	}
+	return true, ""
+}
+
+// inspectProcessGroupLeader reads the process group and start time of one pid
+// through ps — the portable answer on both supported platforms (macOS and
+// Linux). found=false means the pid is gone.
+func inspectProcessGroupLeader(ctx context.Context, pid int64) (groupID int64, started time.Time, found bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, protocol.GitCommandTimeout)
+	defer cancel()
+	output, runErr := exec.CommandContext(ctx,
+		"ps", "-p", strconv.FormatInt(pid, 10), "-o", "pgid=,lstart=").Output()
+	if runErr != nil {
+		var exitError *exec.ExitError
+		if errors.As(runErr, &exitError) {
+			// ps exits nonzero when the pid does not exist.
+			return 0, time.Time{}, false, nil
+		}
+		return 0, time.Time{}, false, fmt.Errorf("inspect pid %d: %w", pid, runErr)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) < 6 {
+		return 0, time.Time{}, false, fmt.Errorf("unreadable ps answer for pid %d: %q", pid, output)
+	}
+	groupID, parseErr := strconv.ParseInt(fields[0], 10, 64)
+	if parseErr != nil {
+		return 0, time.Time{}, false, fmt.Errorf("unreadable process group for pid %d: %q", pid, output)
+	}
+	started, parseErr = time.ParseInLocation(processStartLayout, strings.Join(fields[1:6], " "), time.Local)
+	if parseErr != nil {
+		return 0, time.Time{}, false, fmt.Errorf("unreadable start time for pid %d: %q", pid, output)
+	}
+	return groupID, started, true, nil
+}
+
+// stopProcessGroup TERMs the whole group, waits out the grace window, then
+// KILLs whatever remains. ESRCH means already gone, which is success.
+func stopProcessGroup(groupID int64) {
+	pgid := int(groupID)
+	if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
+		return
+	}
+	deadline := time.Now().Add(processTerminationGrace)
+	for time.Now().Before(deadline) {
+		time.Sleep(processTerminationPoll)
+		if err := syscall.Kill(-pgid, 0); err != nil {
+			return
+		}
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 }
 
 // retainManifest marks one manifest retained, remembers it for registration

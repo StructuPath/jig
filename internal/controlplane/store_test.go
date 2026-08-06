@@ -534,6 +534,54 @@ func TestAStateChangingRequestCarryingAForeignOriginIsRejected(t *testing.T) {
 	}
 }
 
+// TestDNSRebindingHostIsRejectedEvenWithAMatchingOrigin covers R20's other
+// half: r.Host is attacker-controlled, so a page served from a domain the
+// attacker points at 127.0.0.1 makes the browser send both Origin and Host
+// as that domain. They agree with each other, but the Host itself must
+// still name loopback before that agreement is trusted.
+func TestDNSRebindingHostIsRejectedEvenWithAMatchingOrigin(t *testing.T) {
+	store, _ := newTestStore(t)
+	handler := NewHandler(store, "", nil)
+
+	post := func(host, origin string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest("POST", "http://placeholder/api/jobs/missing/retry", nil)
+		request.Host = host
+		if origin != "" {
+			request.Header.Set("Origin", origin)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	// The rebound domain resolves to the loopback listener, so Origin and
+	// Host agree — the old check alone would let this through.
+	rebound := post("evil.test:8383", "http://evil.test:8383")
+	if rebound.Code != http.StatusForbidden {
+		t.Fatalf("DNS-rebound Host: status %d, want 403", rebound.Code)
+	}
+	if !strings.Contains(rebound.Body.String(), "untrusted_host_authority") {
+		t.Fatalf("DNS-rebound Host body = %s, want untrusted_host_authority", rebound.Body.String())
+	}
+	// A portless rebound name must be caught too.
+	if got := post("evil.test", "http://evil.test").Code; got != http.StatusForbidden {
+		t.Fatalf("portless DNS-rebound Host: status %d, want 403", got)
+	}
+
+	// Loopback Host variants, with and without a port, pass the Host-
+	// authority check and reach the (still-required) Origin match, landing
+	// on 404 past the gate exactly like a legitimate same-origin request.
+	for _, host := range []string{
+		"127.0.0.1", "127.0.0.1:8383",
+		"[::1]", "[::1]:8383",
+		"localhost", "localhost:8383", "LOCALHOST",
+	} {
+		if got := post(host, "http://"+host).Code; got != http.StatusNotFound {
+			t.Fatalf("loopback Host %q: status %d, want 404 past the gate", host, got)
+		}
+	}
+}
+
 func TestBindingToANonLoopbackAddressWithoutTheOptInFlagRefusesToStart(t *testing.T) {
 	store, _ := newTestStore(t)
 	for _, address := range []string{"0.0.0.0:0", "192.168.1.10:8383", ":8383"} {

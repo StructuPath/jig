@@ -54,7 +54,44 @@ const (
 	// terminationGrace is how long TERM gets before KILL when stopping the
 	// process group.
 	terminationGrace = 3 * time.Second
+
+	// anchorSelfTerminationGrace is how long the anchor gives its own group
+	// after the parent-death watchdog fires, before killing it outright. It
+	// lives in the anchor script, so it is written in shell seconds.
+	anchorSelfTerminationGrace = "3"
 )
+
+// anchorSignature marks the anchor's command line so any reconciliation that
+// finds a recorded process group can confirm the leader is still OUR anchor
+// before signalling it (pids recycle).
+const anchorSignature = "jig-process-anchor"
+
+// anchorScript is the process-group anchor: the group leader, and the
+// group's dead-man's switch.
+//
+// It ignores TERM so the group-stop protocol (TERM the group, then KILL)
+// reaches the agent's descendants without killing the leader that keeps the
+// group id valid. It blocks on stdin — a pipe held open only by jig — so the
+// moment jig exits, however it exits (SIGKILL included), the read returns
+// EOF and the anchor tears the whole group down on its way out. Without that
+// watchdog an interrupted jig left an immortal anchor behind per send, and a
+// bypassPermissions CLI still editing the operator's repository.
+var anchorScript = strings.Join([]string{
+	"# " + anchorSignature,
+	"trap '' TERM",
+	"read -r _ 2>/dev/null",
+	"kill -TERM 0 2>/dev/null",
+	"sleep " + anchorSelfTerminationGrace,
+	"kill -KILL 0 2>/dev/null",
+}, "\n")
+
+// ErrSessionDiscontinuity reports that a --resume send came back under a
+// DIFFERENT session id than the one it was told to continue: the CLI cold
+// started instead of resuming, so every correction in that send lost the
+// conversation. Surfacing it as a send failure costs one phase retry with a
+// fresh session; swallowing it costs the whole phase's context and gets
+// misreported as "the agent never produced a valid envelope" (R7, R11).
+var ErrSessionDiscontinuity = errors.New("claude resumed a different session than the one requested")
 
 // Adapter runs the Claude Code CLI. The zero value is not usable; New
 // resolves the executable once so agent subprocesses never depend on PATH
@@ -123,6 +160,7 @@ func (a *Adapter) StartOrContinue(
 		"--verbose",
 		"--permission-mode", "bypassPermissions",
 	}
+	resumedID := ""
 	if session.NativeID == "" {
 		id, err := newUUID()
 		if err != nil {
@@ -131,6 +169,7 @@ func (a *Adapter) StartOrContinue(
 		session.NativeID = id
 		arguments = append(arguments, "--session-id", id)
 	} else {
+		resumedID = session.NativeID
 		arguments = append(arguments, "--resume", session.NativeID)
 	}
 	if opts.Model != "" {
@@ -143,15 +182,29 @@ func (a *Adapter) StartOrContinue(
 		arguments = append(arguments, "--tools", strings.Join(opts.Tools, ","))
 	}
 
-	// Anchor first: a trap-TERM sleep loop that becomes the group leader. It
-	// exists so the group id stays occupied by our own unreaped child for the
-	// handle's whole life — signalling -pgid can never hit a recycled pid.
-	anchor := exec.Command("/bin/sh", "-c", "trap '' TERM; while :; do sleep 3600; done")
+	// Anchor first: a trap-TERM shell that becomes the group leader. It exists
+	// so the group id stays occupied by our own unreaped child for the
+	// handle's whole life — signalling -pgid can never hit a recycled pid —
+	// and it holds the parent-death watchdog that kills the group if jig dies
+	// without unwinding.
+	anchor := exec.Command("/bin/sh", "-c", anchorScript)
 	anchor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	watchdog, err := anchor.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("open process-group anchor watchdog: %w", err)
+	}
 	if err := anchor.Start(); err != nil {
+		watchdog.Close()
 		return nil, fmt.Errorf("start process-group anchor: %w", err)
 	}
 	groupID := anchor.Process.Pid
+	// abandon tears down a partially built handle: the group dies and the
+	// anchor is reaped, so a failed start never leaks either.
+	abandon := func() {
+		stopGroup(groupID, 0)
+		_ = watchdog.Close()
+		_ = anchor.Wait()
+	}
 
 	command := exec.Command(a.executable, arguments...)
 	command.Dir = opts.WorkDir
@@ -159,21 +212,18 @@ func (a *Adapter) StartOrContinue(
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: groupID}
 	stdin, err := command.StdinPipe()
 	if err != nil {
-		stopGroup(groupID, 0)
-		_ = anchor.Wait()
+		abandon()
 		return nil, fmt.Errorf("open claude stdin: %w", err)
 	}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		stopGroup(groupID, 0)
-		_ = anchor.Wait()
+		abandon()
 		return nil, fmt.Errorf("open claude stdout: %w", err)
 	}
 	stderrTail := &tailBuffer{limit: protocol.MaxErrorBytes}
 	command.Stderr = stderrTail
 	if err := command.Start(); err != nil {
-		stopGroup(groupID, 0)
-		_ = anchor.Wait()
+		abandon()
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
 	session.Sends++
@@ -181,9 +231,12 @@ func (a *Adapter) StartOrContinue(
 	handle := &claudeHandle{
 		command:    command,
 		anchor:     anchor,
+		watchdog:   watchdog,
 		groupID:    groupID,
+		resumedID:  resumedID,
 		events:     make(chan runtime.Event, eventChannelDepth),
 		done:       make(chan struct{}),
+		stopped:    make(chan struct{}),
 		stderrTail: stderrTail,
 	}
 	go func() {
@@ -191,17 +244,37 @@ func (a *Adapter) StartOrContinue(
 		handle.setPromptError(errors.Join(writeErr, stdin.Close()))
 	}()
 	go handle.consume(stdout)
+	// The send dies with its context. Without this, a cancelled context left
+	// the CLI running with nobody waiting on it — an agent editing the
+	// operator's repository past the end of the run that authorized it.
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = handle.Kill()
+		case <-handle.done:
+		case <-handle.stopped:
+		}
+	}()
 	return handle, nil
 }
 
 // claudeHandle is one in-flight send: the CLI process, its anchor-led
 // process group, and the bounded stream capture.
 type claudeHandle struct {
-	command    *exec.Cmd
-	anchor     *exec.Cmd
-	groupID    int
+	command *exec.Cmd
+	anchor  *exec.Cmd
+	// watchdog is the write end of the anchor's stdin pipe. It stays open for
+	// the handle's life; closing it (or the process dying) is what tells the
+	// anchor to take the group down with it.
+	watchdog io.WriteCloser
+	groupID  int
+	// resumedID is the session this send was told to continue, empty on a
+	// creating send. Result compares it against what the CLI reports back.
+	resumedID  string
 	events     chan runtime.Event
 	done       chan struct{}
+	stopped    chan struct{}
+	stopOnce   sync.Once
 	stderrTail *tailBuffer
 
 	mutex       sync.Mutex
@@ -222,8 +295,19 @@ func (h *claudeHandle) Kill() error {
 	h.mutex.Lock()
 	h.killed = true
 	h.mutex.Unlock()
-	stopGroup(h.groupID, terminationGrace)
+	h.stopEverything(terminationGrace)
 	return nil
+}
+
+// stopEverything is the single teardown path every exit takes: the whole
+// process group goes, then the watchdog pipe closes so a group that somehow
+// survived still sees its parent-death signal. It is idempotent.
+func (h *claudeHandle) stopEverything(grace time.Duration) {
+	h.stopOnce.Do(func() { close(h.stopped) })
+	stopGroup(h.groupID, grace)
+	if h.watchdog != nil {
+		_ = h.watchdog.Close()
+	}
 }
 
 func (h *claudeHandle) setPromptError(err error) {
@@ -366,7 +450,7 @@ func (h *claudeHandle) Result() (runtime.Result, error) {
 	<-h.done
 	// The CLI is gone; release the group. The anchor ignores TERM by design,
 	// so this is the one place it dies.
-	stopGroup(h.groupID, 0)
+	h.stopEverything(0)
 	_ = h.anchor.Wait()
 
 	h.mutex.Lock()
@@ -386,6 +470,12 @@ func (h *claudeHandle) Result() (runtime.Result, error) {
 		h.finalErr = fmt.Errorf("send prompt to claude: %w", h.promptError)
 	case !h.resultSeen:
 		h.finalErr = errors.New("claude returned no terminal result event")
+	case h.resumedID != "" && h.result.SessionID != "" && h.result.SessionID != h.resumedID:
+		// Asserted continuity, verified: a resume that silently cold started
+		// gets its own diagnostic instead of a phase full of context-free
+		// corrections misreported downstream.
+		h.finalErr = fmt.Errorf("%w: asked to resume %s, the CLI answered under %s",
+			ErrSessionDiscontinuity, h.resumedID, h.result.SessionID)
 	}
 	return h.result, h.finalErr
 }
