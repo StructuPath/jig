@@ -49,7 +49,22 @@ const (
 
 	// processStartLayout parses `ps -o lstart=` on both supported platforms.
 	processStartLayout = "Mon Jan 2 15:04:05 2006"
+
+	// minimumSignallableProcessGroup is the smallest recorded group id that
+	// could ever name an attempt's own agent group. The values below it are
+	// not merely useless, they are catastrophic: `kill(-1, ...)` signals every
+	// process the caller may signal — the operator's entire session — and
+	// `kill(0, ...)` signals jig's own group. A zeroed, corrupted, or
+	// hand-edited manifest field must never reach that syscall.
+	minimumSignallableProcessGroup = 2
 )
+
+// signallableProcessGroup reports whether a recorded group id could possibly
+// name an attempt's own process group. Everything at or below 1 is
+// unverifiable by construction: no identity check can make -1, 0, or 1 ours.
+func signallableProcessGroup(groupID int64) bool {
+	return groupID >= minimumSignallableProcessGroup
+}
 
 // ReconcileReport is what one startup reconciliation observed and did.
 type ReconcileReport struct {
@@ -197,14 +212,16 @@ func (w *Worker) Reconcile(ctx context.Context) (ReconcileReport, error) {
 // stopRecordedProcessGroups stops every agent process group a previous worker
 // process recorded as live. Each candidate is identity-checked first: a
 // recorded group id is just a number, and by the time we read it the pid may
-// belong to someone else's shell. Only a leader that still leads that exact
-// group AND started inside the manifest's own lifetime is ours to signal.
-// Either way the flag is cleared, so one unverifiable manifest cannot make
-// every later reconciliation re-examine it forever.
+// belong to someone else's shell — or to nobody at all, if the field was
+// zeroed or corrupted. Only a group id that can name a real group AND whose
+// leader still leads that exact group AND that started inside the manifest's
+// own lifetime is ours to signal. Either way the flag is cleared, so one
+// unverifiable manifest cannot make every later reconciliation re-examine it
+// forever.
 func (w *Worker) stopRecordedProcessGroups(ctx context.Context, manifests []attemptManifest) []int64 {
 	var stopped []int64
 	for _, manifest := range manifests {
-		if !manifest.ProcessActive || manifest.ProcessGroupID <= 0 {
+		if !manifest.ProcessActive {
 			continue
 		}
 		groupID := manifest.ProcessGroupID
@@ -234,6 +251,14 @@ func (w *Worker) stopRecordedProcessGroups(ctx context.Context, manifests []atte
 // processGroupIsOurs answers whether the recorded group's leader is still the
 // process this manifest recorded, and says why when it is not.
 func processGroupIsOurs(ctx context.Context, manifest attemptManifest) (bool, string) {
+	if !signallableProcessGroup(manifest.ProcessGroupID) {
+		// -1 signals every process the operator's user may signal, 0 signals
+		// jig's own group, 1 is init. None can be an attempt's agent group, so
+		// there is nothing here to verify and nothing to signal.
+		return false, fmt.Sprintf(
+			"recorded process group %d can never name an attempt's own group",
+			manifest.ProcessGroupID)
+	}
 	groupID, started, found, err := inspectProcessGroupLeader(ctx, manifest.ProcessGroupID)
 	switch {
 	case err != nil:
@@ -287,7 +312,16 @@ func inspectProcessGroupLeader(ctx context.Context, pid int64) (groupID int64, s
 
 // stopProcessGroup TERMs the whole group, waits out the grace window, then
 // KILLs whatever remains. ESRCH means already gone, which is success.
+//
+// The range guard is the last gate before the syscall and duplicates the
+// caller's on purpose: this function negates its argument, so a group id of 1
+// would become `kill(-1, SIGTERM)` — every process the operator's user may
+// signal. That is one bad integer away from destroying the machine's session,
+// and it must not depend on any caller remembering to check first.
 func stopProcessGroup(groupID int64) {
+	if !signallableProcessGroup(groupID) {
+		return
+	}
 	pgid := int(groupID)
 	if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
 		return

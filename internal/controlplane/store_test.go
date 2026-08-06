@@ -584,21 +584,22 @@ func TestDNSRebindingHostIsRejectedEvenWithAMatchingOrigin(t *testing.T) {
 
 func TestBindingToANonLoopbackAddressWithoutTheOptInFlagRefusesToStart(t *testing.T) {
 	store, _ := newTestStore(t)
+	ctx := context.Background()
 	for _, address := range []string{"0.0.0.0:0", "192.168.1.10:8383", ":8383"} {
-		if _, err := NewServer(store, ServerConfig{Address: address}); err == nil {
+		if _, err := NewServer(ctx, store, ServerConfig{Address: address}); err == nil {
 			t.Fatalf("NewServer(%q) without AllowNonLoopback must refuse", address)
 		}
 	}
 	// The explicit flag is the only door (R20).
-	if _, err := NewServer(store, ServerConfig{Address: "0.0.0.0:0", AllowNonLoopback: true}); err != nil {
+	if _, err := NewServer(ctx, store, ServerConfig{Address: "0.0.0.0:0", AllowNonLoopback: true}); err != nil {
 		t.Fatalf("NewServer with AllowNonLoopback: %v", err)
 	}
 	// The loopback default binds and serves.
-	server, err := NewServer(store, ServerConfig{Address: "127.0.0.1:0"})
+	server, err := NewServer(ctx, store, ServerConfig{Address: "127.0.0.1:0"})
 	if err != nil {
 		t.Fatalf("NewServer loopback: %v", err)
 	}
-	if err := server.Start(); err != nil {
+	if err := server.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	defer server.Shutdown(context.Background())
@@ -612,6 +613,30 @@ func TestBindingToANonLoopbackAddressWithoutTheOptInFlagRefusesToStart(t *testin
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("health status = %d", response.StatusCode)
+	}
+}
+
+// Startup resolves a name in two places — the R20 loopback refusal and the
+// bind itself. Both take the caller's context so a resolver that cannot
+// answer promptly is a startup that fails rather than one that hangs.
+//
+// Only the bind is asserted. Name resolution is deliberately not: a hosts
+// file entry for "localhost" is answered without a context-aware lookup on
+// platforms using the pure-Go resolver, so NewServer legitimately succeeds
+// on a dead context there while the cgo resolver path returns its error.
+// Asserting that difference tests the platform's resolver, not jig.
+func TestServerStartupBindAnswersToItsContext(t *testing.T) {
+	store, _ := newTestStore(t)
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	server, err := NewServer(context.Background(), store, ServerConfig{Address: "localhost:0"})
+	if err != nil {
+		t.Fatalf("NewServer localhost: %v", err)
+	}
+	if err := server.Start(dead); err == nil {
+		server.Shutdown(context.Background())
+		t.Fatal("Start bound the listener without consulting its context")
 	}
 }
 

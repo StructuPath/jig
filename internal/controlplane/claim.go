@@ -159,6 +159,13 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 	if err := rows.Close(); err != nil {
 		return nil, unavailable(err)
 	}
+	// rows.Next() returns false at end-of-set AND on an iteration error, and
+	// Close reports the driver's error, not the iteration's. Without this a
+	// mid-scan failure truncates the candidate list into an EMPTY claim that
+	// the worker then replays for EmptyClaimTTL with work still queued.
+	if err := rows.Err(); err != nil {
+		return nil, unavailable(err)
+	}
 	chosenJob := ""
 	for _, value := range candidates {
 		spec, err := protocol.ParseDefinition([]byte(value.snapshot))

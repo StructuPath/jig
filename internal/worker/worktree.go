@@ -215,21 +215,43 @@ func (w *Worker) removeWorktree(ctx context.Context, manifest attemptManifest, f
 }
 
 // worktreeRegistered reports whether git still lists the path as a worktree
-// of the cache entry.
+// of the cache entry. Both sides are resolved through symlinks before they
+// are compared: git reports worktree paths in resolved form, while the
+// manifest holds the path jig built. On macOS those differ for every default
+// temporary root (/var is a symlink to /private/var), and a string comparison
+// would answer "not registered" for every worktree — turning the check that
+// exists because "git reporting success is not the same as the worktree being
+// gone" into one that can never fail.
 func worktreeRegistered(ctx context.Context, repositoryDir, path string) (bool, error) {
 	stdout, err := runGit(ctx, repositoryDir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return false, err
 	}
+	want := resolvedWorktreePath(path)
 	for _, line := range strings.Split(stdout, "\n") {
 		value, found := strings.CutPrefix(line, "worktree ")
 		if !found {
 			continue
 		}
 		absolute, absErr := filepath.Abs(strings.TrimSpace(value))
-		if absErr == nil && filepath.Clean(absolute) == path {
+		if absErr != nil {
+			continue
+		}
+		if resolvedWorktreePath(absolute) == want {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// resolvedWorktreePath canonicalizes a worktree path through its parent
+// directory, so it still resolves after the worktree itself has been deleted
+// — which is exactly when worktreeRegistered runs.
+func resolvedWorktreePath(path string) string {
+	path = filepath.Clean(path)
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return path
+	}
+	return filepath.Join(parent, filepath.Base(path))
 }

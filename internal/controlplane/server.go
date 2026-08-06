@@ -42,14 +42,16 @@ type Server struct {
 }
 
 // NewServer builds a server. The R20 bind refusal happens here — before any
-// socket exists — so a misconfigured address never listens at all.
-func NewServer(store *Store, config ServerConfig) (*Server, error) {
+// socket exists — so a misconfigured address never listens at all. ctx bounds
+// the name resolution that refusal needs: a stalled resolver must not be able
+// to hold startup open indefinitely.
+func NewServer(ctx context.Context, store *Store, config ServerConfig) (*Server, error) {
 	address := config.Address
 	if address == "" {
 		address = DefaultListenAddress
 	}
 	if !config.AllowNonLoopback {
-		if err := validateLoopbackAddress(address); err != nil {
+		if err := validateLoopbackAddress(ctx, address); err != nil {
 			return nil, fmt.Errorf(
 				"refusing to bind %q: %w (set AllowNonLoopback to opt in explicitly)", address, err)
 		}
@@ -85,16 +87,18 @@ func NewServer(store *Store, config ServerConfig) (*Server, error) {
 func (s *Server) UIToken() string { return s.uiToken }
 
 // Start binds the listener, launches the sweeper, and serves in the
-// background until Shutdown.
-func (s *Server) Start() error {
-	listener, err := net.Listen("tcp", s.http.Addr)
+// background until Shutdown. ctx bounds the BIND only — it is not the
+// server's lifetime, which Shutdown ends: a caller passing a request-scoped
+// context must not have its server torn down under it.
+func (s *Server) Start(ctx context.Context) error {
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.http.Addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.http.Addr, err)
 	}
 	s.listener = listener
-	ctx, cancel := context.WithCancel(context.Background())
+	serveCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.stop = cancel
-	go s.sweeper.Run(ctx, s.logger)
+	go s.sweeper.Run(serveCtx, s.logger)
 	go func() {
 		if err := s.http.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.logger.Error("http_serve_failed", "error", err)
@@ -122,13 +126,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // validateLoopbackAddress accepts only addresses that cannot receive
 // non-local traffic: a loopback IP literal, or "localhost" when every
 // resolved address is loopback (R20). An empty host — which binds every
-// interface — is refused.
-func validateLoopbackAddress(address string) error {
+// interface — is refused. Both lookups run under the caller's context: the
+// only host that reaches the resolver here is "localhost", and a resolver
+// that cannot answer that promptly must fail the bind rather than hang it.
+func validateLoopbackAddress(ctx context.Context, address string) error {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("listen address must be host:port: %w", err)
 	}
-	if _, err := net.LookupPort("tcp", port); err != nil {
+	if _, err := net.DefaultResolver.LookupPort(ctx, "tcp", port); err != nil {
 		return fmt.Errorf("invalid listen port: %w", err)
 	}
 	host = strings.Trim(host, "[]")
@@ -144,12 +150,12 @@ func validateLoopbackAddress(address string) error {
 	if !strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
 		return errors.New("listen host must be a loopback IP or localhost")
 	}
-	ips, err := net.LookupIP(host)
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil || len(ips) == 0 {
 		return fmt.Errorf("resolve listen host: %w", err)
 	}
-	for _, ip := range ips {
-		if !ip.IsLoopback() {
+	for _, addr := range ips {
+		if !addr.IP.IsLoopback() {
 			return errors.New("listen host resolves outside loopback")
 		}
 	}

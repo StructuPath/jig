@@ -119,7 +119,26 @@ func gateFilesNonEmpty(gc gateContext) protocol.GateReport {
 // disk — an agent reporting work it never wrote is refuted mechanically.
 func gateDiffMatchesClaims(gc gateContext) protocol.GateReport {
 	var report protocol.GateReport
-	claimed, _ := gc.envelope.Fields["changed_files"].([]any)
+	// A gate that records nothing PASSES (Passed() is "no violations"), so an
+	// absent or non-array changed_files would make this gate a no-op for
+	// exactly the agent that declined to answer it. The claim is the thing
+	// being checked: no claim is a failed check, not an exemption.
+	raw, present := gc.envelope.Fields["changed_files"]
+	claimed, isList := raw.([]any)
+	switch {
+	case !present:
+		report.Check("changed_files", false, "the envelope claims no changed_files")
+		return report
+	case !isList:
+		report.Check("changed_files", false,
+			fmt.Sprintf("changed_files must be a list of paths, got %T", raw))
+		return report
+	case len(claimed) == 0:
+		// An empty list is an answer: the phase claims it changed nothing.
+		// Recorded so the green report says what it checked (R9).
+		report.Check("changed_files", true, "the phase claims no changed files")
+		return report
+	}
 	for _, item := range claimed {
 		name, ok := item.(string)
 		if !ok {

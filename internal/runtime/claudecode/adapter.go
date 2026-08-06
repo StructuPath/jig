@@ -446,8 +446,14 @@ func (h *claudeHandle) emit(event runtime.Event) {
 // ErrKilled; a clean exit without a result event is an error, never an
 // empty envelope.
 func (h *claudeHandle) Result() (runtime.Result, error) {
-	waitErr := h.command.Wait()
+	// Drain before Wait, never after: Cmd.Wait closes the read end of the
+	// stdout pipe as soon as the process exits, so waiting first can cut
+	// consume off mid-stream and lose the terminal `result` line still sitting
+	// in the pipe — reported downstream as "claude returned no terminal result
+	// event", a phase failure with no cause in the transcript. consume ends at
+	// EOF on its own, so this needs no help from Wait.
 	<-h.done
+	waitErr := h.command.Wait()
 	// The CLI is gone; release the group. The anchor ignores TERM by design,
 	// so this is the one place it dies.
 	h.stopEverything(0)

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -934,6 +935,34 @@ func (e *execution) runAgentPhaseAttempt(
 		})
 		return phaseRun{outcome: phaseFailed, failure: fmt.Sprintf("phase %q: %s", phase.Name, detail)}, false
 	}
+	// An attempt that ends on the clock, on the send ladder, or on a Ctrl-C
+	// had a live agent in this worktree just as surely as one that failed on
+	// its gates. Without enforcement here those three exits are a way OUT of
+	// R10: an agent that plants a hook in the shared git dir — which outlives
+	// the attempt — and then burns to the ceiling leaves it there, unreported,
+	// in a worktree that cleanup retains BECAUSE it is dirty.
+	//
+	// Only the boundary, not death's full rollback: these exits are terminal
+	// and never retried, so restoring the pre-phase tree would destroy the
+	// authorized work the operator retained the worktree to look at, while
+	// discarding nothing that could carry forward.
+	terminalExit := func(run phaseRun, detail string) (phaseRun, bool) {
+		if sender.sendCount == 0 {
+			// The budget check refuses before the subprocess starts: no agent
+			// ran in this entry, so there is nothing of its to enforce.
+			return run, false
+		}
+		// Detached on purpose: cancellation is one of the exits this guards,
+		// and on the caller's dead context every git command would fail,
+		// turning a cancelled attempt into a spurious engine error. Each
+		// command still carries its own GitCommandTimeout.
+		if _, breach := e.enforceWriteBoundary(
+			context.WithoutCancel(ctx), phase, entry, started, before, role.Writes); breach != nil {
+			breach.failure = detail + " — and " + breach.failure
+			return *breach, false
+		}
+		return run, false
+	}
 
 	prompt := composePrompt(userTemplate, e.attempt.Claim.Parameters, previous, e.scratch.handoff)
 	result, sendEndKind, sendDetail := sender.send(ctx, prompt)
@@ -943,8 +972,8 @@ func (e *execution) runAgentPhaseAttempt(
 	case sendRuntimeError:
 		return fail(sendDetail)
 	default:
-		if terminal := terminalSend(sendEndKind, sendDetail); terminal != nil {
-			return *terminal, false
+		if run := terminalSend(sendEndKind, sendDetail); run != nil {
+			return terminalExit(*run, sendDetail)
 		}
 	}
 
@@ -962,8 +991,8 @@ func (e *execution) runAgentPhaseAttempt(
 		case sendDeath:
 			return death(parseDetail)
 		default:
-			if terminal := terminalSend(parseEnd, parseDetail); terminal != nil {
-				return *terminal, false
+			if run := terminalSend(parseEnd, parseDetail); run != nil {
+				return terminalExit(*run, parseDetail)
 			}
 		}
 		if !ok {
@@ -985,8 +1014,8 @@ func (e *execution) runAgentPhaseAttempt(
 		case sendRuntimeError:
 			return fail(sendDetail)
 		default:
-			if terminal := terminalSend(sendEndKind, sendDetail); terminal != nil {
-				return *terminal, false
+			if run := terminalSend(sendEndKind, sendDetail); run != nil {
+				return terminalExit(*run, sendDetail)
 			}
 		}
 	}
@@ -1275,6 +1304,14 @@ func (e *execution) seedRole(role string, spec protocol.RoleSpec) error {
 
 // rolePrompt resolves prompt content or a worktree-relative path — the two
 // are mutually exclusive at save time.
+//
+// The read is rooted at the worktree, not merely checked against it.
+// filepath.IsLocal is a LEXICAL test and os.ReadFile follows symlinks, so a
+// prompt file an earlier phase was allowed to write ("prompts/reviewer.md"
+// inside its `writes`) could be replaced by a link to ~/.ssh/id_rsa and the
+// next role's system prompt would carry the contents straight into an agent
+// CLI. os.Root resolves every component under the worktree and refuses the
+// escape.
 func (e *execution) rolePrompt(content, path string) (string, error) {
 	if content != "" {
 		return content, nil
@@ -1285,7 +1322,17 @@ func (e *execution) rolePrompt(content, path string) (string, error) {
 	if filepath.IsAbs(path) || !filepath.IsLocal(path) {
 		return "", fmt.Errorf("prompt path %q is not worktree-relative", path)
 	}
-	body, err := os.ReadFile(filepath.Join(e.attempt.WorktreePath, path))
+	root, err := os.OpenRoot(e.attempt.WorktreePath)
+	if err != nil {
+		return "", fmt.Errorf("open worktree for prompt %q: %w", path, err)
+	}
+	defer root.Close()
+	file, err := root.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("read prompt %q: %w", path, err)
+	}
+	defer file.Close()
+	body, err := io.ReadAll(file)
 	if err != nil {
 		return "", fmt.Errorf("read prompt %q: %w", path, err)
 	}

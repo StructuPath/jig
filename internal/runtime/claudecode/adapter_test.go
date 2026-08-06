@@ -46,6 +46,15 @@ case "$STUB_MODE" in
     printf '%s\n' '{"type":"system","subtype":"init"}' ;;
   coldstart)
     printf '{"type":"result","result":"cold start","is_error":false,"session_id":"a-different-session"}\n' ;;
+  flood)
+    PAD=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    PAD="$PAD$PAD$PAD$PAD"
+    COUNT=0
+    while [ "$COUNT" -lt 400 ]; do
+      printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$PAD"
+      COUNT=$((COUNT+1))
+    done
+    printf '{"type":"result","result":"survived the flood","is_error":false,"session_id":"%s"}\n' "$SESSION" ;;
   *)
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"x.txt"}},{"type":"text","text":"working on it"}]}}'
     printf '{"type":"result","result":"hello from stub","is_error":false,"total_cost_usd":0.5,"session_id":"%s","usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":2}}\n' "$SESSION"
@@ -414,5 +423,57 @@ func TestCleanExitWithoutAResultEventIsAnError(t *testing.T) {
 	if _, err := handle.Result(); err == nil ||
 		!strings.Contains(err.Error(), "no terminal result event") {
 		t.Fatalf("error = %v, want the missing-result diagnostic", err)
+	}
+}
+
+// Result's own contract is "wait for the subprocess to exit and the stream to
+// drain", so a caller is entitled to call it while it is still reading the
+// stream. Cmd.Wait closes the read end of the stdout pipe the moment the
+// process exits, so waiting before the reader is finished cuts it off
+// mid-stream and loses whatever is still in the pipe — including the terminal
+// `result` line, which then surfaces as "claude returned no terminal result
+// event": a phase failure whose cause appears nowhere in the transcript.
+func TestTheTerminalResultSurvivesAResultCallThatOverlapsTheStream(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	stubDir := t.TempDir()
+	handle, err := adapter.StartOrContinue(context.Background(),
+		&runtime.Session{Key: "attempt-flood"}, "flood please",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(stubDir, "flood")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type answer struct {
+		result runtime.Result
+		err    error
+	}
+	answers := make(chan answer, 1)
+	go func() {
+		result, resultErr := handle.Result()
+		answers <- answer{result, resultErr}
+	}()
+
+	// The consumer arrives late: by now the CLI has written everything it will
+	// write and exited, and more output is outstanding than any single buffer
+	// between it and the reader holds.
+	time.Sleep(500 * time.Millisecond)
+	events := 0
+	for range handle.Events() {
+		events++
+	}
+
+	select {
+	case got := <-answers:
+		if got.err != nil {
+			t.Fatalf("result error = %v, want the terminal result the CLI actually sent", got.err)
+		}
+		if got.result.Text != "survived the flood" {
+			t.Fatalf("result = %+v, want the terminal result the CLI actually sent", got.result)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Result never returned")
+	}
+	if events != 400 {
+		t.Errorf("the stream delivered %d events, want all 400 the CLI wrote", events)
 	}
 }
