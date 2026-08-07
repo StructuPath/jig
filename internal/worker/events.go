@@ -394,6 +394,38 @@ func (s *TraceStream) buffer(event protocol.Event) {
 	s.pending = append(s.pending, event)
 }
 
+// enforceBound drops the oldest undelivered events until the buffer is back
+// within its cap. It exists for the one path that can exceed the cap in a
+// single step — a failed batch restored at the head — where dropping once is
+// not necessarily enough.
+//
+// The loop stops if a drop frees nothing rather than spinning: dropOldest
+// declines to act on a buffer too short to leave a gap marker behind, which
+// is reachable only with a cap below two. Caller holds the mutex.
+func (s *TraceStream) enforceBound() {
+	for len(s.pending) > s.maxBuffered {
+		before := len(s.pending)
+		s.dropOldest()
+		if len(s.pending) >= before {
+			return
+		}
+	}
+}
+
+// gapCoveredTo reads the upper bound of the range a gap marker declares. The
+// marker's own Seq is its lower bound, so an unreadable payload degrades to
+// "covers itself only" — narrower than the truth, never wider, which keeps a
+// merge from silently shrinking a declared range.
+func gapCoveredTo(event protocol.Event) int64 {
+	var declared struct {
+		ToSeq int64 `json:"to_seq"`
+	}
+	if err := json.Unmarshal(event.Payload, &declared); err != nil {
+		return event.Seq
+	}
+	return declared.ToSeq
+}
+
 // isGapMarker reports whether an event is one this stream synthesized for a
 // dropped run, so consecutive overflows merge into one marker instead of
 // producing a flood of them.
@@ -425,11 +457,25 @@ func (s *TraceStream) dropOldest() {
 		return
 	}
 	discarded := s.pending[:drop]
-	first, last := discarded[0], discarded[drop-1]
+	first := discarded[0]
 	lost := drop
-	if merging {
-		// The head was our own marker, not a lost event.
-		lost--
+	// The range the replacement marker must declare is the widest any
+	// discarded element covered — not simply the last one's seq. A marker
+	// swallowed by this drop already stood for events that are gone, and
+	// letting the new marker end short of that range would leave them
+	// undeclared: silent loss, which is the one outcome this whole mechanism
+	// exists to prevent. Markers can sit anywhere in the run, not only at the
+	// head, because a failed batch is restored in front of whatever was
+	// buffered while it was in flight.
+	covered := discarded[drop-1].Seq
+	for _, event := range discarded {
+		if !isGapMarker(event) {
+			continue
+		}
+		lost-- // our own marker, not a lost event
+		if to := gapCoveredTo(event); to > covered {
+			covered = to
+		}
 	}
 	s.dropped += int64(lost)
 
@@ -444,7 +490,7 @@ func (s *TraceStream) dropOldest() {
 		"reason":     "the worker's event buffer overflowed while ingestion was unavailable",
 		"dropped":    s.dropped,
 		"from_seq":   first.Seq,
-		"to_seq":     last.Seq,
+		"to_seq":     covered,
 		"buffer_cap": s.maxBuffered,
 		"note":       "the complete trace is in the attempt-local JSONL record",
 	})
@@ -461,7 +507,7 @@ func (s *TraceStream) dropOldest() {
 		s.logger.Warn("trace_gap_record_failed", "attempt_id", s.attemptID, "error", err)
 	}
 	s.logger.Warn("trace_buffer_overflow", "attempt_id", s.attemptID,
-		"dropped", lost, "from_seq", first.Seq, "to_seq", last.Seq)
+		"dropped", lost, "from_seq", first.Seq, "to_seq", covered)
 }
 
 // nudge wakes the sender without blocking. Caller holds the mutex.
@@ -557,7 +603,14 @@ func (s *TraceStream) sendOnce(ctx context.Context) (int, error) {
 		// Back at the head, where they were: the batch is the oldest run, so
 		// restoring it in front of whatever arrived meanwhile keeps the buffer
 		// in seq order.
+		//
+		// Then re-apply the bound. Emit kept buffering while this batch was
+		// out — the bound it enforced counted only what was still pending —
+		// so restoring the batch can push the buffer past its cap. Without
+		// this the cap is really maxBuffered plus one batch, and "explicitly
+		// bounded" would be a promise the code does not keep.
 		s.pending = append(batch, s.pending...)
+		s.enforceBound()
 		return 0, err
 	}
 	return count, nil
