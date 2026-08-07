@@ -272,9 +272,24 @@ func TestBufferedEventsReplayInSeqOrderAfterAnOutage(t *testing.T) {
 // The buffer is explicitly bounded, and overflow is visible: the oldest
 // undelivered events are replaced by ONE gap marker naming the range, and the
 // JSONL keeps the complete record.
+// bufferedCount is the buffer's own occupancy, excluding any batch in flight.
+// The overflow bound governs this number; Undelivered deliberately reports a
+// larger one, so a test about the bound has to ask for the right thing.
+func bufferedCount(stream *TraceStream) int {
+	stream.mutex.Lock()
+	defer stream.mutex.Unlock()
+	return len(stream.pending)
+}
+
 func TestBufferOverflowLeavesAGapMarkerRatherThanSilence(t *testing.T) {
 	ingester := &fakeIngester{offline: true}
 	stream, path := newTraceFixture(t, ingester, 6)
+	// The bound is a property of the buffer, not of when the sender happens to
+	// wake. Stop the background sender so the emits below land deterministically
+	// and the assertions measure the mechanism rather than the scheduler; Close
+	// still drains through Flush, which sends inline.
+	stream.stop()
+	<-stream.done
 
 	for seq := int64(1); seq <= 24; seq++ {
 		if err := stream.Emit(event(seq, protocol.EventToolCall, "Write", map[string]any{"seq": seq})); err != nil {
@@ -284,6 +299,9 @@ func TestBufferOverflowLeavesAGapMarkerRatherThanSilence(t *testing.T) {
 	pending, dropped := stream.Undelivered()
 	if pending > 6 {
 		t.Fatalf("the buffer must stay bounded, got %d pending", pending)
+	}
+	if buffered := bufferedCount(stream); buffered > 6 {
+		t.Fatalf("the buffer must stay bounded, got %d buffered", buffered)
 	}
 	if dropped == 0 {
 		t.Fatalf("expected the overflow to be counted")
@@ -476,8 +494,16 @@ func TestARestoredFailedBatchStaysWithinTheBufferBound(t *testing.T) {
 			t.Fatalf("emit: %v", err)
 		}
 	}
-	if pending, _ := stream.Undelivered(); pending > 6 {
-		t.Fatalf("buffer was past its cap before the restore: %d", pending)
+	buffered := bufferedCount(stream)
+	if buffered > 6 {
+		t.Fatalf("buffer was past its cap before the restore: %d", buffered)
+	}
+	// The five on the wire are still undelivered — the control plane has not
+	// accepted them, and it may yet refuse. Undelivered counts them; the cap
+	// above cannot, because they are not this process's to drop.
+	if pending, _ := stream.Undelivered(); pending != buffered+5 {
+		t.Fatalf("undelivered = %d, want %d buffered plus the 5 in flight",
+			pending, buffered+5)
 	}
 
 	close(gate.release)
@@ -490,4 +516,56 @@ func TestARestoredFailedBatchStaysWithinTheBufferBound(t *testing.T) {
 	if _, dropped := stream.Undelivered(); dropped == 0 {
 		t.Fatal("events left the buffer without being counted as dropped")
 	}
+}
+
+// Flush promises that an attempt reporting a terminal state has no events
+// still in the air. Reading only the buffer broke that promise: a batch on
+// the wire has left pending, so an empty buffer looked like a delivered
+// trace, and Flush returned success over events the control plane could still
+// refuse — which is exactly when it goes on to refuse them.
+func TestFlushDoesNotDeclareSuccessOverABatchStillInFlight(t *testing.T) {
+	gate := &gatedIngester{entered: make(chan struct{}), release: make(chan struct{})}
+	stream, _ := newTraceFixture(t, gate, 0)
+	stream.stop()
+	<-stream.done
+
+	for seq := int64(1); seq <= 3; seq++ {
+		if err := stream.Emit(event(seq, protocol.EventToolCall, "Write", nil)); err != nil {
+			t.Fatalf("emit: %v", err)
+		}
+	}
+	sending := make(chan struct{})
+	go func() {
+		defer close(sending)
+		_, _ = stream.sendOnce(context.Background())
+	}()
+	<-gate.entered
+
+	// The buffer is empty and every event is on the wire: the moment a
+	// buffer-only reading calls the trace complete.
+	if buffered := bufferedCount(stream); buffered != 0 {
+		t.Fatalf("expected the whole buffer to be in flight, %d still buffered", buffered)
+	}
+	if pending, _ := stream.Undelivered(); pending != 3 {
+		t.Fatalf("undelivered = %d, want the 3 events still in flight", pending)
+	}
+
+	// Flush must not report done here. Give it a deadline: returning nil is
+	// the bug, timing out is the correct refusal.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	flushed := make(chan error, 1)
+	go func() { flushed <- stream.Flush(ctx) }()
+
+	select {
+	case err := <-flushed:
+		if err == nil {
+			t.Fatal("Flush reported a fully delivered trace while a batch was still in flight")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Flush neither returned nor timed out")
+	}
+
+	close(gate.release)
+	<-sending
 }

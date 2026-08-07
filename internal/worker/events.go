@@ -18,6 +18,13 @@
 // gap-marker event carrying the dropped range, because a UI that silently
 // omits events lies, and the JSONL still holds the complete record.
 //
+// "Undelivered" always means buffered PLUS in flight. A batch that has left
+// the buffer has not landed — the control plane may still refuse it, and then
+// it returns to the head — so Flush, Undelivered and Close all count it, and
+// none of them can report a complete trace over a batch still in doubt. The
+// overflow bound is the one thing that cannot count it, because an event on
+// the wire is not an event this process can drop.
+//
 // Delivery is strictly in seq order with one batch in flight at a time. That
 // is what makes a UI cursor safe across an outage: the cursor can never
 // advance past an event that has not landed, so replayed events always arrive
@@ -246,10 +253,19 @@ type TraceStream struct {
 	mutex   sync.Mutex
 	file    *os.File
 	pending []protocol.Event
-	// sending is true while one batch is out at the control plane. That batch
-	// has already left pending, so the bound below applies to buffered events
-	// exactly; a failed batch is put back at the head.
+	// sending is true while one batch is out at the control plane, and
+	// inflight is how many events that batch holds. The batch has physically
+	// left pending, but it has NOT been delivered — the control plane may yet
+	// refuse it, and then it comes back at the head. Undelivered, Flush and
+	// the buffer bound therefore all count it: an event on the wire is an
+	// event that has not landed, and pretending otherwise is what let Flush
+	// report success over a batch still in doubt.
+	//
+	// Both fields move under the mutex in the same critical section as the
+	// pending slice, so len(pending)+inflight is exact at every moment an
+	// observer can see, never transiently short by a batch.
 	sending   bool
+	inflight  int
 	dropped   int64
 	closed    bool
 	writeErrs int
@@ -385,8 +401,25 @@ func (s *TraceStream) writeRecord(record traceRecord) error {
 	return nil
 }
 
+// undeliveredLocked is how many of this attempt's events the control plane
+// has not confirmed: what is buffered plus whatever is on the wire. Flush,
+// Undelivered and Close all mean this number, so they cannot disagree about
+// whether the trace is complete. Caller holds the mutex.
+func (s *TraceStream) undeliveredLocked() int {
+	return len(s.pending) + s.inflight
+}
+
 // buffer appends one event to the send buffer, dropping the oldest
-// undelivered run when the bound is reached. Caller holds the mutex.
+// undelivered run when the bound is reached.
+//
+// The bound governs the BUFFER, not undeliveredLocked, because a batch on the
+// wire cannot be dropped to make room — the drop would have to reach into a
+// request already sent. Counting it here would only make the buffer evict
+// events it could still have held, and never actually hold the total down. So
+// the honest ceiling is maxBuffered droppable events plus at most one batch
+// in flight, and MaxEventsPerBatch is what bounds that second term.
+//
+// Caller holds the mutex.
 func (s *TraceStream) buffer(event protocol.Event) {
 	if len(s.pending) >= s.maxBuffered {
 		s.dropOldest()
@@ -585,6 +618,9 @@ func (s *TraceStream) sendOnce(ctx context.Context) (int, error) {
 	batch := append([]protocol.Event(nil), s.pending[:count]...)
 	s.pending = append([]protocol.Event(nil), s.pending[count:]...)
 	s.sending = true
+	// Counted as undelivered from the same critical section that removes it:
+	// the total never dips while the batch is in the air.
+	s.inflight = count
 	s.mutex.Unlock()
 
 	_, err := s.ingest.IngestEvents(ctx, s.attemptID, protocol.EventBatch{
@@ -595,6 +631,10 @@ func (s *TraceStream) sendOnce(ctx context.Context) (int, error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	s.sending = false
+	// Either the batch landed, or it is about to go back into pending below.
+	// Clearing it here — under the same lock as that restore — keeps the
+	// total exact through the handover.
+	s.inflight = 0
 	if err != nil {
 		if ctx.Err() == nil {
 			s.logger.Warn("trace_ingest_failed", "attempt_id", s.attemptID,
@@ -622,7 +662,7 @@ func (s *TraceStream) sendOnce(ctx context.Context) (int, error) {
 func (s *TraceStream) Undelivered() (pending int, dropped int64) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	return len(s.pending), s.dropped
+	return s.undeliveredLocked(), s.dropped
 }
 
 // Flush drains the buffer until it is empty or ctx ends. It is what an
@@ -631,7 +671,7 @@ func (s *TraceStream) Undelivered() (pending int, dropped int64) {
 func (s *TraceStream) Flush(ctx context.Context) error {
 	for {
 		s.mutex.Lock()
-		remaining := len(s.pending)
+		remaining := s.undeliveredLocked()
 		s.mutex.Unlock()
 		if remaining == 0 {
 			return nil
@@ -683,7 +723,7 @@ func (s *TraceStream) Close(ctx context.Context) error {
 
 		s.mutex.Lock()
 		s.closed = true
-		remaining := len(s.pending)
+		remaining := s.undeliveredLocked()
 		dropped := s.dropped
 		closeErr := s.file.Close()
 		s.mutex.Unlock()
