@@ -427,3 +427,67 @@ func TestRedactorMatchesJSONEscapedValues(t *testing.T) {
 		t.Fatalf("redaction broke the payload JSON: %v (%s)", err, got.Payload)
 	}
 }
+
+// gatedIngester holds its first send in flight until released, which is what
+// makes the interleaving below deterministic instead of a 1-in-15 flake.
+type gatedIngester struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedIngester) IngestEvents(
+	_ context.Context, _ string, _ protocol.EventBatch,
+) (protocol.EventBatchResult, error) {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	return protocol.EventBatchResult{}, errors.New("control plane is unreachable")
+}
+
+// The bound holds across a failed send, not only across Emit. A batch in
+// flight has already left the buffer, so Emit's check counts only what
+// remains and is satisfied — then restoring that batch at the head carries
+// the buffer past its cap. The package comment calls the buffer explicitly
+// bounded, and this is the path that made that untrue.
+func TestARestoredFailedBatchStaysWithinTheBufferBound(t *testing.T) {
+	gate := &gatedIngester{entered: make(chan struct{}), release: make(chan struct{})}
+	stream, _ := newTraceFixture(t, gate, 6)
+	// Drive the sender by hand: the background loop would race the
+	// interleaving this test exists to pin down.
+	stream.stop()
+	<-stream.done
+
+	for seq := int64(1); seq <= 5; seq++ {
+		if err := stream.Emit(event(seq, protocol.EventToolCall, "Write", nil)); err != nil {
+			t.Fatalf("emit: %v", err)
+		}
+	}
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		_, _ = stream.sendOnce(context.Background())
+	}()
+	<-gate.entered
+
+	// Five events are out. Emit now fills the buffer to its cap, satisfied by
+	// a count that cannot see them.
+	for seq := int64(6); seq <= 30; seq++ {
+		if err := stream.Emit(event(seq, protocol.EventToolCall, "Write", nil)); err != nil {
+			t.Fatalf("emit: %v", err)
+		}
+	}
+	if pending, _ := stream.Undelivered(); pending > 6 {
+		t.Fatalf("buffer was past its cap before the restore: %d", pending)
+	}
+
+	close(gate.release)
+	<-sent
+
+	if pending, _ := stream.Undelivered(); pending > 6 {
+		t.Fatalf("the restored batch carried the buffer to %d, past its cap of 6", pending)
+	}
+	// The drop is accounted for, not silent: the JSONL keeps the full record.
+	if _, dropped := stream.Undelivered(); dropped == 0 {
+		t.Fatal("events left the buffer without being counted as dropped")
+	}
+}
