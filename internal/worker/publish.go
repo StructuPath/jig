@@ -889,6 +889,16 @@ func (w *Worker) StrayPublishBranches(ctx context.Context) ([]StrayBranch, error
 	for _, repository := range repositories {
 		branches, err := w.remoteAttemptBranches(ctx, repository)
 		if err != nil {
+			if remoteRetired(err) {
+				// A remote that no longer exists can neither grow new branches
+				// nor answer for its old ones, and its manifests live on here
+				// forever. Reporting it as an incomplete scan on every startup
+				// would bury the strays an operator can still act on, so the
+				// skip is recorded and the scan stays whole for the rest.
+				w.logger.Info("stray_branch_scan_skipped_retired_remote",
+					"repository", repository, "error", err)
+				continue
+			}
 			scanErrors = append(scanErrors, fmt.Errorf("%s: %w", repository, err))
 			continue
 		}
@@ -921,6 +931,34 @@ func (w *Worker) StrayPublishBranches(ctx context.Context) ([]StrayBranch, error
 		return stray[i].Branch < stray[j].Branch
 	})
 	return stray, errors.Join(scanErrors...)
+}
+
+// remoteRetired reports whether a repository-level git failure means the
+// remote is gone rather than momentarily out of reach. Git has no exit code
+// for "this repository no longer exists" — the distinction lives only in the
+// message — so this matches the not-found signatures the hosts emit.
+//
+// It is deliberately narrow. A timeout, a DNS failure, or a refused
+// credential prompt must not match: those mean "ask again later", and
+// treating them as retired would quietly stop scanning a repository that is
+// still live. The one ambiguity it cannot resolve is a private repository
+// the worker's credentials no longer reach — GitHub answers not-found rather
+// than forbidden so as not to leak existence — which is why the caller logs
+// the skip instead of swallowing it.
+func remoteRetired(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A file:// remote retires by disappearing from the filesystem, and that
+	// arrives typed, before git is ever run — the local analogue of the
+	// not-found answers below. A missing git binary does not match: exec
+	// reports that as exec.ErrNotFound, not a filesystem ENOENT.
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "repository not found") ||
+		strings.Contains(message, "does not appear to be a git repository")
 }
 
 // pushedBranchesForJob is the set of branches the control plane holds a push

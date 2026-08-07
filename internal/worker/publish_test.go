@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -388,6 +390,89 @@ func TestAZombieIsFencedOutWhileItsSuccessorPublishesAndItsStrayBranchIsReported
 	}
 	if stray.RemoteRef == "" || stray.Reason == "" {
 		t.Fatalf("stray branch = %+v, want the remote ref and a reason an operator can act on", stray)
+	}
+}
+
+// A remote that no longer exists is skipped, not reported as an incomplete
+// scan. The scan's input is attempt manifests, which outlive the repository
+// they name, so without this a retired remote makes every worker start report
+// the same permanent failure — and the strays an operator can still act on
+// drown in it.
+func TestAScanSkipsARepositoryWhoseRemoteHasBeenRetired(t *testing.T) {
+	h := newHarness(t)
+	originDir, head, identity := newOriginRepo(t)
+	h.seedRun("run-1", protocol.RunTarget{Repository: identity, BaseSHA: head})
+	h.enqueue("run-1", identity)
+
+	gateway := newFakeGateway()
+	dataDir := filepath.Join(t.TempDir(), "worker")
+	w, _ := newPublishingWorker(t, h, dataDir,
+		writeAndDeclare(t, map[string]string{"work.txt": "published work\n"}), gateway)
+
+	attempt, err := w.ClaimOnce(context.Background())
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if attempt == nil || attempt.State != protocol.AttemptAccepted {
+		t.Fatalf("attempt = %+v, want accepted", attempt)
+	}
+
+	// The remote retires under the worker; the manifest naming it stays behind.
+	if err := os.RemoveAll(originDir); err != nil {
+		t.Fatalf("retire the remote: %v", err)
+	}
+
+	stray, scanErr := w.StrayPublishBranches(context.Background())
+	if scanErr != nil {
+		t.Fatalf("scan reported %v; a retired remote is a skip, not an incomplete scan", scanErr)
+	}
+	if len(stray) != 0 {
+		t.Fatalf("scan reported strays %+v for a retired remote, want none", stray)
+	}
+	report, err := w.ReconcileIncludingPublish(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(report.StrayBranches) != 0 {
+		t.Fatalf("reconcile reported strays %+v, want none", report.StrayBranches)
+	}
+}
+
+// The classifier must stay narrow: anything that means "ask again later"
+// keeps its place in the scan errors, because silently skipping a live
+// repository is how a real stray branch goes unreported forever.
+func TestOnlyAGoneRemoteCountsAsRetired(t *testing.T) {
+	cases := []struct {
+		name    string
+		detail  string
+		retired bool
+	}{
+		{"github deleted the repository", "remote: Repository not found.", true},
+		{"the remote path is gone", "fatal: '/tmp/o.git' does not appear to be a git repository", true},
+		{"dns failure", "fatal: unable to access: Could not resolve host: github.com", false},
+		{"refused credential prompt", "fatal: could not read Username: terminal prompts disabled", false},
+		{"permission denied", "ERROR: Permission to owner/repo denied to jig", false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := fmt.Errorf("git ls-remote --heads origin: exit status 128: %s", testCase.detail)
+			if got := remoteRetired(err); got != testCase.retired {
+				t.Fatalf("remoteRetired(%q) = %v, want %v", testCase.detail, got, testCase.retired)
+			}
+		})
+	}
+	if remoteRetired(nil) {
+		t.Fatal("remoteRetired(nil) = true, want false")
+	}
+	// A file:// remote retires by vanishing, which arrives typed.
+	gone := fmt.Errorf("repository cache entry unavailable: %w",
+		&fs.PathError{Op: "lstat", Path: "/tmp/o.git", Err: fs.ErrNotExist})
+	if !remoteRetired(gone) {
+		t.Fatalf("remoteRetired(%v) = false, want true for a vanished local remote", gone)
+	}
+	// But a missing git binary is not a missing repository.
+	if remoteRetired(&exec.Error{Name: "git", Err: exec.ErrNotFound}) {
+		t.Fatal("a missing git binary was classified as a retired remote")
 	}
 }
 
