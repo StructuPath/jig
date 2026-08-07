@@ -37,9 +37,26 @@ Node is never required: the UI is committed and embedded, and the SQLite
 driver is pure Go — which is also why one command cross-compiles every
 supported platform (`just release`).
 
-**From a release**: download the `jig_<version>_<os>_<arch>.tar.gz` for your
-platform from the releases page, verify it against `SHA256SUMS`, and put
-`jig` on your `PATH`.
+**From a release** (no Go toolchain needed) — pick your platform, check it
+against the published checksums, and put `jig` on your `PATH`:
+
+```sh
+VERSION=v0.1.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')          # darwin or linux
+ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+
+BASE=https://github.com/StructuPath/jig/releases/download/$VERSION
+curl -fsSLO "$BASE/jig_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSLO "$BASE/SHA256SUMS"
+
+sha256sum -c SHA256SUMS --ignore-missing            # macOS: shasum -a 256 -c
+tar -xzf "jig_${VERSION}_${OS}_${ARCH}.tar.gz"
+./jig version
+```
+
+Verify the checksum before you run the binary, not after — that line is the
+only thing standing between a tampered download and an executable you are
+about to trust with your repositories.
 
 You also need at least one agent CLI, authenticated:
 
@@ -140,6 +157,11 @@ Rules worth knowing before you write one:
   `if:` guards, and repair predicates read. Code phases get an adapter
   envelope built from their exit status, so a failing test suite enters the
   repair loop through the same door as a failing agent report.
+- **A verdict is stated, never inferred.** Under `verdict_consistent` a
+  reviewer must write `approved` as a JSON boolean; omitting it is its own
+  gate failure, not a silent rejection. The distinction matters because
+  `on_fail: {when: "approved == false"}` is how a review routes work back to
+  a builder, and a verdict nobody stated must not decide that either way.
 - **Gates verify claims, they do not judge quality.** The registry is
   `artifacts_exist`, `files_non_empty`, `diff_matches_claims`,
   `verdict_consistent`, and `tests_pass(command)`. Repo-specific
