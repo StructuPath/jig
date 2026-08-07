@@ -177,6 +177,11 @@ Within a couple of seconds it claims the queued job, materializes a worktree
 at the pinned SHA, runs the chain, and publishes. Watch it live in the UI:
 one lane per attempt, phases and tool calls as they happen.
 
+If nothing gets claimed, open the **Fleet** view. A worker that never
+registered is not there at all; one that stopped heartbeating reads `stale`,
+and its free slots stop counting toward the fleet's capacity — which is
+exactly what the claim transaction does with them.
+
 Publishing needs a GitHub remote and an authenticated `gh`. Against a local
 repository the push succeeds and the pull request cannot be created, which
 lands the job in `accepted_unpublished` — a distinct state with a

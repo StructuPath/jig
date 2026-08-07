@@ -51,6 +51,7 @@ func NewHandler(store *Store, uiToken string, logger *slog.Logger) http.Handler 
 	mux.HandleFunc("GET /api/runs", api.listRuns)
 	mux.HandleFunc("GET /api/runs/{run_id}", api.getRun)
 	mux.HandleFunc("POST /api/runs/{run_id}/readmit", api.readmitRun)
+	mux.HandleFunc("GET /api/workers", api.listWorkers)
 	mux.HandleFunc("PUT /api/workers/{worker_id}", api.registerWorker)
 	mux.HandleFunc("POST /api/workers/{worker_id}/claims", api.claim)
 	mux.HandleFunc("POST /api/attempts/{attempt_id}/start", api.startAttempt)

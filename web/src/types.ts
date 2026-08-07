@@ -120,6 +120,38 @@ export interface QueueView {
   observed_at: string;
 }
 
+export interface RuntimeCapability {
+  name: string;
+  version: string;
+  can_resume: boolean;
+  reports_cost: boolean;
+}
+
+// FleetMember flattens the control plane's worker record: `live` is the
+// claim transaction's own verdict, computed server-side, because the browser
+// clock has no business deciding whether work can move.
+export interface FleetMember {
+  id: string;
+  name: string;
+  worker_version: string;
+  capacity: number;
+  active_count: number;
+  available: number;
+  live: boolean;
+  env_names: string[] | null;
+  runtimes: RuntimeCapability[] | null;
+  registered_at: string;
+  last_heartbeat: string;
+}
+
+export interface FleetView {
+  workers: FleetMember[] | null;
+  live_count: number;
+  stale_count: number;
+  available_slots: number;
+  observed_at: string;
+}
+
 export interface GateEvidence {
   attempt_id: string;
   phase: string;

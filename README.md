@@ -201,6 +201,14 @@ Two things a worker prints at startup deserve reading: orphan worktrees
 branches on a remote that no fenced push record explains, which is the
 visible residue of a zombie attempt that pushed after its lease expired.
 
+Once it is running, the UI's **Fleet** view (`/fleet`, or `GET /api/workers`)
+is where you check on it: which workers are registered, which agent runtime
+each one owns, how many attempt slots are busy, and whether the control plane
+still counts a worker live. That last one is the usual answer to a queue that
+will not drain — a worker whose heartbeat lapsed is skipped by the claim
+transaction, and the view reports that transaction's own verdict rather than
+a second opinion.
+
 `Ctrl-C` is orderly: it stops new claims, cancels in-flight attempts, records
 their terminal state, and destroys their ephemeral scratch.
 

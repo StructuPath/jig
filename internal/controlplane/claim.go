@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/StructuPath/jig/internal/protocol"
 )
@@ -118,7 +119,7 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 	`, workerID).Scan(&active); err != nil {
 		return nil, unavailable(err)
 	}
-	if now.Sub(fromMillis(lastHeartbeat)) > protocol.WorkerLivenessWindow || active >= capacity {
+	if !workerIsLive(now, fromMillis(lastHeartbeat)) || active >= capacity {
 		return s.commitEmptyClaim(ctx, tx, workerID, input.RequestID, digest, nowMillis)
 	}
 	var advertisedNames []string
@@ -238,6 +239,14 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 	}
 	claim, err := s.claimDetail(ctx, attemptID)
 	return &claim, err
+}
+
+// workerIsLive is the liveness half of claim eligibility (R4, KTD12), named
+// so the fleet view (fleet.go) can state the same fact the claim transaction
+// decides on. A view that recomputed liveness its own way would eventually
+// tell an operator a worker is ready while this transaction skips it.
+func workerIsLive(now, lastHeartbeat time.Time) bool {
+	return now.Sub(lastHeartbeat) <= protocol.WorkerLivenessWindow
 }
 
 // commitEmptyClaim records the empty answer so a replay of the same request
