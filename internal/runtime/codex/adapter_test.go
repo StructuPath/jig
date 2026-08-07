@@ -10,6 +10,7 @@ package codex
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/StructuPath/jig/internal/protocol"
 	"github.com/StructuPath/jig/internal/runtime"
 )
 
@@ -737,5 +739,70 @@ func TestTheAdapterHonoursTheEngineRuntimeContract(t *testing.T) {
 	drainQuietly(hung)
 	if _, err := hung.Result(); !errors.Is(err, runtime.ErrKilled) {
 		t.Fatalf("killed send reported %v, want ErrKilled", err)
+	}
+}
+
+// gatedReader withholds its first read until released. It makes the
+// scheduling window deterministic: the stderr capture provably has not
+// consumed the pipe at the moment drainStream runs, which is the ordering
+// that only shows up on a loaded machine.
+type gatedReader struct {
+	reader io.Reader
+	gate   chan struct{}
+	opened bool
+}
+
+func (g *gatedReader) Read(p []byte) (int, error) {
+	if !g.opened {
+		<-g.gate
+		g.opened = true
+	}
+	return g.reader.Read(p)
+}
+
+// The CLI's diagnostic survives even when stdout's capture finishes first.
+// Closing both read ends on stdout alone cuts the stderr copy off with the
+// bytes still sitting in the pipe, and a nonzero exit then reaches the trace
+// with no cause at all — "exit status 3:" and nothing after it.
+func TestDrainStreamWaitsForTheStderrCaptureBeforeClosingIt(t *testing.T) {
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("open stdout pipe: %v", err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("open stderr pipe: %v", err)
+	}
+	handle := &codexHandle{
+		done:         make(chan struct{}),
+		stderrDone:   make(chan struct{}),
+		stdoutReader: stdoutReader,
+		stderrReader: stderrReader,
+		stderrTail:   &tailBuffer{limit: protocol.MaxErrorBytes},
+	}
+	gate := make(chan struct{})
+	go handle.captureStderr(&gatedReader{reader: stderrReader, gate: gate})
+
+	// The shape a dying CLI leaves behind: its diagnostic is unread in the
+	// pipe and the write end went with the process.
+	if _, err := io.WriteString(stderrWriter, "codex fell over"); err != nil {
+		t.Fatalf("write stderr: %v", err)
+	}
+	_ = stderrWriter.Close()
+	// stdout's capture finishes first — the ordering that loses the tail.
+	_ = stdoutWriter.Close()
+	close(handle.done)
+
+	drained := make(chan struct{})
+	go func() { handle.drainStream(); close(drained) }()
+
+	// Long enough that a drainStream which closes on stdout alone has already
+	// done so; the release then finds a dead descriptor instead of the tail.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	<-drained
+
+	if got := handle.stderrTail.String(); got != "codex fell over" {
+		t.Fatalf("stderr tail = %q, want the CLI's diagnostic intact", got)
 	}
 }

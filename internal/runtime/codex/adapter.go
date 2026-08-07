@@ -710,20 +710,40 @@ func (h *codexHandle) Result() (runtime.Result, error) {
 // under the reader ends the capture rather than waiting on a descriptor that
 // may never be released.
 //
+// Both captures are waited on, never stdout alone. Closing a read end is what
+// ends its capture, so closing the moment stdout finishes can cut the stderr
+// copy off before it has read what the exiting CLI left in the pipe — and for
+// a nonzero exit that tail is the entire cause of the phase death. One
+// deadline spans both waits, because the grace bounds the whole drain rather
+// than each stream separately.
+//
 // The final wait is unbounded on purpose: at that point consume can only be
 // blocked publishing to the event channel, and every caller of Result must
 // drain Events.
 func (h *codexHandle) drainStream() {
-	timer := time.NewTimer(streamDrainGrace)
-	defer timer.Stop()
-	select {
-	case <-h.done:
-	case <-timer.C:
-	}
+	deadline := time.Now().Add(streamDrainGrace)
+	waitClosedBy(h.done, deadline)
+	waitClosedBy(h.stderrDone, deadline)
 	_ = h.stdoutReader.Close()
 	_ = h.stderrReader.Close()
 	<-h.done
 	<-h.stderrDone
+}
+
+// waitClosedBy waits for done to close, giving up at deadline. A deadline
+// already past does not wait at all, which is what lets one budget cover
+// several waits in sequence.
+func waitClosedBy(done <-chan struct{}, deadline time.Time) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 // captureStderr keeps the bounded stderr tail. It reads through a descriptor
