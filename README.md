@@ -296,3 +296,9 @@ The plan this repository was built from is
 `docs/plans/2026-08-05-001-feat-jig-software-factory-plan.md`. It carries the
 requirements (R1–R21) and key technical decisions (KTD1–KTD12) that the code
 comments cite by name.
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
