@@ -196,6 +196,7 @@ h4 {
 
 .badge-accepted .dot,
 .badge-success .dot,
+.badge-live .dot,
 .badge-running .dot {
   background: var(--ok);
 }
@@ -213,6 +214,7 @@ h4 {
 .badge-queued .dot,
 .badge-preparing .dot,
 .badge-mixed .dot,
+.badge-stale .dot,
 .badge-accepted_unpublished .dot {
   background: var(--warn);
 }

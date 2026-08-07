@@ -7,6 +7,7 @@ import type {
   AttemptSummary,
   EnvelopeRecord,
   EventPage,
+  FleetView,
   GateEvidence,
   JobDetail,
   QueueView,
@@ -67,6 +68,7 @@ export const api = {
     request<EnvelopeRecord[] | null>(`/api/attempts/${encodeURIComponent(id)}/envelopes`).then(
       (rows) => rows ?? [],
     ),
+  fleet: () => request<FleetView>("/api/workers"),
   worktrees: () =>
     request<WorktreeLedgerEntry[] | null>("/api/worktrees").then((rows) => rows ?? []),
   releaseWorktree: (attemptID: string) =>

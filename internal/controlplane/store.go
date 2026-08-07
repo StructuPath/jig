@@ -306,21 +306,36 @@ func normalizeEnvNames(names []string) []string {
 	return normalized
 }
 
+// workerSelect is the SELECT the singular read and the fleet read (fleet.go)
+// share. ActiveCount is computed from leased attempts rather than read from
+// the stored counter, so the two reads can never disagree about how busy a
+// worker is.
+const workerSelect = `
+	SELECT id, name, worker_version, capacity, env_names_json, runtimes_json,
+	       registered_at, last_heartbeat,
+	       (SELECT COUNT(*) FROM attempts
+	        WHERE worker_id = workers.id AND state IN ('preparing', 'running'))
+	FROM workers`
+
 // Worker reads one worker record, computing ActiveCount from leased attempts.
 func (s *Store) Worker(ctx context.Context, workerID string) (protocol.Worker, error) {
+	value, err := scanWorker(s.db.QueryRowContext(ctx, workerSelect+` WHERE id = ?`, workerID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return protocol.Worker{}, ErrNotFound
+	}
+	return value, err
+}
+
+// scanWorker reads one workerSelect row. sql.ErrNoRows passes through
+// unwrapped so a single-row caller can map it to ErrNotFound.
+func scanWorker(row rowScanner) (protocol.Worker, error) {
 	var value protocol.Worker
 	var envJSON, runtimesJSON string
 	var registeredAt, lastHeartbeat int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, name, worker_version, capacity, env_names_json, runtimes_json,
-		       registered_at, last_heartbeat,
-		       (SELECT COUNT(*) FROM attempts
-		        WHERE worker_id = workers.id AND state IN ('preparing', 'running'))
-		FROM workers WHERE id = ?
-	`, workerID).Scan(&value.ID, &value.Name, &value.WorkerVersion, &value.Capacity,
+	err := row.Scan(&value.ID, &value.Name, &value.WorkerVersion, &value.Capacity,
 		&envJSON, &runtimesJSON, &registeredAt, &lastHeartbeat, &value.ActiveCount)
 	if errors.Is(err, sql.ErrNoRows) {
-		return value, ErrNotFound
+		return value, err
 	}
 	if err != nil {
 		return value, unavailable(err)
