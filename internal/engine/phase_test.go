@@ -1431,3 +1431,59 @@ acceptance: [all_phases_passed]
 		t.Fatalf("correction prompt does not name the missing claim: %.200q", calls[1].Prompt)
 	}
 }
+
+// ---- scenario: a missing verdict is not a rejection (R9) -------------------
+
+// `approved` is read as a bool, so an omitted field and a stated false carry
+// the same value. Telling an agent it claimed approved=false when it claimed
+// nothing points it at a decision it never made, and the cheapest way to
+// satisfy that complaint is to add approved=true — which converts a missing
+// verdict into an approval. In a definition whose repair edge is
+// `when: "approved == false"`, that skips the revision entirely.
+func TestVerdictConsistentSaysTheVerdictIsMissingRatherThanRejected(t *testing.T) {
+	repo := initRepo(t)
+	omitted := envelope(map[string]any{"status": "success", "summary": "looked around"})
+	wrongType := envelope(map[string]any{"status": "success", "summary": "looked around",
+		"approved": "true"})
+	stated := envelope(map[string]any{"status": "success", "summary": "looked around",
+		"approved": true})
+	fake := enginetest.New(
+		enginetest.Step{Text: omitted},
+		enginetest.Step{Text: wrongType},
+		enginetest.Step{Text: stated},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + oneWriterRoster + `
+phases:
+  - name: review
+    kind: agent
+    owner: writer
+    gates:
+      - {name: verdict_consistent}
+acceptance: [all_phases_passed]
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	if got := sink.count(protocol.EventGateFail, "verdict_consistent"); got != 2 {
+		t.Fatalf("verdict_consistent failed %d time(s), want 2 (omitted, then not a bool)", got)
+	}
+	if fake.Remaining() != 0 {
+		t.Fatalf("unconsumed scripted steps: %d — the gate waved an emission through", fake.Remaining())
+	}
+	calls := fake.Calls()
+	// The omitted-field correction must not accuse the agent of a rejection.
+	if strings.Contains(calls[1].Prompt, "approved=false") {
+		t.Fatalf("correction accuses the agent of a verdict it never gave: %.300q", calls[1].Prompt)
+	}
+	if !strings.Contains(calls[1].Prompt, "missing") {
+		t.Fatalf("correction does not say the verdict is missing: %.300q", calls[1].Prompt)
+	}
+	// A wrong-typed verdict is named as such, never silently read as false.
+	if !strings.Contains(calls[2].Prompt, "boolean") {
+		t.Fatalf("correction does not name the type problem: %.300q", calls[2].Prompt)
+	}
+}

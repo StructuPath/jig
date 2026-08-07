@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -73,8 +74,13 @@ func (f *fakeIngester) delivered() []protocol.Event {
 	return events
 }
 
+// discardLogger throws its output away. It must be io.Discard and not
+// os.NewFile(0, os.DevNull): that call does not open /dev/null, it wraps file
+// descriptor 0 and merely names it. When the test binary runs with stdin
+// closed, fd 0 is free, the trace file opened next takes it, and the "discard"
+// logger writes slog text straight into the JSONL under test.
 func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func newTraceFixture(t *testing.T, ingest EventIngester, maxBuffered int) (*TraceStream, string) {

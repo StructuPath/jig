@@ -154,7 +154,7 @@ Rules worth knowing before you write one:
 jig def validate examples/definitions/simple-sdlc.yaml
 jig def create examples/definitions/simple-sdlc.yaml
 jig def list --json
-jig def invoke <definition-id> --instructions "add a --version flag" --repo github.com/you/repo
+jig def invoke --instructions "add a --version flag" --repo github.com/you/repo <definition-id>
 ```
 
 ---

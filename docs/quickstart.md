@@ -142,10 +142,15 @@ In a second terminal, save a definition and admit a run:
 ./bin/jig def create examples/definitions/two-phase.yaml
 ./bin/jig def list
 
-./bin/jig def invoke <definition-id> \
+./bin/jig def invoke \
     --instructions "write the note this repository is missing" \
-    --repo "$PWD"
+    --repo "$PWD" \
+    <definition-id>
 ```
+
+Flags come before the definition id. Go's flag parser stops at the first
+positional argument, so `def invoke <id> --repo …` silently drops every flag
+after the id and exits 2 with a usage dump.
 
 The run fans out into one job per target repository, each pinned to that
 repository's HEAD at admission. Nothing runs yet: jobs are queued until a

@@ -166,7 +166,13 @@ func gateDiffMatchesClaims(gc gateContext) protocol.GateReport {
 // names no problem, is a claim the harness refutes without reading a line.
 func gateVerdictConsistent(gc gateContext) protocol.GateReport {
 	var report protocol.GateReport
-	approved, _ := gc.envelope.Fields["approved"].(bool)
+	// Presence and type are kept apart from the value. An absent field and a
+	// stated `false` both read as false, and telling an agent it claimed
+	// approved=false when it claimed nothing sends it looking for a decision
+	// it never made — whose cheapest repair is to add approved=true, turning
+	// a missing verdict into an approval.
+	rawApproved, approvedPresent := gc.envelope.Fields["approved"]
+	approved, approvedIsBool := rawApproved.(bool)
 	blocking, _ := gc.envelope.Fields["blocking"].([]any)
 	var unmet int
 	if findings, ok := gc.envelope.Fields["findings"].([]any); ok {
@@ -200,9 +206,18 @@ func gateVerdictConsistent(gc gateContext) protocol.GateReport {
 		report.Check("approved vs findings", true,
 			fmt.Sprintf("%d unmet requirement(s), not approved", unmet))
 	}
-	if approved || len(blocking) > 0 || unmet > 0 {
+	switch {
+	case approved || len(blocking) > 0 || unmet > 0:
 		report.Check("rejection names a problem", true, "verdict is supported")
-	} else {
+	case !approvedPresent:
+		report.Check("rejection names a problem", false,
+			`"approved" is missing: state the verdict explicitly as true or false. `+
+				"It is not inferred, and a missing verdict is not a rejection to justify.")
+	case !approvedIsBool:
+		report.Check("rejection names a problem", false,
+			fmt.Sprintf(`"approved" must be a JSON boolean, got %T: `+
+				"state the verdict explicitly as true or false", rawApproved))
+	default:
 		report.Check("rejection names a problem", false,
 			"approved=false but no blocking item or unmet requirement was given")
 	}

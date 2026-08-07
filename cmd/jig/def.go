@@ -41,7 +41,11 @@ Commands:
   update <id> <file>           replace a definition's source in place
   list                         list saved definitions
   show <id>                    print one definition, source included
-  invoke <id> --repo <r> ...   admit a run of a definition
+  invoke --repo <r> ... <id>   admit a run of a definition
+
+Flags come before the positional argument — ` + "`jig def show --json <id>`" + `,
+never ` + "`jig def show <id> --json`" + `, which stops flag parsing at the id
+and reports a usage error.
 
 Flags:
   --server <url>   control plane URL (default http://127.0.0.1:8383)
