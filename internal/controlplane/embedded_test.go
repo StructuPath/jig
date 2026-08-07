@@ -31,6 +31,47 @@ phases:
 
 const directHeadSHA = "0123456789abcdef0123456789abcdef01234567"
 
+// directRepoPath is a repository path that EXISTS on disk. Admission
+// canonicalizes every target's repository identity (U5), and canonicalizing
+// resolves symlinks — /var is one on macOS — so a path that is never created
+// cannot be admitted.
+func directRepoPath(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// admitDirectFixture admits a one-target run of the direct fixture through
+// U5's admission path — the same path DirectRun itself takes — and returns
+// its single fanned-out job.
+func admitDirectFixture(t *testing.T, store *Store, repoPath string) protocol.Job {
+	t.Helper()
+	ctx := context.Background()
+	definition, err := store.saveDefinition(ctx, directSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := store.resolveTargets(ctx, []InvocationTarget{
+		{Repository: repoPath, BaseSHA: directHeadSHA},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.admitRun(ctx, preparedInvocation{
+		definitionID: definition.ID,
+		generation:   definition.Generation,
+		snapshot:     directSnapshot,
+		targets:      targets,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view.Jobs[0]
+}
+
 func directCapability() protocol.RuntimeCapability {
 	return protocol.RuntimeCapability{Name: "scripted", Version: "0.0.0", CanResume: true}
 }
@@ -83,19 +124,7 @@ func abandonDirectRun(t *testing.T, dataDir, repoPath string) (jobID, attemptID 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	definitionID, generation, err := store.upsertDefinition(ctx, "direct-fixture", directSnapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runID, err := store.insertFrozenRun(ctx, definitionID, generation, directSnapshot, nil,
-		protocol.RunTarget{Repository: repoPath, BaseSHA: directHeadSHA})
-	if err != nil {
-		t.Fatal(err)
-	}
-	job, err := store.EnqueueJob(ctx, runID, repoPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	job := admitDirectFixture(t, store, repoPath)
 	marker, err := acquireDirectMarker(dataDir, job.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +151,7 @@ func abandonDirectRun(t *testing.T, dataDir, repoPath string) (jobID, attemptID 
 // recovery before, and that throws away every trace with it.
 func TestADirectRunReclaimsTheAttemptAnUngracefullyKilledRunAbandoned(t *testing.T) {
 	dataDir := t.TempDir()
-	repoPath := filepath.Join(t.TempDir(), "repo")
+	repoPath := directRepoPath(t)
 	abandonedJob, abandonedAttempt := abandonDirectRun(t, dataDir, repoPath)
 
 	result, err := DirectRun(context.Background(), directConfig(dataDir, repoPath, acceptingExecutor(nil)))
@@ -200,7 +229,7 @@ func TestTwoConcurrentDirectRunsBothCompleteAndNeitherKillsTheOthersJob(t *testi
 		group.Add(1)
 		go func(i int) {
 			defer group.Done()
-			repoPath := filepath.Join(t.TempDir(), "repo")
+			repoPath := directRepoPath(t)
 			results[i], errs[i] = DirectRun(context.Background(),
 				directConfig(dataDir, repoPath, acceptingExecutor(overlap)))
 		}(i)
@@ -238,7 +267,7 @@ func TestTwoConcurrentDirectRunsBothCompleteAndNeitherKillsTheOthersJob(t *testi
 // was found.
 func TestADirectRunReleasesAForeignQueuedJobInsteadOfFailingIt(t *testing.T) {
 	dataDir := t.TempDir()
-	repoPath := filepath.Join(t.TempDir(), "repo")
+	repoPath := directRepoPath(t)
 	ctx := context.Background()
 
 	store, err := Open(ctx, filepath.Join(dataDir, "jig.db"))
@@ -252,21 +281,9 @@ func TestADirectRunReleasesAForeignQueuedJobInsteadOfFailingIt(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	definitionID, generation, err := store.upsertDefinition(ctx, "server-path", directSnapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foreignRun, err := store.insertFrozenRun(ctx, definitionID, generation, directSnapshot, nil,
-		protocol.RunTarget{Repository: repoPath, BaseSHA: directHeadSHA})
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Queued by another path entirely: no liveness marker, so nothing about
 	// it is ours to judge.
-	foreignJob, err := store.EnqueueJob(ctx, foreignRun, repoPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	foreignJob := admitDirectFixture(t, store, repoPath)
 	store.Close()
 
 	_, runErr := DirectRun(ctx, directConfig(dataDir, repoPath, acceptingExecutor(nil)))
@@ -317,7 +334,7 @@ func TestADirectRunReleasesAForeignQueuedJobInsteadOfFailingIt(t *testing.T) {
 // the line, the events table does not, and the two stop agreeing.
 func TestAnInterruptedDirectRunPersistsTheEventsItEmitsWhileUnwinding(t *testing.T) {
 	dataDir := t.TempDir()
-	repoPath := filepath.Join(t.TempDir(), "repo")
+	repoPath := directRepoPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

@@ -28,10 +28,9 @@ import (
 	"github.com/StructuPath/jig/internal/engine/enginetest"
 	"github.com/StructuPath/jig/internal/protocol"
 	"github.com/StructuPath/jig/internal/runtime"
-	"github.com/StructuPath/jig/internal/runtime/claudecode"
 )
 
-const runUsage = `Usage: jig run --def <file> [--data <dir>] [--json] [--no-seed-auth] <repo-path> "<prompt>"
+const runUsage = `Usage: jig run --def <file> [--data <dir>] [--runtime <name>] [--json] [--no-seed-auth] <repo-path> "<prompt>"
 
 Run a definition directly against a local repository: validate it, freeze
 an in-process run pinned at the repository's current HEAD, execute the
@@ -42,6 +41,8 @@ Flags (before the positional arguments):
   --def <file>     definition YAML file (required)
   --data <dir>     data directory for the store, traces, and scratch
                    (default ~/.jig)
+  --runtime <name> agent CLI to run the roster on: claude-code (default)
+                   or codex
   --json           emit the structured result as one JSON object on stdout
                    instead of the human report
   --no-seed-auth   do not seed runtime auth material into the ephemeral HOME
@@ -78,6 +79,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		defaultData = filepath.Join(home, ".jig")
 	}
 	dataDir := flags.String("data", defaultData, "data directory")
+	runtimeName := flags.String("runtime", runtimeClaudeCode, "agent CLI runtime")
 	asJSON := flags.Bool("json", false, "emit the structured result as JSON")
 	noSeedAuth := flags.Bool("no-seed-auth", false, "do not seed runtime auth material")
 	if err := flags.Parse(args); err != nil {
@@ -117,18 +119,14 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	agentRuntime, capability, scripted, err := buildRuntime(ctx)
-	if err != nil {
-		fmt.Fprintf(stderr, "jig run: %v\n", err)
-		return exitInfraFailed
-	}
 	// Auth seeding is a real-CLI concern: the scripted fake needs nothing,
 	// and --no-seed-auth is the escape hatch for a CLI already configured
 	// through its environment (e.g. ANTHROPIC_API_KEY on the role's env
-	// allowlist).
-	var seeder engine.HomeSeeder
-	if !scripted && !*noSeedAuth {
-		seeder = seedClaudeAuth
+	// allowlist). Both runtimes seed (KTD11) — see runtime.go.
+	selected, err := selectRuntime(ctx, *runtimeName, !*noSeedAuth)
+	if err != nil {
+		fmt.Fprintf(stderr, "jig run: %v\n", err)
+		return exitInfraFailed
 	}
 
 	result, err := controlplane.DirectRun(ctx, controlplane.DirectRunConfig{
@@ -137,8 +135,9 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		RepoPath:   repoPath,
 		HeadSHA:    headSHA,
 		Parameters: map[string]string{"prompt": prompt},
-		Capability: capability,
-		Execute:    engineExecutor(ctx, *dataDir, repoPath, headSHA, agentRuntime, capability, seeder),
+		Capability: selected.Capability,
+		Execute: engineExecutor(ctx, *dataDir, repoPath, headSHA,
+			selected.Runtime, selected.Capability, selected.Seeder),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "jig run: %v\n", err)
@@ -361,29 +360,6 @@ func repoHead(repoPath string) (string, error) {
 	return sha, nil
 }
 
-// buildRuntime constructs the agent runtime: the scripted fake when the
-// test hook is set, the real Claude Code adapter otherwise. The returned
-// flag reports which, so auth seeding can stay a real-CLI concern.
-func buildRuntime(ctx context.Context) (runtime.Runtime, protocol.RuntimeCapability, bool, error) {
-	if scriptPath := os.Getenv(scriptedRuntimeEnv); scriptPath != "" {
-		fake, err := loadScriptedRuntime(scriptPath)
-		if err != nil {
-			return nil, protocol.RuntimeCapability{}, false, err
-		}
-		capability, err := fake.Probe(ctx)
-		return fake, capability, true, err
-	}
-	adapter, err := claudecode.New()
-	if err != nil {
-		return nil, protocol.RuntimeCapability{}, false, err
-	}
-	capability, err := adapter.Probe(ctx)
-	if err != nil {
-		return nil, protocol.RuntimeCapability{}, false, err
-	}
-	return adapter, capability, false, nil
-}
-
 // loadScriptedRuntime reads the test hook's JSON script: an ordered step
 // list in the enginetest shape ("write these files, then emit this text").
 func loadScriptedRuntime(path string) (*enginetest.Runtime, error) {
@@ -394,10 +370,19 @@ func loadScriptedRuntime(path string) (*enginetest.Runtime, error) {
 	var script struct {
 		CanResume *bool `json:"can_resume"`
 		Steps     []struct {
-			Files map[string]string `json:"files"`
-			Text  string            `json:"text"`
-			Hang  bool              `json:"hang"`
-			Crash bool              `json:"crash"`
+			Files    map[string]string `json:"files"`
+			Text     string            `json:"text"`
+			Hang     bool              `json:"hang"`
+			Crash    bool              `json:"crash"`
+			IsError  bool              `json:"is_error"`
+			ExitCode int               `json:"exit_code"`
+			// Events are streamed before the result, so a scripted run can
+			// exercise the tool-call rows the trace views fold into spans.
+			Events []struct {
+				Type    string          `json:"type"`
+				Name    string          `json:"name"`
+				Payload json.RawMessage `json:"payload"`
+			} `json:"events"`
 		} `json:"steps"`
 	}
 	if err := json.Unmarshal(body, &script); err != nil {
@@ -405,11 +390,22 @@ func loadScriptedRuntime(path string) (*enginetest.Runtime, error) {
 	}
 	steps := make([]enginetest.Step, 0, len(script.Steps))
 	for _, step := range script.Steps {
+		events := make([]runtime.Event, 0, len(step.Events))
+		for _, event := range step.Events {
+			events = append(events, runtime.Event{
+				Kind:    event.Type,
+				Name:    event.Name,
+				Payload: event.Payload,
+			})
+		}
 		steps = append(steps, enginetest.Step{
-			Files: step.Files,
-			Text:  step.Text,
-			Hang:  step.Hang,
-			Crash: step.Crash,
+			Files:    step.Files,
+			Events:   events,
+			Text:     step.Text,
+			Hang:     step.Hang,
+			Crash:    step.Crash,
+			IsError:  step.IsError,
+			ExitCode: step.ExitCode,
 		})
 	}
 	fake := enginetest.New(steps...)
@@ -417,42 +413,4 @@ func loadScriptedRuntime(path string) (*enginetest.Runtime, error) {
 		fake.CanResume = *script.CanResume
 	}
 	return fake, nil
-}
-
-// seedClaudeAuth is the default darwin-aware HomeSeeder for real-CLI runs
-// (KTD11): the minimum auth material Claude Code needs inside the
-// ephemeral HOME. The credentials file when it exists; otherwise the macOS
-// keychain secret extracted into the ephemeral HOME's credentials file —
-// the CLI's keychain lookup does not survive a HOME change. Onboarding
-// state rides along so print mode skips first-run prompts. (Same seeding
-// the U4 live smoke proved out.)
-func seedClaudeAuth(home, _ string, _ protocol.RoleSpec) error {
-	real, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
-		return err
-	}
-	credentials, readErr := os.ReadFile(filepath.Join(real, ".claude", ".credentials.json"))
-	if readErr != nil {
-		extracted, keychainErr := exec.Command("security",
-			"find-generic-password", "-s", "Claude Code-credentials", "-w").Output()
-		if keychainErr != nil {
-			return fmt.Errorf(
-				"seed claude auth: no credentials file and no keychain item (%v); "+
-					"use --no-seed-auth if the CLI authenticates through its environment", keychainErr)
-		}
-		credentials = extracted
-	}
-	if err := os.WriteFile(
-		filepath.Join(home, ".claude", ".credentials.json"), credentials, 0o600); err != nil {
-		return err
-	}
-	if onboarding, err := os.ReadFile(filepath.Join(real, ".claude.json")); err == nil {
-		if err := os.WriteFile(filepath.Join(home, ".claude.json"), onboarding, 0o600); err != nil {
-			return err
-		}
-	}
-	return nil
 }

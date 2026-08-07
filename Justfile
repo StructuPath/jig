@@ -26,9 +26,18 @@ vet:
 format-check:
     @test -z "$(gofmt -l cmd internal migrations)"
 
+# Validate every stock definition without a server (U9).
+definitions:
+    go run ./cmd/jig def validate examples/definitions/*.yaml
+
+# Cross-compile release binaries into dist/ for linux and darwin on amd64
+# and arm64. Pure-Go SQLite is what makes this one command (KTD3, R19).
+release version="":
+    scripts/release.sh {{version}}
+
 # Prove the worker never imports control-plane implementation code (KTD1).
 boundary:
     @! go list -deps ./internal/worker | grep -qx 'github.com/StructuPath/jig/internal/controlplane'
 
 # Run the local and CI checks.
-check: format-check vet boundary test build
+check: format-check vet boundary definitions test build

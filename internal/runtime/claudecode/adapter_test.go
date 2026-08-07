@@ -7,6 +7,7 @@ package claudecode
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/StructuPath/jig/internal/protocol"
 	"github.com/StructuPath/jig/internal/runtime"
 )
 
@@ -44,6 +46,12 @@ case "$STUB_MODE" in
     printf '%s\n' '{"type":"result","result":"boom","is_error":true,"session_id":"sid-err"}' ;;
   noresult)
     printf '%s\n' '{"type":"system","subtype":"init"}' ;;
+  orphan)
+    # A descendant that inherits stdout and outlives the CLI — an MCP server,
+    # a backgrounded tool process. The write end of the stream stays open
+    # after the CLI itself has exited and delivered its terminal result.
+    sleep 60 &
+    printf '{"type":"result","result":"the CLI exited first","is_error":false,"session_id":"%s"}\n' "$SESSION" ;;
   coldstart)
     printf '{"type":"result","result":"cold start","is_error":false,"session_id":"a-different-session"}\n' ;;
   flood)
@@ -475,5 +483,117 @@ func TestTheTerminalResultSurvivesAResultCallThatOverlapsTheStream(t *testing.T)
 	}
 	if events != 400 {
 		t.Errorf("the stream delivered %d events, want all 400 the CLI wrote", events)
+	}
+}
+
+// The other half of that contract: waiting for the stream must not be the way
+// the send learns the CLI is gone. A descendant that inherits stdout — an MCP
+// server, a backgrounded tool process — holds the write end open after the
+// CLI exits, so EOF never arrives on its own. Waiting on it left Result
+// blocked on a CLI that had already delivered its terminal result, with the
+// process group still alive and nothing left to stop it.
+func TestResultReturnsWhenADescendantOutlivesTheCLIHoldingTheStream(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	stubDir := t.TempDir()
+	handle, err := adapter.StartOrContinue(context.Background(),
+		&runtime.Session{Key: "attempt-orphan"}, "p",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(stubDir, "orphan")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupID := handle.ProcessGroupID()
+	if groupID <= 0 {
+		t.Fatal("no process group to stop")
+	}
+
+	type answer struct {
+		result runtime.Result
+		err    error
+	}
+	answers := make(chan answer, 1)
+	go func() {
+		result, resultErr := handle.Result()
+		answers <- answer{result, resultErr}
+	}()
+	go drainQuietly(handle)
+
+	select {
+	case got := <-answers:
+		if got.err != nil {
+			t.Fatalf("result error = %v, want the terminal result the CLI sent before exiting", got.err)
+		}
+		if got.result.Text != "the CLI exited first" {
+			t.Fatalf("result = %+v, want the terminal result the CLI sent before exiting", got.result)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Result never returned: it is still waiting for a stdout EOF " +
+			"that a descendant of the exited CLI will not deliver")
+	}
+	// And the group goes with it — the descendant does not outlive the send.
+	waitForGroupExit(t, groupID, 5*time.Second)
+}
+
+// gatedReader withholds its first read until released. It makes the
+// scheduling window deterministic: the stderr capture provably has not
+// consumed the pipe at the moment drainStream runs, which is the ordering
+// that only shows up on a loaded machine.
+type gatedReader struct {
+	reader io.Reader
+	gate   chan struct{}
+	opened bool
+}
+
+func (g *gatedReader) Read(p []byte) (int, error) {
+	if !g.opened {
+		<-g.gate
+		g.opened = true
+	}
+	return g.reader.Read(p)
+}
+
+// The CLI's diagnostic survives even when stdout's capture finishes first.
+// Closing both read ends on stdout alone cuts the stderr copy off with the
+// bytes still sitting in the pipe, and a nonzero exit then reaches the trace
+// with no cause at all.
+func TestDrainStreamWaitsForTheStderrCaptureBeforeClosingIt(t *testing.T) {
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("open stdout pipe: %v", err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("open stderr pipe: %v", err)
+	}
+	handle := &claudeHandle{
+		done:         make(chan struct{}),
+		stderrDone:   make(chan struct{}),
+		stdoutReader: stdoutReader,
+		stderrReader: stderrReader,
+		stderrTail:   &tailBuffer{limit: protocol.MaxErrorBytes},
+	}
+	gate := make(chan struct{})
+	go handle.captureStderr(&gatedReader{reader: stderrReader, gate: gate})
+
+	// The shape a dying CLI leaves behind: its diagnostic is unread in the
+	// pipe and the write end went with the process.
+	if _, err := io.WriteString(stderrWriter, "claude fell over"); err != nil {
+		t.Fatalf("write stderr: %v", err)
+	}
+	_ = stderrWriter.Close()
+	// stdout's capture finishes first — the ordering that loses the tail.
+	_ = stdoutWriter.Close()
+	close(handle.done)
+
+	drained := make(chan struct{})
+	go func() { handle.drainStream(); close(drained) }()
+
+	// Long enough that a drainStream which closes on stdout alone has already
+	// done so; the release then finds a dead descriptor instead of the tail.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	<-drained
+
+	if got := handle.stderrTail.String(); got != "claude fell over" {
+		t.Fatalf("stderr tail = %q, want the CLI's diagnostic intact", got)
 	}
 }

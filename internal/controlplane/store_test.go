@@ -140,6 +140,28 @@ func serviceCode(t *testing.T, err error) string {
 	return service.Code
 }
 
+// proveThePublish records the three publish steps an attempt needs before it
+// may legitimately complete `accepted`. R12 is a conjunction — phases passed
+// AND predicate held AND publish proven — and the store enforces the third
+// conjunct inside the completion transaction, so any test that ends an
+// attempt in `accepted` has to have published first, exactly as the worker's
+// publish pipeline does.
+func proveThePublish(t *testing.T, store *Store, claim *protocol.Claim, token string) {
+	t.Helper()
+	ctx := context.Background()
+	branch := protocol.PublishBranch(claim.Job.ID, claim.Attempt.AttemptNumber)
+	for _, step := range []protocol.PublishStepRequest{
+		{Step: protocol.PublishStepPush, RemoteRef: shaA},
+		{Step: protocol.PublishStepPullRequest, PullRequestURL: "https://github.com/example/repo/pull/1"},
+		{Step: protocol.PublishStepProof, RemoteRef: shaA},
+	} {
+		step.LeaseToken, step.Branch = token, branch
+		if _, err := store.RecordPublishStep(ctx, claim.Attempt.ID, step); err != nil {
+			t.Fatalf("record publish step %s: %v", step.Step, err)
+		}
+	}
+}
+
 // claimAndStart is the standard path to a running, leased attempt.
 func claimAndStart(t *testing.T, store *Store, runID, repository string) *protocol.Claim {
 	t.Helper()
@@ -218,6 +240,7 @@ func TestTerminalCompletionReplayedWithTheOriginalTokenReturnsTheStoredOutcome(t
 	registerTestWorker(t, store, 2)
 	claim := claimAndStart(t, store, "run-1", repoA)
 	ctx := context.Background()
+	proveThePublish(t, store, claim, tokenA)
 	first, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
 		LeaseToken: tokenA, State: protocol.AttemptAccepted, Result: "published PR #7",
 	})
@@ -245,6 +268,70 @@ func TestTerminalCompletionReplayedWithTheOriginalTokenReturnsTheStoredOutcome(t
 	}
 	if job.State != protocol.JobAccepted {
 		t.Fatalf("job state = %q, want accepted", job.State)
+	}
+}
+
+// R12's "published" conjunct is a control-plane invariant, not a worker
+// convention: `accepted` means phases passed AND the predicate held AND
+// publish completed with remote proof. The first two are worker judgements
+// the store cannot re-derive; the third is a row in its own database, so it
+// checks — inside the completion transaction, against a fenced, still-leased
+// attempt. Without it, any worker bug, stale build, or hand-driven API call
+// could mark unpublished work `accepted`, and R14's publish-only retry would
+// never be offered for work that genuinely needs it.
+func TestCompletingAsAcceptedIsRefusedWithoutARecordedProofOfPublish(t *testing.T) {
+	store, _ := newTestStore(t)
+	seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+	registerTestWorker(t, store, 2)
+	claim := claimAndStart(t, store, "run-1", repoA)
+	ctx := context.Background()
+
+	_, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAccepted, Result: "claims to be published",
+	})
+	if err == nil {
+		t.Fatal("an attempt with no publish record completed as accepted")
+	}
+	if code := serviceCode(t, err); code != "publish_proof_required" {
+		t.Fatalf("error code = %q, want publish_proof_required", code)
+	}
+	attempt, err := store.Attempt(ctx, claim.Attempt.ID)
+	if err != nil {
+		t.Fatalf("read attempt: %v", err)
+	}
+	if attempt.State != protocol.AttemptRunning {
+		t.Fatalf("the refused completion moved the attempt to %q", attempt.State)
+	}
+
+	// A push and a pull request are not proof either: proof is the step that
+	// verified the remote ref, and it is the one the check requires.
+	branch := protocol.PublishBranch(claim.Job.ID, claim.Attempt.AttemptNumber)
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepPush, shaA, ""); err != nil {
+		t.Fatalf("record push: %v", err)
+	}
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepPullRequest, "",
+		"https://github.com/example/repo-a/pull/7"); err != nil {
+		t.Fatalf("record pull request: %v", err)
+	}
+	if _, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAccepted,
+	}); err == nil || serviceCode(t, err) != "publish_proof_required" {
+		t.Fatalf("accepted with a push but no proof: err=%v, want publish_proof_required", err)
+	}
+
+	// accepted_unpublished is the state that IS available, and it is what
+	// carries the publish-only retry (R14).
+	unpublished, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAcceptedUnpublished,
+	})
+	if err != nil {
+		t.Fatalf("complete as accepted_unpublished: %v", err)
+	}
+	if unpublished.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("attempt state = %q, want accepted_unpublished", unpublished.State)
+	}
+	if branch == "" {
+		t.Fatal("the attempt-scoped branch is empty")
 	}
 }
 
@@ -287,6 +374,7 @@ func TestFirstHeartbeatAfterAnEightHourCoSleepRenewsTheExpiredLease(t *testing.T
 		t.Fatalf("renewed expiry = %v, want %v", response.LeaseExpiresAt, want)
 	}
 	// ...and the attempt continues to a normal completion.
+	proveThePublish(t, store, claim, tokenA)
 	if _, err := store.CompleteAttempt(context.Background(), claim.Attempt.ID, protocol.CompleteAttemptRequest{
 		LeaseToken: tokenA, State: protocol.AttemptAccepted, Result: "survived the sleep",
 	}); err != nil {
@@ -696,6 +784,19 @@ func TestWorkerRoutesDriveAFullClaimHeartbeatCompleteCycleOverHTTP(t *testing.T)
 	response, err = do("PUT", "/api/attempts/"+claim.Attempt.ID+"/heartbeat",
 		fmt.Sprintf(`{"lease_token":%q}`, tokenA))
 	expectStatus(t, response, err, http.StatusOK)
+
+	// Publish before acceptance: `accepted` is refused without a proof record
+	// (R12), and the worker's real cycle records the steps at this point too.
+	branch := protocol.PublishBranch(claim.Job.ID, claim.Attempt.AttemptNumber)
+	for _, body := range []string{
+		fmt.Sprintf(`{"lease_token":%q,"step":"push","branch":%q,"remote_ref":%q}`, tokenA, branch, shaA),
+		fmt.Sprintf(`{"lease_token":%q,"step":"pull_request","branch":%q,`+
+			`"pr_url":"https://github.com/example/repo-a/pull/7"}`, tokenA, branch),
+		fmt.Sprintf(`{"lease_token":%q,"step":"proof","branch":%q,"remote_ref":%q}`, tokenA, branch, shaA),
+	} {
+		response, err = do("POST", "/api/attempts/"+claim.Attempt.ID+"/publish/record", body)
+		expectStatus(t, response, err, http.StatusOK)
+	}
 
 	response, err = do("POST", "/api/attempts/"+claim.Attempt.ID+"/complete",
 		fmt.Sprintf(`{"lease_token":%q,"state":"accepted","result":"done"}`, tokenA))

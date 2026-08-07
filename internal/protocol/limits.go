@@ -145,4 +145,48 @@ const (
 
 	// MaxErrorBytes caps an attempt completion's error text.
 	MaxErrorBytes = 16 << 10
+
+	// ---- admission triggers (U6, R13, KTD7) ---------------------------------
+
+	// TriggerTickInterval is how often the admission loop wakes to admit due
+	// schedules, poll due GitHub triggers, and dispatch pending occurrences.
+	// It is the granularity of "due", not of the schedules themselves: a cron
+	// minute is admitted on the first tick at or after it.
+	TriggerTickInterval = 15 * time.Second
+
+	// TriggerPollTimeout bounds one `gh` invocation. A poll that cannot finish
+	// inside it is a `gh_timed_out` diagnostic, never a wait (KTD7).
+	TriggerPollTimeout = 30 * time.Second
+
+	// MinTriggerPollInterval and DefaultTriggerPollInterval bound how often a
+	// GitHub trigger may spend a `gh` invocation. Polling is the admission
+	// path (KTD7: webhooks cannot reach a loopback server), so the floor is
+	// what keeps a misconfigured trigger from becoming a rate-limit incident.
+	MinTriggerPollInterval     = 30 * time.Second
+	DefaultTriggerPollInterval = 5 * time.Minute
+
+	// MaxTriggerMatches caps how many issues or pull requests one poll may
+	// return. `gh` is asked for one more than this, so an over-limit answer is
+	// detectable rather than silently truncated: it produces a `gh_match_limit`
+	// diagnostic and admits nothing, because a trigger that would have fanned
+	// out 500 runs is a configuration error, not a workload.
+	MaxTriggerMatches = 100
+
+	// MaxTriggerStdoutBytes and MaxTriggerStderrBytes bound what one `gh`
+	// invocation may write. Exceeding either is its own diagnostic; nothing
+	// unbounded is ever read into memory from a subprocess.
+	MaxTriggerStdoutBytes = 4 << 20
+	MaxTriggerStderrBytes = 64 << 10
+
+	// MaxTriggerDiagnosticBytes caps a stored trigger diagnostic. Diagnostics
+	// are operator-facing text, so they are truncated rather than dropped.
+	MaxTriggerDiagnosticBytes = 4 << 10
+
+	// MaxTriggerConfigBytes caps a trigger's frozen configuration JSON.
+	MaxTriggerConfigBytes = 64 << 10
+
+	// MaxTriggerObservationBytes caps the canonical metadata of one observed
+	// issue or pull request, excluding its body text (which is bounded
+	// separately by the prompt composer's untrusted-section limits).
+	MaxTriggerObservationBytes = 16 << 10
 )

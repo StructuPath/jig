@@ -42,16 +42,48 @@ jobs:
       - name: Run race suite (claim/heartbeat/sweep, worker, phase engine)
         run: just test-race
 
+  # The UI is committed as a built artifact so operators never need Node
+  # (R18). This job is what keeps the committed bundle honest: it runs the
+  # frontend tests, rebuilds dist from source, and fails if the rebuild
+  # differs from what is in the tree.
+  ui:
+    name: UI tests and committed bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Rebuild the embedded bundle
+        run: npm run build
+      - name: The committed bundle must match its source
+        working-directory: .
+        run: git diff --exit-code -- web/dist
+
   check:
     name: check
     if: always()
-    needs: [linux, macos]
+    needs: [linux, macos, ui]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every platform check
         env:
           LINUX_RESULT: ${{ needs.linux.result }}
           MACOS_RESULT: ${{ needs.macos.result }}
+          UI_RESULT: ${{ needs.ui.result }}
         run: |
           test "$LINUX_RESULT" = success
           test "$MACOS_RESULT" = success
+          test "$UI_RESULT" = success

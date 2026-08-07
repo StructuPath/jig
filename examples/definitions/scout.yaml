@@ -1,0 +1,76 @@
+# scout.yaml — read-only recon (U9). Two agent phases, no writes anywhere:
+# a surveyor maps the repository, then an assessor answers the operator's
+# question against that map and returns a verdict with findings.
+#
+#   jig run --def examples/definitions/scout.yaml . "can this repo adopt Go 1.26?"
+#
+# Where smoke.yaml is the install check (one phase, one question), scout is
+# the recon workflow: it proves the handoff contract — the surveyor's
+# envelope becomes the assessor's input — while both roles stay genuinely
+# read-only. Read-only is enforced, not requested: both write allowlists are
+# empty, so any repository write rolls back and aborts the attempt (R10).
+#
+# The verdict gate checks the assessor's envelope against ITSELF: an
+# approval shipping blocking items, or an approval with unmet findings, is
+# refuted without reading a line of the repository, which is what makes this
+# definition repo-independent.
+name: scout
+roster:
+  surveyor:
+    model: haiku
+    system_prompt: |
+      You are a read-only surveyor examining a git repository. You never
+      create, modify, or delete any file — you only read, and you report
+      exclusively through your final JSON envelope.
+    user_prompt: |
+      Survey this repository for the following question. Do not answer it
+      yet — map the ground the answer will stand on.
+
+      Question: {{prompt}}
+
+      Report the layout, languages, build and test entry points, and the
+      files that bear on the question, in your "summary" field.
+
+      Your final JSON must also include:
+        - "notes_for_next_agent": what the assessor most needs to know,
+          including the specific paths worth opening
+    env: [PATH]
+    writes: []
+  assessor:
+    model: haiku
+    system_prompt: |
+      You are a read-only assessor. You answer one question about a git
+      repository using the surveyor's notes and your own reading, and you
+      never create, modify, or delete any file.
+
+      A finding is a requirement you checked, with "met" true or false. Your
+      verdict must agree with your findings: do not approve while any
+      finding is unmet or any blocking item stands.
+
+      Your "status" is "success" whenever you completed the assessment. The
+      answer travels in "approved", never in "status": a well-evidenced "no"
+      is a phase that worked.
+    user_prompt: |
+      Question: {{prompt}}
+
+      Answer it in your "summary" field, citing the paths you relied on.
+
+      Your final JSON must also include:
+        - "approved": true when the answer is yes and nothing blocks it,
+          false otherwise
+        - "findings": a list of {"requirement": "<what you checked>",
+          "met": true|false, "evidence": "<path or observation>"}
+        - "blocking": a list of strings naming anything that blocks a yes
+          (an empty list when nothing does)
+    env: [PATH]
+    writes: []
+phases:
+  - name: survey
+    kind: agent
+    owner: surveyor
+  - name: assess
+    kind: agent
+    owner: assessor
+    gates:
+      - {name: verdict_consistent}
+acceptance: [all_phases_passed, verdict_consistent]

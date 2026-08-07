@@ -1,0 +1,58 @@
+name: Release
+
+# Tag-driven: pushing v* builds the four platform binaries and attaches them
+# to a GitHub release. Every action is pinned by commit SHA (R19) — a release
+# workflow that resolves a floating tag is a supply chain with a hole in it.
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs build and upload the artifacts without publishing a release,
+  # so the cross-compile can be exercised before a tag exists.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Cross-compiled binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Only the release step needs write, and only on a tag.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `git describe` stamps the version into the binary; a shallow
+          # checkout has no tags to describe from.
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      # A release that skips the checks is a release nobody verified.
+      - name: Run all checks
+        run: just check
+
+      - name: Build release artifacts
+        run: scripts/release.sh "${GITHUB_REF_NAME}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jig-binaries
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS

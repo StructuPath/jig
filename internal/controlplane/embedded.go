@@ -243,19 +243,32 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 		return zero, err
 	}
 
-	definitionID, generation, err := store.upsertDefinition(ctx, spec.Name, string(config.Source))
+	// Authoring, freezing, and fan-out are U5's, used here unchanged: a
+	// direct run is a one-target admission, not a parallel implementation of
+	// one (the definition upserts by name, the run freezes by value, the
+	// single job is the fan-out of a single target).
+	definition, err := store.saveDefinition(ctx, string(config.Source))
 	if err != nil {
 		return zero, err
 	}
-	runID, err := store.insertFrozenRun(ctx, definitionID, generation, string(config.Source),
-		config.Parameters, protocol.RunTarget{Repository: config.RepoPath, BaseSHA: config.HeadSHA})
+	targets, err := store.resolveTargets(ctx, []InvocationTarget{
+		{Repository: config.RepoPath, BaseSHA: config.HeadSHA},
+	})
 	if err != nil {
 		return zero, err
 	}
-	job, err := store.EnqueueJob(ctx, runID, config.RepoPath)
+	view, err := store.admitRun(ctx, preparedInvocation{
+		definitionID: definition.ID,
+		generation:   definition.Generation,
+		snapshot:     string(config.Source),
+		parameters:   config.Parameters,
+		targets:      targets,
+	})
 	if err != nil {
 		return zero, err
 	}
+	runID := view.Run.ID
+	job := view.Jobs[0]
 	// The marker publishes this process as the job's live owner before the
 	// job can ever be seen queued by another run, and holds until this run
 	// exits — however it exits.
@@ -344,9 +357,10 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 	if err != nil {
 		return zero, fmt.Errorf("record outcome (engine said %s): %w", outcome.State, err)
 	}
-	if err := store.finishDirectRun(completionCtx, runID, attempt.State); err != nil {
-		return zero, err
-	}
+	// The run's state is not written here: CompleteAttempt already aggregated
+	// it from this job inside the same fenced transaction (R12, U5). A direct
+	// run has no second rule of its own — an `accepted_unpublished` job makes
+	// its run `mixed`, and the attempt's no-publish marker says why.
 	job, err = store.Job(completionCtx, job.ID)
 	if err != nil {
 		return zero, err
@@ -703,11 +717,8 @@ func (s *Store) loseAbandonedAttempt(ctx context.Context, attemptID, jobID, reas
 	`, now, jobID); err != nil {
 		return unavailable(err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE runs SET state = 'failed', updated_at = ?
-		WHERE id = (SELECT run_id FROM jobs WHERE id = ?) AND state = 'active'
-	`, now, jobID); err != nil {
-		return unavailable(err)
+	if err := applyRunAggregationForJob(ctx, tx, jobID, now); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return unavailable(err)
@@ -731,104 +742,6 @@ func mintDirectLeaseToken() (string, error) {
 		return "", fmt.Errorf("mint lease token: %w", err)
 	}
 	return hex.EncodeToString(raw[:]), nil
-}
-
-// upsertDefinition saves the definition record behind a direct run:
-// insert on first sight, generation bump in place after (R1 — no revision
-// library; the run snapshot preserves what actually executed).
-func (s *Store) upsertDefinition(ctx context.Context, name, source string) (string, int, error) {
-	now := s.now().UnixMilli()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", 0, unavailable(err)
-	}
-	defer tx.Rollback()
-	var id string
-	var generation int
-	err = tx.QueryRowContext(ctx,
-		`SELECT id, generation FROM definitions WHERE name = ?`, name).Scan(&id, &generation)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		id, err = newID()
-		if err != nil {
-			return "", 0, unavailable(err)
-		}
-		generation = 1
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO definitions(id, name, generation, source, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, id, name, generation, source, now, now); err != nil {
-			return "", 0, unavailable(err)
-		}
-	case err != nil:
-		return "", 0, unavailable(err)
-	default:
-		generation++
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE definitions SET generation = ?, source = ?, updated_at = ? WHERE id = ?
-		`, generation, source, now, id); err != nil {
-			return "", 0, unavailable(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return "", 0, unavailable(err)
-	}
-	return id, generation, nil
-}
-
-// insertFrozenRun freezes one run by value (R2, KTD9): the snapshot, the
-// parameters, and the single pinned target. Nothing in it resolves lazily.
-func (s *Store) insertFrozenRun(
-	ctx context.Context, definitionID string, generation int, snapshot string,
-	parameters map[string]string, target protocol.RunTarget,
-) (string, error) {
-	if parameters == nil {
-		parameters = map[string]string{}
-	}
-	parametersJSON, err := json.Marshal(parameters)
-	if err != nil {
-		return "", unavailable(err)
-	}
-	targetsJSON, err := json.Marshal([]protocol.RunTarget{target})
-	if err != nil {
-		return "", unavailable(err)
-	}
-	runID, err := newID()
-	if err != nil {
-		return "", unavailable(err)
-	}
-	now := s.now().UnixMilli()
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO runs(id, definition_id, definition_generation, snapshot, parameters, targets, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
-	`, runID, definitionID, generation, snapshot, string(parametersJSON), string(targetsJSON),
-		now, now); err != nil {
-		return "", unavailable(err)
-	}
-	return runID, nil
-}
-
-// finishDirectRun records the single-job run's terminal state. Direct runs
-// end at predicate evaluation with publish out of scope by design, so an
-// accepted_unpublished attempt IS the direct-run notion of accepted — the
-// no-publish marker in the attempt result keeps the record honest (U11;
-// full multi-job aggregation is U5's).
-func (s *Store) finishDirectRun(ctx context.Context, runID, attemptState string) error {
-	var state string
-	switch attemptState {
-	case protocol.AttemptAcceptedUnpublished, protocol.AttemptAccepted:
-		state = protocol.RunAccepted
-	case protocol.AttemptCancelled:
-		state = protocol.RunCancelled
-	default:
-		state = protocol.RunFailed
-	}
-	if _, err := s.db.ExecContext(ctx, `
-		UPDATE runs SET state = ?, updated_at = ? WHERE id = ? AND state = 'active'
-	`, state, s.now().UnixMilli(), runID); err != nil {
-		return unavailable(err)
-	}
-	return nil
 }
 
 // AppendEvents persists trace events under the per-attempt monotonic seq
@@ -856,10 +769,25 @@ func (s *Store) AppendEvents(ctx context.Context, attemptID string, events []pro
 		if err != nil {
 			return unavailable(err)
 		}
-		if _, err := tx.ExecContext(ctx, `
+		result, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO events(attempt_id, seq, type, phase, payload, payload_bytes, server_time)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, attemptID, event.Seq, event.Type, event.Phase, body, len(body), now); err != nil {
+		`, attemptID, event.Seq, event.Type, event.Phase, body, len(body), now)
+		if err != nil {
+			return unavailable(err)
+		}
+		// Project only what this call actually inserted, so a replay adds no
+		// second copy of the evidence. Direct runs reach the same gate and
+		// envelope views as the worker path (ingest.go) rather than degrading
+		// to the attempt result alone.
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return unavailable(err)
+		}
+		if inserted == 0 {
+			continue
+		}
+		if err := projectEvidence(ctx, tx, attemptID, event, now); err != nil {
 			return unavailable(err)
 		}
 	}

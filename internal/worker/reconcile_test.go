@@ -7,9 +7,11 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -187,6 +189,35 @@ func TestAProcessGroupIdAtOrBelowOneIsNeverSignalled(t *testing.T) {
 	}
 }
 
+// The signal path narrows the recorded int64 to an int before negating it. On
+// a 32-bit build that narrowing truncates, and the truncated values land
+// exactly on the ids the range gate exists to refuse — 2^32 becomes 0, 2^32+1
+// becomes 1 — so a value that does not survive the round trip must be refused
+// outright instead of silently reinterpreted as some other group.
+func TestAProcessGroupIdThatCannotSurviveTheSignalPathIsRefused(t *testing.T) {
+	// Every one of these is >= 2 (so the range gate alone lets it through) and
+	// truncates to an id at or below 1 on a 32-bit build.
+	for _, groupID := range []int64{
+		1 << 32,           // truncates to 0 — jig's own process group
+		1<<32 + 1,         // truncates to 1 — kill(-1, ...), the whole session
+		math.MaxInt32 + 1, // truncates to a negative id that names nothing of ours
+		math.MaxInt64,     // truncates to -1, which negates into pid 1
+	} {
+		signallable := signallableProcessGroup(groupID)
+		// The invariant holds on both word sizes: a recorded id is signallable
+		// only if the id that reaches kill(2) is the id that was recorded.
+		if signallable && int64(int(groupID)) != groupID {
+			t.Errorf("process group %d is treated as signallable but reaches "+
+				"the syscall as %d", groupID, int(groupID))
+		}
+		// And on a 32-bit build none of them may pass at all.
+		if want := strconv.IntSize >= 64; signallable != want {
+			t.Errorf("signallableProcessGroup(%d) = %v on a %d-bit int, want %v",
+				groupID, signallable, strconv.IntSize, want)
+		}
+	}
+}
+
 // The same three values must be unrepresentable in a manifest, so a zeroed or
 // hand-edited field never becomes a signal target on a later restart.
 func TestAManifestCannotCarryAnUnsignallableProcessGroup(t *testing.T) {
@@ -253,7 +284,13 @@ func TestReconcileSignalsNothingForACorruptedProcessGroupOnDisk(t *testing.T) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		t.Fatal(err)
 	}
-	worktreePath, _ := raw["worktree_path"].(string)
+	// Without this the test proves nothing it claims to: an absent field leaves
+	// worktreePath empty, os.Stat("") fails, and the failure is reported as
+	// "reconcile deleted the worktree" — naming the wrong cause.
+	worktreePath, ok := raw["worktree_path"].(string)
+	if !ok || worktreePath == "" {
+		t.Fatalf("the manifest carries no worktree_path to check: %v", raw["worktree_path"])
+	}
 	raw["process_group_id"] = 1
 	raw["process_active"] = true
 	corrupted, err := json.Marshal(raw)

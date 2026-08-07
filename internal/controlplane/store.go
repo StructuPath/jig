@@ -63,6 +63,9 @@ type Store struct {
 	db *sql.DB
 	// now is injectable so tests can simulate sleeps and clock jumps.
 	now func() time.Time
+	// resolveRef is the base-SHA resolver, injectable for the same reason:
+	// pinning touches the network (KTD9). Nil means the real one.
+	resolveRef func(ctx context.Context, identity, ref string) (string, error)
 }
 
 const sqlitePragmas = "_pragma=busy_timeout%285000%29&_pragma=foreign_keys%281%29&_pragma=journal_mode%28WAL%29&_txlock=immediate"
@@ -488,6 +491,28 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 		lease.attemptState != protocol.AttemptRunning {
 		return protocol.Attempt{}, conflict("invalid_transition", "only a running attempt can be accepted")
 	}
+	if input.State == protocol.AttemptAccepted {
+		// R12's third conjunct, enforced HERE rather than only worker-side:
+		// `accepted` means phases passed AND the predicate held AND publish
+		// completed with remote proof. The first two are worker judgements the
+		// control plane cannot re-derive, but the third is a row in its own
+		// database — so it checks, inside the same transaction that would
+		// write the state. A worker with a bug, a stale build, or an operator
+		// driving the API by hand cannot declare published work that was never
+		// published; `accepted_unpublished` is the state for that, and it has
+		// its own retry (R14).
+		var proven int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM publish_records WHERE attempt_id = ? AND step = ?
+		`, attemptID, protocol.PublishStepProof).Scan(&proven); err != nil {
+			return protocol.Attempt{}, unavailable(err)
+		}
+		if proven == 0 {
+			return protocol.Attempt{}, conflict("publish_proof_required",
+				"an attempt is `accepted` only with a recorded proof-of-publish step (R12); "+
+					"complete as accepted_unpublished when publish did not finish")
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE attempts SET state = ?, result = ?, error = ?, completed_at = ?
 		WHERE id = ? AND state IN ('preparing', 'running')
@@ -499,6 +524,12 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 		UPDATE jobs SET state = ?, updated_at = ? WHERE id = ? AND state = 'active'
 	`, input.State, now, lease.jobID); err != nil {
 		return protocol.Attempt{}, unavailable(err)
+	}
+	// The run aggregate rides the same transaction as the job state it
+	// summarizes (R12): there is no window in which a run's state disagrees
+	// with its jobs (U5).
+	if err := applyRunAggregationForJob(ctx, tx, lease.jobID, now); err != nil {
+		return protocol.Attempt{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return protocol.Attempt{}, unavailable(err)
@@ -561,6 +592,11 @@ func (s *Store) RetryJob(ctx context.Context, jobID string) (protocol.Job, error
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return protocol.Job{}, conflict("retry_conflict", "the job left the failed state during retry")
 	}
+	// A retried job is live again, so its run returns to `active` — the
+	// aggregate is recomputed, never latched (R12, U5).
+	if err := applyRunAggregationForJob(ctx, tx, jobID, now); err != nil {
+		return protocol.Job{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return protocol.Job{}, unavailable(err)
 	}
@@ -605,6 +641,9 @@ func (s *Store) CancelJob(ctx context.Context, jobID string) (protocol.Job, erro
 		`, now, jobID); err != nil {
 			return protocol.Job{}, unavailable(err)
 		}
+	}
+	if err := applyRunAggregationForJob(ctx, tx, jobID, now); err != nil {
+		return protocol.Job{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return protocol.Job{}, unavailable(err)

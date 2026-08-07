@@ -391,3 +391,34 @@ type Event struct {
 	StartedAt *time.Time      `json:"started_at,omitempty"`
 	EndedAt   *time.Time      `json:"ended_at,omitempty"`
 }
+
+// EventBatch is one worker→server trace ingestion request (U8, KTD8): a
+// bounded, seq-ordered run of one attempt's events, fenced by the same lease
+// token every other attempt-scoped write carries (R6). Batches are capped at
+// MaxEventsPerBatch so an event storm backpressures into the worker's local
+// buffer instead of one giant request.
+type EventBatch struct {
+	LeaseToken string  `json:"lease_token"`
+	Events     []Event `json:"events"`
+}
+
+// EventBatchResult answers an ingestion request. Accepted counts the rows the
+// batch actually inserted — a replayed batch reports zero and is not an error,
+// because INSERT OR IGNORE on (attempt_id, seq) makes replay land exactly once
+// (KTD8). HighestSeq is the attempt's highest stored seq after the batch, which
+// is what lets a worker resume its buffer without re-reading the trace.
+type EventBatchResult struct {
+	Accepted   int   `json:"accepted"`
+	HighestSeq int64 `json:"highest_seq"`
+}
+
+// EventPage is one seq-cursor page of an attempt's stored trace — the read
+// half the UI polls (KTD8: cursors ride seq, never rowid). NextCursor is the
+// seq to pass as `after` next time; it equals After when the page is empty, so
+// a caller that polls a finished attempt never moves backwards.
+type EventPage struct {
+	AttemptID  string  `json:"attempt_id"`
+	After      int64   `json:"after"`
+	NextCursor int64   `json:"next_cursor"`
+	Events     []Event `json:"events"`
+}

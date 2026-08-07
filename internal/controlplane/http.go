@@ -43,6 +43,14 @@ func NewHandler(store *Store, uiToken string, logger *slog.Logger) http.Handler 
 	api := &API{store: store, uiToken: uiToken, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", api.health)
+	mux.HandleFunc("POST /api/definitions", api.createDefinition)
+	mux.HandleFunc("GET /api/definitions", api.listDefinitions)
+	mux.HandleFunc("GET /api/definitions/{definition_id}", api.getDefinition)
+	mux.HandleFunc("PUT /api/definitions/{definition_id}", api.updateDefinition)
+	mux.HandleFunc("POST /api/runs", api.invokeDefinition)
+	mux.HandleFunc("GET /api/runs", api.listRuns)
+	mux.HandleFunc("GET /api/runs/{run_id}", api.getRun)
+	mux.HandleFunc("POST /api/runs/{run_id}/readmit", api.readmitRun)
 	mux.HandleFunc("PUT /api/workers/{worker_id}", api.registerWorker)
 	mux.HandleFunc("POST /api/workers/{worker_id}/claims", api.claim)
 	mux.HandleFunc("POST /api/attempts/{attempt_id}/start", api.startAttempt)
@@ -53,6 +61,13 @@ func NewHandler(store *Store, uiToken string, logger *slog.Logger) http.Handler 
 	mux.HandleFunc("GET /api/workers/{worker_id}/worktrees", api.workerWorktrees)
 	mux.HandleFunc("POST /api/workers/{worker_id}/worktrees/reconcile", api.reconcileWorktrees)
 	mux.HandleFunc("POST /api/worktrees/{attempt_id}/release", api.releaseWorktree)
+	// Publish routes register themselves from publish_ledger.go (U7), the
+	// admission-trigger routes from schedule.go (U6), and trace ingestion plus
+	// the read-only surface from ingest.go (U8), where their handlers live
+	// beside the store methods they call.
+	api.registerPublishRoutes(mux)
+	api.registerTriggerRoutes(mux)
+	api.registerIngestRoutes(mux)
 	return mux
 }
 
@@ -62,6 +77,109 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---- definitions and runs (U5) -------------------------------------------
+//
+// Authoring and invocation are operator surfaces, so they take the same
+// mutation gate as every worker route: prepareMutation first, always (R20).
+
+func (a *API) createDefinition(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	var input DefinitionInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	definition, err := a.store.CreateDefinition(r.Context(), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, definition)
+}
+
+func (a *API) updateDefinition(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	var input DefinitionInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	definition, err := a.store.UpdateDefinition(r.Context(), r.PathValue("definition_id"), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, definition)
+}
+
+func (a *API) getDefinition(w http.ResponseWriter, r *http.Request) {
+	definition, err := a.store.Definition(r.Context(), r.PathValue("definition_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, definition)
+}
+
+func (a *API) listDefinitions(w http.ResponseWriter, r *http.Request) {
+	definitions, err := a.store.Definitions(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, definitions)
+}
+
+func (a *API) invokeDefinition(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	var input RunInvocation
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	view, err := a.store.InvokeDefinition(r.Context(), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, view)
+}
+
+// readmitRun is the KTD9 escape hatch's route: a bodyless POST, because
+// re-admitting takes nothing but the run whose pins are stale.
+func (a *API) readmitRun(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	view, err := a.store.ReadmitRunAtHead(r.Context(), r.PathValue("run_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, view)
+}
+
+func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
+	view, err := a.store.RunDetail(r.Context(), r.PathValue("run_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := a.store.Runs(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, runs)
 }
 
 func (a *API) registerWorker(w http.ResponseWriter, r *http.Request) {

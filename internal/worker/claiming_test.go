@@ -104,16 +104,19 @@ func TestAManifestWriteFailureAfterTheRunnerStillReportsTheOutcomeAndRetains(t *
 		worktreePath = attempt.WorktreePath
 		// The disk goes read-only while the attempt is running.
 		sealAttemptsDirectory(t, dataDir)
-		return Outcome{State: protocol.AttemptAccepted, Result: "the runner did the work"}
+		// A bare runner has no publish pipeline wrapped around it, so the
+		// strongest outcome it can honestly declare is accepted_unpublished —
+		// the control plane refuses `accepted` without a proof record (R12).
+		return Outcome{State: protocol.AttemptAcceptedUnpublished, Result: "the runner did the work"}
 	})
 	w := newHookedWorker(t, h, dataDir, runner, func(string) {})
 
 	if _, err := w.ClaimOnce(context.Background()); err == nil {
 		t.Fatal("a failed manifest write must still surface as an error")
 	}
-	if state := attemptStateInStore(t, h, attemptID); state != protocol.AttemptAccepted {
+	if state := attemptStateInStore(t, h, attemptID); state != protocol.AttemptAcceptedUnpublished {
 		t.Fatalf("attempt state is %q, want %q — the runner's outcome was dropped when the "+
-			"manifest write failed", state, protocol.AttemptAccepted)
+			"manifest write failed", state, protocol.AttemptAcceptedUnpublished)
 	}
 	entry := retainedLedgerEntry(t, w, attemptID)
 	if entry.State != protocol.WorktreeRetained || !strings.Contains(entry.Reason, "could not record completion") {
@@ -138,7 +141,7 @@ func TestAManifestWriteFailureBeforeTheRunnerTerminatesTheAttemptAndRetains(t *t
 	ranAttempts := 0
 	runner := RunnerFunc(func(context.Context, *PreparedAttempt) Outcome {
 		ranAttempts++
-		return Outcome{State: protocol.AttemptAccepted}
+		return Outcome{State: protocol.AttemptAcceptedUnpublished}
 	})
 	// The seal lands between the start call and the running-lifecycle write
 	// that follows it — the one window where the attempt is live server-side

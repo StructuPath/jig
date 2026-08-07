@@ -327,6 +327,10 @@ func TestConcurrentHeartbeatsSweepsAndCompletionKeepExactlyOneOutcome(t *testing
 	claim := claimAndStart(t, store, "run-1", repoA)
 	sweeper := NewSweeper(store)
 	ctx := context.Background()
+	// Publish before the storm, so `accepted` remains a reachable outcome of
+	// the race (R12 refuses acceptance without proof) and the sweep is racing
+	// a completion that could genuinely win.
+	proveThePublish(t, store, claim, tokenA)
 
 	var wg sync.WaitGroup
 	wg.Add(3)

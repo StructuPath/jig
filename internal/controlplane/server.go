@@ -91,6 +91,13 @@ func (s *Server) UIToken() string { return s.uiToken }
 // server's lifetime, which Shutdown ends: a caller passing a request-scoped
 // context must not have its server torn down under it.
 func (s *Server) Start(ctx context.Context) error {
+	// Check the context ourselves rather than relying on the bind to do it.
+	// ListenConfig.Listen consults the context only where it resolves a name,
+	// so an address needing no resolution binds happily on a dead context —
+	// and which addresses need resolution differs by platform and resolver.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("listen on %s: %w", s.http.Addr, err)
+	}
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.http.Addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.http.Addr, err)
