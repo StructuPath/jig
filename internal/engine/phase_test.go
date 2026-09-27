@@ -1042,8 +1042,7 @@ acceptance: [all_phases_passed]
 		"PATH": true, "FOO": true, "HOME": true,
 		"XDG_CONFIG_HOME": true, "XDG_CACHE_HOME": true,
 		"XDG_DATA_HOME": true, "XDG_STATE_HOME": true,
-		"JIG_BASE_SHA": true,
-		"PWD": true, "SHLVL": true, "_": true,
+		"JIG_BASE_SHA": true, "PWD": true, "SHLVL": true, "_": true,
 	}
 	for name := range values {
 		if !allowed[name] {
@@ -1683,5 +1682,26 @@ acceptance: [all_phases_passed]
 `, protocol.MaxReportLineBytes+10), nil, repo))
 	if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "exceeds") {
 		t.Fatalf("outcome = %+v, want a failed phase naming the overflow", outcome)
+	}
+}
+
+func TestANotEqualHoldFailsClosedWhenTheFieldWasNeverReported(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	outcome := newTestRunner(t, fake, &recordingSink{}, nil).Execute(context.Background(), testAttempt(`
+name: fail-closed
+roster:
+  builder: {model: test-model, system_prompt: Build., user_prompt: Build., writes: ["src/"]}
+phases:
+  - {name: build, kind: agent, owner: builder}
+acceptance: [all_phases_passed]
+publish:
+  hold_when: "risk != low"
+`, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished || outcome.PublishHold == "" {
+		t.Fatalf("outcome = %+v, want work with no risk report held", outcome)
 	}
 }

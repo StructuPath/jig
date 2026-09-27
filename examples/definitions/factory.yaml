@@ -20,11 +20,13 @@
 # its last output line is a JSON object, and jig merges those fields into the
 # envelope view the guards and the publish hold read. The script is
 # deterministic — paths touched and lines changed, no model — so the same
-# diff always scores the same. `if: "risk == high"` runs one more review only
-# for high-risk work, and `publish.hold_when` parks it: the attempt ends
+# diff always scores the same. Anything but `risk: low` runs one more review
+# and trips `publish.hold_when`, which parks the work: the attempt ends
 # accepted_unpublished with the hold on record, the worktree and branch are
 # retained, and the operator's publish retry is the human sign-off. Low-risk
-# work publishes on its own.
+# work publishes on its own. Both predicates say `risk != low` rather than
+# `risk == high` so they fail closed: work the classifier never scored — a
+# missing or unexpected `risk` — is held, not shipped.
 #
 # THE ROSTER. Builders and reviewers are `opus`; the planner and the extra
 # high-risk reviewer are `sonnet`. `effort` is medium for building to a plan
@@ -346,7 +348,7 @@ phases:
   - name: review-risk
     kind: agent
     owner: risk-reviewer
-    if: "risk == high"
+    if: "risk != low"
 acceptance: [all_phases_passed, verdict_consistent, diff_matches_claims]
 publish:
-  hold_when: "risk == high"
+  hold_when: "risk != low"

@@ -215,7 +215,12 @@ Rules worth knowing before you write one:
   after acceptance passes. When it holds, the attempt ends
   `accepted_unpublished` with the hold recorded, nothing is pushed, and the
   worktree and branch are retained — the publish-only retry is the human
-  sign-off that releases it. Low-risk work never waits.
+  sign-off that releases it. Low-risk work never waits. Write the predicate
+  to fail closed — `risk != low` holds work whose risk was never reported,
+  where `risk == high` would ship it. The sign-off is only as strong as
+  access to the control plane: jig has one trusted operator and no
+  authentication (see *Loopback only*), so the operator's retry is the
+  approval, with no separate approver identity.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 
