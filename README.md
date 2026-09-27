@@ -203,7 +203,10 @@ Rules worth knowing before you write one:
   envelope view that `if:` guards and `publish.hold_when` read. It is how a
   deterministic script — a risk classifier scoring paths and diff size — gets
   a say in routing without a model in the loop. The adapter's own fields
-  (`status`, `passed`, `exit_code`, …) are reserved.
+  (`status`, `passed`, `exit_code`, …) are reserved, and a reported field is
+  protected: a later agent envelope cannot overwrite it. Code phases and
+  gates receive `JIG_BASE_SHA`, the commit the run was pinned to, so a script
+  can diff the whole change without guessing a base from history.
 - **Guards compare as well as test.** `if: revised` runs a phase when a
   previous envelope set the field truthy; `if: "risk == high"` runs it when
   the comparison holds, in the same `<field> ==|!= <literal>` language as

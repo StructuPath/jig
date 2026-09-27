@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -200,6 +201,7 @@ func (r *Runner) Execute(ctx context.Context, attempt Attempt) worker.Outcome {
 		sessions:     make(map[string]*runtime.Session),
 		transcripts:  make(map[string][]exchange),
 		fieldView:    make(map[string]any),
+		reportedBy:   make(map[string]string),
 		gateReports:  make(map[string]protocol.GateReport),
 		seededRoles:  make(map[string]bool),
 		phaseEntries: make(map[string]int),
@@ -230,7 +232,13 @@ type execution struct {
 	fieldView   map[string]any
 	// publishHeld is the hold reason once publishHold() fired, so the summary
 	// says "held" where it would otherwise say "not_attempted".
-	publishHeld  string
+	publishHeld string
+	// reportedBy names, per field, the reports_fields code phase that last
+	// set it. Those values are deterministic facts about the change (a risk
+	// score), and an agent envelope may not overwrite them: a reviewer that
+	// reports `risk: low` must not be able to talk its way past a publish
+	// hold keyed on the classifier's `risk: high`.
+	reportedBy   map[string]string
 	results      []protocol.PhaseResult
 	gateReports  map[string]protocol.GateReport
 	seededRoles  map[string]bool
@@ -750,11 +758,33 @@ func (e *execution) phaseEnv(phase protocol.PhaseSpec) []string {
 	if phase.Owner != "" {
 		allow = append(allow, e.spec.Roster[phase.Owner].Env...)
 	}
-	return subprocessEnv(e.runner.config.BaseEnv, allow, e.scratch.home)
+	env := subprocessEnv(e.runner.config.BaseEnv, allow, e.scratch.home)
+	// The run's pinned base, so a command can diff the whole change against
+	// the one commit the attempt started from rather than guess it from
+	// history the agents wrote.
+	return append(env, "JIG_BASE_SHA="+e.attempt.BaseSHA)
 }
 
 func (e *execution) mergeFields(fields map[string]any) {
 	for key, value := range fields {
+		e.fieldView[key] = value
+	}
+}
+
+// mergeAgentFields merges an agent envelope into the field view, except for
+// fields a reports_fields code phase already set: those keep the reported
+// value, and the attempted overwrite is traced.
+func (e *execution) mergeAgentFields(phase, role string, fields map[string]any) {
+	for key, value := range fields {
+		if reporter, reported := e.reportedBy[key]; reported {
+			if !reflect.DeepEqual(e.fieldView[key], value) {
+				e.emit.emit(protocol.EventLog, phase, "reported_field_protected", map[string]any{
+					"role": role, "field": key, "reported_by": reporter,
+					"kept": e.fieldView[key], "ignored": value,
+				})
+			}
+			continue
+		}
 		e.fieldView[key] = value
 	}
 }
@@ -786,7 +816,7 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 	}
 	var reported map[string]any
 	if phase.ReportsFields && result.Passed() {
-		fields, err := reportedFields(result.OutputTail)
+		fields, err := reportedFields(result.LastLine, result.LastLineOverflow)
 		if err != nil {
 			// A reporting phase that did not report is a failed phase, not a
 			// silent success with nothing for the guards downstream to read.
@@ -811,6 +841,9 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 		status = protocol.EnvelopeSuccess
 	}
 	e.mergeFields(envelope.Fields)
+	for key := range reported {
+		e.reportedBy[key] = phase.Name
+	}
 	e.recordResult(protocol.PhaseResult{
 		Phase: phase.Name, Kind: phase.Kind, Status: status, PhaseAttempt: entry,
 		Envelope: envelope.Raw, Gates: report, StartedAt: &started,
@@ -1078,7 +1111,7 @@ func (e *execution) runAgentPhaseAttempt(
 			map[string]any{"role": phase.Owner, "paths": touched})
 	}
 
-	e.mergeFields(envelope.Fields)
+	e.mergeAgentFields(phase.Name, phase.Owner, envelope.Fields)
 	e.emit.emit(protocol.EventHandoff, phase.Name, phase.Owner, map[string]any{
 		"artifacts": envelope.Base.Artifacts, "summary": envelope.Base.Summary,
 	})

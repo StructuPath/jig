@@ -316,16 +316,17 @@ phases:
       elif [ -f go.mod ]; then go test ./...;
       elif [ -f package.json ]; then npm test --silent;
       else echo "factory: no test command detected — edit the retest phase"; exit 1; fi
-  # Deterministic risk classification. The commits jig made are authored
-  # "jig", so the base is the newest commit that is not — the run's pinned
-  # HEAD — and the diff from there is the whole change. The last line printed
-  # is the report; everything before it is ordinary output.
+  # Deterministic risk classification. JIG_BASE_SHA is the commit the run was
+  # pinned to, so the diff from there is the whole change, however many
+  # commits it took. The last line printed is the report; everything before
+  # it is ordinary output. Fields a reporting phase sets are protected: a
+  # later agent envelope cannot overwrite `risk`.
   - name: classify-risk
     kind: code
     reports_fields: true
     command: |
       set -eu
-      base=$(git log --format='%H %an' HEAD | awk '$2 != "jig" { print $1; exit }')
+      base="${JIG_BASE_SHA:?JIG_BASE_SHA is required}"
       pattern='(^|/)(auth|authn|authz|login|session|secret|token|password|crypto|migrations?|schema|deploy|infra|terraform|helm|k8s)([./_-]|$)|(^|/)\.github/workflows/|(^|/)Dockerfile|(^|/)go\.mod$|(^|/)package(-lock)?\.json$'
       threshold=400
       files=$(git diff --name-only "$base" HEAD)

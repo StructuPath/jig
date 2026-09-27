@@ -7,10 +7,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -27,6 +29,11 @@ type commandResult struct {
 	TimedOut   bool
 	StartError string
 	OutputTail string
+	// LastLine is the last non-empty output line, kept whole (up to
+	// MaxReportLineBytes) independently of the bounded tail, so a
+	// reports_fields report longer than the tail still parses.
+	LastLine         string
+	LastLineOverflow bool
 }
 
 // Passed reports a clean exit.
@@ -58,8 +65,10 @@ func runShellCommand(
 	shell.Env = env
 	shell.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	tail := &tailWriter{limit: protocol.MaxCommandOutputTailBytes}
-	shell.Stdout = tail
-	shell.Stderr = tail
+	lines := &lastLineWriter{limit: protocol.MaxReportLineBytes}
+	output := io.MultiWriter(tail, lines)
+	shell.Stdout = output
+	shell.Stderr = output
 	if err := shell.Start(); err != nil {
 		return commandResult{ExitCode: -1, StartError: err.Error()}
 	}
@@ -67,7 +76,8 @@ func runShellCommand(
 	go func() { done <- shell.Wait() }()
 	select {
 	case err := <-done:
-		result := commandResult{OutputTail: tail.String()}
+		last, overflow := lines.Last()
+		result := commandResult{OutputTail: tail.String(), LastLine: last, LastLineOverflow: overflow}
 		if exitError, ok := err.(*exec.ExitError); ok {
 			result.ExitCode = exitError.ExitCode()
 		} else if err != nil {
@@ -85,15 +95,11 @@ func runShellCommand(
 // reportedFields reads a reports_fields code phase's report: its last
 // non-empty output line, which must be a JSON object. Everything before it
 // is ordinary output — a script may log freely and report once, at the end.
-func reportedFields(outputTail string) (map[string]any, error) {
-	lines := strings.Split(strings.TrimRight(outputTail, "\n"), "\n")
-	last := ""
-	for i := len(lines) - 1; i >= 0; i-- {
-		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
-			last = trimmed
-			break
-		}
+func reportedFields(lastLine string, overflow bool) (map[string]any, error) {
+	if overflow {
+		return nil, fmt.Errorf("the last output line exceeds %d bytes", protocol.MaxReportLineBytes)
 	}
+	last := strings.TrimSpace(lastLine)
 	if last == "" {
 		return nil, errors.New("the command printed nothing to report")
 	}
@@ -176,3 +182,46 @@ func (w *tailWriter) Write(value []byte) (int, error) {
 }
 
 func (w *tailWriter) String() string { return string(w.bytes) }
+
+// lastLineWriter keeps the last non-empty line written to it, whole, up to
+// limit bytes. A line longer than limit is not truncated into something that
+// might still parse: it is reported as overflowed.
+type lastLineWriter struct {
+	limit           int
+	current         []byte
+	currentOverflow bool
+	last            []byte
+	lastOverflow    bool
+}
+
+func (w *lastLineWriter) Write(value []byte) (int, error) {
+	for _, b := range value {
+		if b == '\n' {
+			w.finishLine()
+			continue
+		}
+		if len(w.current) < w.limit {
+			w.current = append(w.current, b)
+		} else {
+			w.currentOverflow = true
+		}
+	}
+	return len(value), nil
+}
+
+func (w *lastLineWriter) finishLine() {
+	if w.currentOverflow || len(bytes.TrimSpace(w.current)) > 0 {
+		w.last = append(w.last[:0], w.current...)
+		w.lastOverflow = w.currentOverflow
+	}
+	w.current = w.current[:0]
+	w.currentOverflow = false
+}
+
+// Last returns the last non-empty line, counting an unterminated final line.
+func (w *lastLineWriter) Last() (string, bool) {
+	if w.currentOverflow || len(bytes.TrimSpace(w.current)) > 0 {
+		w.finishLine()
+	}
+	return string(w.last), w.lastOverflow
+}

@@ -130,6 +130,10 @@ const (
 	// output lives in the attempt trace; the envelope keeps the tail an agent
 	// can act on.
 	MaxCommandOutputTailBytes = 4 << 10
+	// MaxReportLineBytes caps a reports_fields phase's final report line,
+	// kept whole alongside the tail. A longer report fails the phase rather
+	// than being cut into JSON that does not parse.
+	MaxReportLineBytes = 32 << 10
 
 	// MaxEventPayloadBytes caps one trace event's payload everywhere the
 	// engine emits it (KTD8). Oversized payloads are truncated with a marker,
