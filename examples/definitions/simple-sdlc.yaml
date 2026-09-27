@@ -27,10 +27,16 @@
 # EDIT BEFORE USE: the test command (it detects common entry points and
 # fails loudly when it finds none) and the builder's `writes` allowlist
 # (`**` is the weakest boundary jig can enforce — narrow it, R10).
+#
+# THE ROSTER. The builder and reviewer write and judge code, so they run on
+# `opus`; the planner only reads and plans, on `sonnet`. `effort` sets how
+# much each role thinks and verifies: medium for building to a plan, high
+# for a reviewer whose job is the edge cases a build missed. Leave `effort`
+# out to take the CLI's default for the model.
 name: simple-sdlc
 roster:
   planner:
-    model: haiku
+    model: sonnet
     system_prompt: |
       You are a read-only planner working in a git repository. You never
       create, modify, or delete any file; you produce a plan the builder
@@ -48,7 +54,8 @@ roster:
     env: [PATH]
     writes: []
   builder:
-    model: sonnet
+    model: opus
+    effort: medium
     system_prompt: |
       You are a builder working in a git repository. You execute the plan
       you are handed, you write only what the task requires, and you report
@@ -82,7 +89,8 @@ roster:
     env: [PATH]
     writes: ["**"]
   reviewer:
-    model: sonnet
+    model: opus
+    effort: high
     system_prompt: |
       You are a read-only reviewer. You judge the change against the task
       and the repository's own conventions, and you never create, modify, or

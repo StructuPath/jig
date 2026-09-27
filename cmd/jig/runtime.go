@@ -48,6 +48,9 @@ type selectedRuntime struct {
 	Runtime    runtime.Runtime
 	Capability protocol.RuntimeCapability
 	Seeder     engine.HomeSeeder
+	// Warning is an operator-facing note from the probe (an out-of-date CLI),
+	// or "". It never blocks: the probe already proved the CLI runs.
+	Warning string
 	// Scripted reports the test hook: the enginetest fake needs no auth
 	// material, so seeding is skipped for it entirely.
 	Scripted bool
@@ -97,7 +100,13 @@ func selectRuntime(ctx context.Context, name string, seedAuth bool) (selectedRun
 	if !seedAuth {
 		seeder = nil
 	}
-	return selectedRuntime{Runtime: adapter, Capability: capability, Seeder: seeder}, nil
+	warning := ""
+	if name == runtimeClaudeCode {
+		warning = claudecode.VersionWarning(capability.Version)
+	}
+	return selectedRuntime{
+		Runtime: adapter, Capability: capability, Seeder: seeder, Warning: warning,
+	}, nil
 }
 
 // seedClaudeAuth is the darwin-aware Claude Code seeder (KTD11): the minimum

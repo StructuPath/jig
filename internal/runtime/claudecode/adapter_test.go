@@ -597,3 +597,81 @@ func TestDrainStreamWaitsForTheStderrCaptureBeforeClosingIt(t *testing.T) {
 		t.Fatalf("stderr tail = %q, want the CLI's diagnostic intact", got)
 	}
 }
+
+func TestEffortIsPassedOnlyWhenTheRoleSetsIt(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	for _, effort := range []string{"high", ""} {
+		stubDir := t.TempDir()
+		opts := runtime.Options{
+			Model: "opus", Effort: effort, WorkDir: t.TempDir(), Env: stubEnv(stubDir, "ok"),
+		}
+		handle, err := adapter.StartOrContinue(
+			context.Background(), &runtime.Session{Key: "effort"}, "prompt", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drain(t, handle)
+		if _, err := handle.Result(); err != nil {
+			t.Fatal(err)
+		}
+		arguments, err := os.ReadFile(filepath.Join(stubDir, "args"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		argText := string(arguments)
+		if effort != "" && !strings.Contains(argText, "--effort\n"+effort+"\n") {
+			t.Errorf("args missing --effort %s:\n%s", effort, argText)
+		}
+		if effort == "" && strings.Contains(argText, "--effort") {
+			t.Errorf("an unset effort must leave the CLI default, got:\n%s", argText)
+		}
+	}
+}
+
+func TestVersionWarningFlagsOnlyReleasesOlderThanRecommended(t *testing.T) {
+	for version, wantWarning := range map[string]bool{
+		RecommendedVersion: false,
+		"2.1.283":          false,
+		"2.2.0":            false,
+		"3.0.0":            false,
+		"2.1.279":          true,
+		"2.0.999":          true,
+		"1.9.0":            true,
+		"2.1.279-beta":     true,
+		"not-a-version":    false,
+		"":                 false,
+	} {
+		warning := VersionWarning(version)
+		if (warning != "") != wantWarning {
+			t.Errorf("VersionWarning(%q) = %q, want warning: %v", version, warning, wantWarning)
+		}
+	}
+}
+
+func TestBudgetIsPassedAsMaxBudgetUSDOnlyWhenSet(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	for budget, want := range map[float64]string{2.5: "--max-budget-usd\n2.5\n", 0: ""} {
+		stubDir := t.TempDir()
+		handle, err := adapter.StartOrContinue(context.Background(), &runtime.Session{Key: "budget"},
+			"prompt", runtime.Options{Model: "opus", BudgetUSD: budget, WorkDir: t.TempDir(),
+				Env: stubEnv(stubDir, "ok")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		drain(t, handle)
+		if _, err := handle.Result(); err != nil {
+			t.Fatal(err)
+		}
+		arguments, err := os.ReadFile(filepath.Join(stubDir, "args"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		argText := string(arguments)
+		if want != "" && !strings.Contains(argText, want) {
+			t.Errorf("budget %v: args missing %q:\n%s", budget, want, argText)
+		}
+		if want == "" && strings.Contains(argText, "--max-budget-usd") {
+			t.Errorf("an unset budget must add no flag, got:\n%s", argText)
+		}
+	}
+}

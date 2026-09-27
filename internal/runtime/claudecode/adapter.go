@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -147,6 +148,51 @@ func (a *Adapter) Probe(ctx context.Context) (protocol.RuntimeCapability, error)
 	}, nil
 }
 
+// RecommendedVersion is the oldest Claude Code release that serves the
+// current model generation (Opus 5.5 needs 2.1.280). An older CLI still runs,
+// but a roster's `opus` alias resolves to whatever that build knew about.
+const RecommendedVersion = "2.1.280"
+
+// VersionWarning reports why a probed version is older than
+// RecommendedVersion, or "" when it is current. A version it cannot parse is
+// not a reason to warn: the probe already proved the CLI runs.
+func VersionWarning(version string) string {
+	have, ok := parseVersion(version)
+	if !ok {
+		return ""
+	}
+	want, _ := parseVersion(RecommendedVersion)
+	for i := range want {
+		if have[i] != want[i] {
+			if have[i] > want[i] {
+				return ""
+			}
+			return fmt.Sprintf("claude CLI %s is older than %s; roster model aliases may not "+
+				"resolve to the newest models — run `claude update`", version, RecommendedVersion)
+		}
+	}
+	return ""
+}
+
+// parseVersion reads a dotted major.minor.patch, ignoring any pre-release or
+// build suffix on the patch number.
+func parseVersion(version string) ([3]int, bool) {
+	var parsed [3]int
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) != 3 {
+		return parsed, false
+	}
+	parts[2], _, _ = strings.Cut(parts[2], "-")
+	for i, part := range parts {
+		number, err := strconv.Atoi(part)
+		if err != nil {
+			return parsed, false
+		}
+		parsed[i] = number
+	}
+	return parsed, true
+}
+
 // StartOrContinue sends one prompt into the session. The CLI-native session
 // id is minted here on first use; later sends resume it. The subprocess
 // environment is exactly opts.Env (KTD10) — nothing from the worker's own
@@ -181,6 +227,13 @@ func (a *Adapter) StartOrContinue(
 	}
 	if opts.Model != "" {
 		arguments = append(arguments, "--model", opts.Model)
+	}
+	if opts.Effort != "" {
+		arguments = append(arguments, "--effort", opts.Effort)
+	}
+	if opts.BudgetUSD > 0 {
+		arguments = append(arguments, "--max-budget-usd",
+			strconv.FormatFloat(opts.BudgetUSD, 'f', -1, 64))
 	}
 	if opts.SystemPrompt != "" {
 		arguments = append(arguments, "--system-prompt", opts.SystemPrompt)

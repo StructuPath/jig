@@ -806,3 +806,35 @@ func TestDrainStreamWaitsForTheStderrCaptureBeforeClosingIt(t *testing.T) {
 		t.Fatalf("stderr tail = %q, want the CLI's diagnostic intact", got)
 	}
 }
+
+func TestEffortBecomesARootReasoningOverrideOnBothShapes(t *testing.T) {
+	adapter := NewWithExecutable("codex")
+	for _, test := range []struct{ effort, want string }{
+		{"low", `model_reasoning_effort="low"`},
+		{"xhigh", `model_reasoning_effort="xhigh"`},
+		{"max", `model_reasoning_effort="xhigh"`},
+	} {
+		for _, nativeID := range []string{"", "thread-1"} {
+			arguments, _ := adapter.arguments(
+				&runtime.Session{NativeID: nativeID}, runtime.Options{Effort: test.effort})
+			if len(arguments) < 3 || arguments[0] != "-c" || arguments[1] != test.want ||
+				arguments[2] != "exec" {
+				t.Errorf("effort %q (resume=%v): args = %q, want -c %s ahead of exec",
+					test.effort, nativeID != "", arguments, test.want)
+			}
+		}
+	}
+	arguments, _ := adapter.arguments(&runtime.Session{}, runtime.Options{})
+	if arguments[0] != "exec" {
+		t.Errorf("an unset effort must add no override, got %q", arguments)
+	}
+}
+
+func TestADeclaredBudgetFailsTheSendRatherThanBeingDropped(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	_, err := adapter.StartOrContinue(context.Background(), &runtime.Session{Key: "attempt-budget"}, "p",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(t.TempDir(), "ok"), BudgetUSD: 3})
+	if !errors.Is(err, ErrBudgetUnsupported) {
+		t.Fatalf("error = %v, want ErrBudgetUnsupported", err)
+	}
+}

@@ -120,6 +120,13 @@ var ErrSessionDiscontinuity = errors.New("codex resumed a different thread than 
 var ErrToolAllowlistUnsupported = errors.New(
 	"codex exec has no tool allowlist flag; a role tools: list cannot be enforced")
 
+// ErrBudgetUnsupported reports a role that declared a spend cap against a
+// runtime with no way to enforce one. `codex exec` has no per-run dollar
+// budget flag, and a cap that is silently dropped is worse than none: the
+// definition promised a bound the run does not have. It fails the send.
+var ErrBudgetUnsupported = errors.New(
+	"codex exec has no spend-cap flag; a role budget_usd cannot be enforced")
+
 // Adapter runs the Codex CLI. The zero value is not usable; New resolves the
 // executable once so agent subprocesses never depend on PATH from their own
 // (allowlisted) environment to find the CLI.
@@ -211,6 +218,9 @@ func (a *Adapter) StartOrContinue(
 	if len(opts.Tools) > 0 {
 		return nil, fmt.Errorf("%w (role asked for %s)",
 			ErrToolAllowlistUnsupported, strings.Join(opts.Tools, ","))
+	}
+	if opts.BudgetUSD > 0 {
+		return nil, fmt.Errorf("%w (role asked for $%.2f)", ErrBudgetUnsupported, opts.BudgetUSD)
 	}
 
 	arguments, resumedID := a.arguments(session, opts)
@@ -335,7 +345,14 @@ func (a *Adapter) StartOrContinue(
 // `codex exec resume` accepts neither `--color` nor `--sandbox`, so the
 // bypass posture has to be expressed with the one flag both subcommands take.
 func (a *Adapter) arguments(session *runtime.Session, opts runtime.Options) ([]string, string) {
-	arguments := []string{"exec"}
+	var arguments []string
+	if effort := reasoningEffort(opts.Effort); effort != "" {
+		// A root-level config override, ahead of the subcommand: the root
+		// propagates -c into both `exec` and `exec resume`, so one placement
+		// serves both shapes.
+		arguments = append(arguments, "-c", `model_reasoning_effort="`+effort+`"`)
+	}
+	arguments = append(arguments, "exec")
 	resumedID := session.NativeID
 	if resumedID != "" {
 		arguments = append(arguments, "resume")
@@ -363,6 +380,17 @@ func (a *Adapter) arguments(session *runtime.Session, opts runtime.Options) ([]s
 	// carry untrusted context and argv is world-readable, so they never go on
 	// the command line.
 	return append(arguments, "-"), resumedID
+}
+
+// reasoningEffort maps a role's effort level (Claude Code's vocabulary, the
+// one definitions validate against) onto Codex's model_reasoning_effort.
+// Codex has no level above xhigh, so max runs at xhigh; empty stays empty and
+// leaves the CLI's own default in place.
+func reasoningEffort(effort string) string {
+	if effort == "max" {
+		return "xhigh"
+	}
+	return effort
 }
 
 // codexHandle is one in-flight send: the CLI process, its anchor-led process

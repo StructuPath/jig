@@ -41,6 +41,19 @@ const (
 	RepairExhaustedProceed = "proceed"
 )
 
+// EffortLevels is the accepted `effort:` vocabulary, lowest to highest. It is
+// Claude Code's `--effort` set; the Codex adapter maps it onto that CLI's
+// reasoning-effort setting.
+var EffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
+
+var effortLevels = func() map[string]bool {
+	levels := make(map[string]bool, len(EffortLevels))
+	for _, level := range EffortLevels {
+		levels[level] = true
+	}
+	return levels
+}()
+
 // DefinitionSpec is the parsed YAML form of a Job Definition (R1, KTD2): an
 // ordered phase chain, a per-role roster, and an acceptance predicate of
 // named checks. Validate enforces the save-time contract; nothing downstream
@@ -50,14 +63,33 @@ type DefinitionSpec struct {
 	Roster     map[string]RoleSpec `yaml:"roster"`
 	Phases     []PhaseSpec         `yaml:"phases"`
 	Acceptance []string            `yaml:"acceptance"`
+	Publish    *PublishSpec        `yaml:"publish"`
+}
+
+// PublishSpec is the definition's say over delivery. HoldWhen is a declared
+// envelope predicate (the `on_fail.when` language) evaluated against the
+// chain's merged field view once acceptance has passed: when it holds, the
+// attempt ends accepted_unpublished with a recorded hold instead of a branch
+// and pull request, and the operator's publish retry is the human review
+// step that releases it. A change a classifier scored `risk == high` waits
+// for a person; everything else ships.
+type PublishSpec struct {
+	HoldWhen string `yaml:"hold_when"`
 }
 
 // RoleSpec is one roster entry: the model, prompts, and allowlists an agent
 // role runs with. Prompts are content or a repo-relative path, exclusively.
 // Env is the per-role environment allowlist (KTD10); SensitiveEnv names the
 // subset whose values are redacted from every persisted trace (R15).
+// Effort, when set, is the per-role effort level handed to the runtime CLI;
+// empty leaves the CLI's own default for the model. BudgetUSD, when
+// positive, caps what one send by this role may spend; the runtime CLI
+// enforces it, so a runtime with no such control refuses the send rather
+// than run uncapped.
 type RoleSpec struct {
 	Model            string   `yaml:"model"`
+	Effort           string   `yaml:"effort"`
+	BudgetUSD        float64  `yaml:"budget_usd"`
 	Thinking         string   `yaml:"thinking"`
 	SystemPrompt     string   `yaml:"system_prompt"`
 	SystemPromptPath string   `yaml:"system_prompt_path"`
@@ -71,16 +103,21 @@ type RoleSpec struct {
 
 // PhaseSpec is one link of the chain. Agent phases have an Owner role from
 // the roster; code phases have a Command (and Owner only if they need a
-// role's environment). If names an envelope field: the phase is skipped
-// unless a previous envelope set that field truthy (KTD2).
+// role's environment). If guards the phase (KTD2): a bare field name runs
+// the phase only when a previous envelope set that field truthy; a
+// `<field> == <literal>` predicate runs it only when the comparison holds.
+// ReportsFields, on a code phase, makes the command's last stdout line a
+// JSON object of envelope fields — the way a deterministic script (a risk
+// classifier, say) speaks to `if:` guards and the publish hold.
 type PhaseSpec struct {
-	Name    string      `yaml:"name"`
-	Kind    string      `yaml:"kind"`
-	Owner   string      `yaml:"owner"`
-	Command string      `yaml:"command"`
-	If      string      `yaml:"if"`
-	Gates   []GateSpec  `yaml:"gates"`
-	OnFail  *RepairEdge `yaml:"on_fail"`
+	Name          string      `yaml:"name"`
+	Kind          string      `yaml:"kind"`
+	Owner         string      `yaml:"owner"`
+	Command       string      `yaml:"command"`
+	If            string      `yaml:"if"`
+	ReportsFields bool        `yaml:"reports_fields"`
+	Gates         []GateSpec  `yaml:"gates"`
+	OnFail        *RepairEdge `yaml:"on_fail"`
 }
 
 // GateSpec configures one built-in gate on a phase. Budget is the
@@ -116,6 +153,12 @@ type EnvelopePredicate struct {
 	Op      string
 	Literal string
 }
+
+// IsPredicate reports whether an `if:` guard is a comparison rather than a
+// bare field name: anything with more than one whitespace-separated token
+// must parse as a predicate, so a typo like `risk = high` is a save-time
+// error rather than a guard on a field literally named "risk = high".
+func IsPredicate(guard string) bool { return len(strings.Fields(guard)) > 1 }
 
 // ParsePredicate parses a declared envelope predicate, rejecting anything
 // that is not exactly `<field> <==|!=> <literal>`.
@@ -185,12 +228,35 @@ func (spec *DefinitionSpec) Validate() error {
 	if err := spec.validateRepairAcyclic(phasesByName); err != nil {
 		return err
 	}
-	return spec.validateAcceptance()
+	if err := spec.validateAcceptance(); err != nil {
+		return err
+	}
+	return spec.validatePublish()
+}
+
+func (spec *DefinitionSpec) validatePublish() error {
+	if spec.Publish == nil {
+		return nil
+	}
+	if strings.TrimSpace(spec.Publish.HoldWhen) == "" {
+		return fmt.Errorf("publish: hold_when is required when publish is declared")
+	}
+	if _, err := ParsePredicate(spec.Publish.HoldWhen); err != nil {
+		return fmt.Errorf("publish: hold_when: %w", err)
+	}
+	return nil
 }
 
 func (role RoleSpec) validate(name string) error {
 	if strings.TrimSpace(role.Model) == "" {
 		return fmt.Errorf("role %q: model is required", name)
+	}
+	if role.Effort != "" && !effortLevels[role.Effort] {
+		return fmt.Errorf("role %q: effort %q is not one of %s",
+			name, role.Effort, strings.Join(EffortLevels, ", "))
+	}
+	if role.BudgetUSD < 0 {
+		return fmt.Errorf("role %q: budget_usd must not be negative", name)
 	}
 	if role.SystemPrompt == "" && role.SystemPromptPath == "" {
 		return fmt.Errorf(
@@ -218,6 +284,11 @@ func (spec *DefinitionSpec) validatePhase(phase PhaseSpec, phases map[string]Pha
 		if phase.Command != "" {
 			return fmt.Errorf("phase %q: agent phases do not take a command", phase.Name)
 		}
+		if phase.ReportsFields {
+			return fmt.Errorf(
+				"phase %q: reports_fields is for code phases — an agent phase reports through its envelope",
+				phase.Name)
+		}
 	case PhaseKindCode:
 		if strings.TrimSpace(phase.Command) == "" {
 			return fmt.Errorf("phase %q: code phases require a command", phase.Name)
@@ -225,6 +296,11 @@ func (spec *DefinitionSpec) validatePhase(phase PhaseSpec, phases map[string]Pha
 	default:
 		return fmt.Errorf("phase %q: kind %q is not %q or %q",
 			phase.Name, phase.Kind, PhaseKindAgent, PhaseKindCode)
+	}
+	if IsPredicate(phase.If) {
+		if _, err := ParsePredicate(phase.If); err != nil {
+			return fmt.Errorf("phase %q: if: %w", phase.Name, err)
+		}
 	}
 	if phase.Owner != "" {
 		if _, defined := spec.Roster[phase.Owner]; !defined {

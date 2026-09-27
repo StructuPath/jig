@@ -96,6 +96,9 @@ func publishCode(err error) string {
 const (
 	PublishStatePublished = "published"
 	PublishStateFailed    = "failed"
+	// PublishStateHeld: the definition's publish.hold_when held, so nothing
+	// was pushed. Not a failure — the retry action is the release.
+	PublishStateHeld = "held"
 )
 
 // PublishSummary is what publish writes into the attempt's result: the
@@ -228,6 +231,15 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 	default:
 		// Failed, cancelled, or aborted work is not published. Nothing about
 		// publish applies to it.
+		return outcome
+	}
+	if outcome.PublishHold != "" {
+		// Accepted, and deliberately not shipped: the definition asked for a
+		// person here. The worktree is retained like any unpublished accept
+		// (R16), so the publish-only retry can release it later.
+		outcome.State = protocol.AttemptAcceptedUnpublished
+		outcome.Result = withPublishSummary(outcome.Result, PublishSummary{
+			State: PublishStateHeld, Code: "publish_held", Detail: outcome.PublishHold})
 		return outcome
 	}
 	worker := r.boundWorker()

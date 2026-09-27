@@ -338,3 +338,126 @@ phases:
       run: build
 `, "on_fial")
 }
+
+func TestRoleEffortIsParsedWhenInTheVocabulary(t *testing.T) {
+	for _, level := range EffortLevels {
+		spec := mustParse(t, `
+name: effort
+roster:
+  builder:
+    model: opus
+    effort: `+level+`
+    system_prompt: s
+    user_prompt: u
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+acceptance: [all_phases_passed]
+`)
+		if got := spec.Roster["builder"].Effort; got != level {
+			t.Fatalf("effort = %q, want %q", got, level)
+		}
+	}
+}
+
+func TestUnknownRoleEffortIsRejectedNamingRoleAndLevel(t *testing.T) {
+	mustReject(t, `
+name: bad
+roster:
+  builder:
+    model: opus
+    effort: extreme
+    system_prompt: s
+    user_prompt: u
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+`, `"builder"`, `"extreme"`, "low, medium, high, xhigh, max")
+}
+
+func TestComparisonIfGuardParsesAndMalformedOneIsRejected(t *testing.T) {
+	spec := mustParse(t, `
+name: guard
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: classify, kind: code, command: "echo '{\"risk\":\"high\"}'", reports_fields: true}
+  - {name: extra-review, kind: agent, owner: builder, if: "risk == high"}
+  - {name: retest, kind: code, command: "true", if: revised}
+acceptance: [all_phases_passed]
+`)
+	if !IsPredicate(spec.Phases[1].If) || IsPredicate(spec.Phases[2].If) {
+		t.Fatalf("IsPredicate misclassified the guards %q / %q", spec.Phases[1].If, spec.Phases[2].If)
+	}
+	mustReject(t, `
+name: bad
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder, if: "risk = high"}
+`, `"build"`, "if:", `"="`)
+}
+
+func TestReportsFieldsIsRejectedOnAgentPhases(t *testing.T) {
+	mustReject(t, `
+name: bad
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder, reports_fields: true}
+`, `"build"`, "reports_fields is for code phases")
+}
+
+func TestPublishHoldWhenMustBeAPredicate(t *testing.T) {
+	spec := mustParse(t, `
+name: hold
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+publish:
+  hold_when: "risk == high"
+`)
+	if spec.Publish == nil || spec.Publish.HoldWhen != "risk == high" {
+		t.Fatalf("publish = %+v", spec.Publish)
+	}
+	mustReject(t, `
+name: bad
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+publish:
+  hold_when: risky
+`, "publish: hold_when", "not of the form")
+	mustReject(t, `
+name: bad
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+publish: {}
+`, "hold_when is required")
+}
+
+func TestNegativeRoleBudgetIsRejected(t *testing.T) {
+	spec := mustParse(t, `
+name: budget
+roster:
+  builder: {model: opus, budget_usd: 2.5, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`)
+	if spec.Roster["builder"].BudgetUSD != 2.5 {
+		t.Fatalf("budget_usd = %v", spec.Roster["builder"].BudgetUSD)
+	}
+	mustReject(t, `
+name: bad
+roster:
+  builder: {model: opus, budget_usd: -1, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`, `"builder"`, "budget_usd must not be negative")
+}

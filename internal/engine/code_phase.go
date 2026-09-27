@@ -7,10 +7,14 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,6 +29,11 @@ type commandResult struct {
 	TimedOut   bool
 	StartError string
 	OutputTail string
+	// LastLine is the last non-empty output line, kept whole (up to
+	// MaxReportLineBytes) independently of the bounded tail, so a
+	// reports_fields report longer than the tail still parses.
+	LastLine         string
+	LastLineOverflow bool
 }
 
 // Passed reports a clean exit.
@@ -56,8 +65,10 @@ func runShellCommand(
 	shell.Env = env
 	shell.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	tail := &tailWriter{limit: protocol.MaxCommandOutputTailBytes}
-	shell.Stdout = tail
-	shell.Stderr = tail
+	lines := &lastLineWriter{limit: protocol.MaxReportLineBytes}
+	output := io.MultiWriter(tail, lines)
+	shell.Stdout = output
+	shell.Stderr = output
 	if err := shell.Start(); err != nil {
 		return commandResult{ExitCode: -1, StartError: err.Error()}
 	}
@@ -65,7 +76,8 @@ func runShellCommand(
 	go func() { done <- shell.Wait() }()
 	select {
 	case err := <-done:
-		result := commandResult{OutputTail: tail.String()}
+		last, overflow := lines.Last()
+		result := commandResult{OutputTail: tail.String(), LastLine: last, LastLineOverflow: overflow}
 		if exitError, ok := err.(*exec.ExitError); ok {
 			result.ExitCode = exitError.ExitCode()
 		} else if err != nil {
@@ -80,10 +92,41 @@ func runShellCommand(
 	}
 }
 
+// reportedFields reads a reports_fields code phase's report: its last
+// non-empty output line, which must be a JSON object. Everything before it
+// is ordinary output — a script may log freely and report once, at the end.
+func reportedFields(lastLine string, overflow bool) (map[string]any, error) {
+	if overflow {
+		return nil, fmt.Errorf("the last output line exceeds %d bytes", protocol.MaxReportLineBytes)
+	}
+	last := strings.TrimSpace(lastLine)
+	if last == "" {
+		return nil, errors.New("the command printed nothing to report")
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(last), &fields); err != nil {
+		return nil, fmt.Errorf("the last output line is not a JSON object: %w", err)
+	}
+	for key := range fields {
+		if adapterReservedFields[key] {
+			return nil, fmt.Errorf("reported field %q is reserved for the adapter envelope", key)
+		}
+	}
+	return fields, nil
+}
+
+// adapterReservedFields are the envelope fields the adapter owns; a
+// reports_fields script may not overwrite the record of its own exit.
+var adapterReservedFields = map[string]bool{
+	"status": true, "summary": true, "passed": true, "failures": true,
+	"exit_code": true, "output_tail": true,
+}
+
 // adapterEnvelope wraps a command result as an envelope (R8): the
 // sssf:VerifyOutput shape — status, passed, failures — plus the exit status
-// and output tail as the evidence a repair-target agent works from.
-func adapterEnvelope(command string, result commandResult) parsedEnvelope {
+// and output tail as the evidence a repair-target agent works from, plus
+// any fields a reports_fields phase declared.
+func adapterEnvelope(command string, result commandResult, reported map[string]any) parsedEnvelope {
 	status := protocol.EnvelopeFail
 	summary := fmt.Sprintf("command %q exited %d", command, result.ExitCode)
 	var failures []string
@@ -100,14 +143,16 @@ func adapterEnvelope(command string, result commandResult) parsedEnvelope {
 	default:
 		failures = append(failures, fmt.Sprintf("exit %d", result.ExitCode))
 	}
-	fields := map[string]any{
-		"status":      status,
-		"summary":     summary,
-		"passed":      result.Passed(),
-		"failures":    failures,
-		"exit_code":   result.ExitCode,
-		"output_tail": result.OutputTail,
+	fields := make(map[string]any, len(reported)+6)
+	for key, value := range reported {
+		fields[key] = value
 	}
+	fields["status"] = status
+	fields["summary"] = summary
+	fields["passed"] = result.Passed()
+	fields["failures"] = failures
+	fields["exit_code"] = result.ExitCode
+	fields["output_tail"] = result.OutputTail
 	raw, err := json.Marshal(fields)
 	if err != nil {
 		raw = []byte(`{"status":"fail","summary":"adapter envelope encoding failed"}`)
@@ -137,3 +182,46 @@ func (w *tailWriter) Write(value []byte) (int, error) {
 }
 
 func (w *tailWriter) String() string { return string(w.bytes) }
+
+// lastLineWriter keeps the last non-empty line written to it, whole, up to
+// limit bytes. A line longer than limit is not truncated into something that
+// might still parse: it is reported as overflowed.
+type lastLineWriter struct {
+	limit           int
+	current         []byte
+	currentOverflow bool
+	last            []byte
+	lastOverflow    bool
+}
+
+func (w *lastLineWriter) Write(value []byte) (int, error) {
+	for _, b := range value {
+		if b == '\n' {
+			w.finishLine()
+			continue
+		}
+		if len(w.current) < w.limit {
+			w.current = append(w.current, b)
+		} else {
+			w.currentOverflow = true
+		}
+	}
+	return len(value), nil
+}
+
+func (w *lastLineWriter) finishLine() {
+	if w.currentOverflow || len(bytes.TrimSpace(w.current)) > 0 {
+		w.last = append(w.last[:0], w.current...)
+		w.lastOverflow = w.currentOverflow
+	}
+	w.current = w.current[:0]
+	w.currentOverflow = false
+}
+
+// Last returns the last non-empty line, counting an unterminated final line.
+func (w *lastLineWriter) Last() (string, bool) {
+	if w.currentOverflow || len(bytes.TrimSpace(w.current)) > 0 {
+		w.finishLine()
+	}
+	return string(w.last), w.lastOverflow
+}

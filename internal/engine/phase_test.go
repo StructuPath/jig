@@ -1035,13 +1035,14 @@ acceptance: [all_phases_passed]
 			values[name] = value
 		}
 	}
-	// `sh` itself contributes these three; everything else must have been
-	// composed by the engine.
+	// `sh` itself contributes PWD, SHLVL and _; everything else must have
+	// been composed by the engine — the allowlist, the HOME/XDG family, and
+	// JIG_BASE_SHA, the run's pinned commit.
 	allowed := map[string]bool{
 		"PATH": true, "FOO": true, "HOME": true,
 		"XDG_CONFIG_HOME": true, "XDG_CACHE_HOME": true,
 		"XDG_DATA_HOME": true, "XDG_STATE_HOME": true,
-		"PWD": true, "SHLVL": true, "_": true,
+		"JIG_BASE_SHA": true, "PWD": true, "SHLVL": true, "_": true,
 	}
 	for name := range values {
 		if !allowed[name] {
@@ -1485,5 +1486,222 @@ acceptance: [all_phases_passed]
 	// A wrong-typed verdict is named as such, never silently read as false.
 	if !strings.Contains(calls[2].Prompt, "boolean") {
 		t.Fatalf("correction does not name the type problem: %.300q", calls[2].Prompt)
+	}
+}
+
+// ---- scenario: reported fields, comparison guards, the publish hold --------
+
+// factorySnapshot is the risk-gated tail of the factory shape: a code phase
+// classifies the change by reporting fields, a comparison guard routes an
+// extra review only for high risk, and the publish hold parks high-risk
+// work for a person.
+const factorySnapshot = `
+name: factory
+roster:
+  builder:
+    model: test-model
+    system_prompt: Build.
+    user_prompt: "Build the app."
+    writes: ["src/"]
+  reviewer:
+    model: test-model
+    system_prompt: Review.
+    user_prompt: "Review the work."
+    writes: []
+phases:
+  - {name: build, kind: agent, owner: builder}
+  - name: classify
+    kind: code
+    reports_fields: true
+    command: |
+      echo "scanning the diff"
+      if [ -f src/auth.txt ]; then echo '{"risk":"high","touched":["src/auth.txt"]}';
+      else echo '{"risk":"low","touched":[]}'; fi
+  - {name: security-review, kind: agent, owner: reviewer, if: "risk == high"}
+acceptance: [all_phases_passed]
+publish:
+  hold_when: "risk == high"
+`
+
+func TestHighRiskChangeGetsTheExtraReviewAndHoldsPublish(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/auth.txt": "token check"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built auth"})},
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "approved": true,
+			"summary": "security ok"})},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+	outcome := runner.Execute(context.Background(), testAttempt(factorySnapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	if fake.Remaining() != 0 {
+		t.Fatal("the security review did not run for a high-risk change")
+	}
+	if !strings.Contains(outcome.PublishHold, `"risk == high"`) ||
+		!strings.Contains(outcome.PublishHold, "risk = high") {
+		t.Fatalf("PublishHold = %q, want the held predicate and the field value", outcome.PublishHold)
+	}
+	if !sink.has(protocol.EventLog, "publish_held") {
+		t.Fatal("no publish_held trace event")
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(outcome.Result), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["publish"] != "held" || summary["publish_hold"] == nil {
+		t.Fatalf("summary publish = %v / %v, want held with a reason", summary["publish"], summary["publish_hold"])
+	}
+}
+
+func TestLowRiskChangeSkipsTheExtraReviewAndIsNotHeld(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+	outcome := runner.Execute(context.Background(), testAttempt(factorySnapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished || outcome.PublishHold != "" {
+		t.Fatalf("outcome = %+v, want accepted_unpublished with no hold", outcome)
+	}
+	if fake.Remaining() != 0 {
+		t.Fatal("the security review ran for a low-risk change")
+	}
+	if !sink.has(protocol.EventLog, "phase_skipped") || sink.has(protocol.EventLog, "publish_held") {
+		t.Fatal("expected the review skipped and no hold")
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(outcome.Result), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["publish"] != "not_attempted" {
+		t.Fatalf("summary publish = %v, want not_attempted", summary["publish"])
+	}
+}
+
+func TestAReportingPhaseThatDoesNotReportFails(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	snapshot := strings.Replace(factorySnapshot,
+		`else echo '{"risk":"low","touched":[]}'; fi`, `else echo "no report here"; fi`, 1)
+	outcome := newTestRunner(t, fake, &recordingSink{}, nil).
+		Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "reports_fields") {
+		t.Fatalf("outcome = %+v, want a failed attempt naming reports_fields", outcome)
+	}
+}
+
+func TestAReportedFieldMayNotOverwriteTheAdaptersOwn(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	snapshot := strings.Replace(factorySnapshot,
+		`else echo '{"risk":"low","touched":[]}'; fi`, `else echo '{"passed":true,"risk":"low"}'; fi`, 1)
+	outcome := newTestRunner(t, fake, &recordingSink{}, nil).
+		Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "reserved") {
+		t.Fatalf("outcome = %+v, want a failed attempt naming the reserved field", outcome)
+	}
+}
+
+func TestAnAgentCannotOverwriteAReportedFieldToEscapeTheHold(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/auth.txt": "token check"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built auth"})},
+		// The high-risk reviewer tries to downgrade the classifier's verdict.
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "approved": true,
+			"risk": "low", "summary": "nothing to see"})},
+	)
+	sink := &recordingSink{}
+	outcome := newTestRunner(t, fake, sink, nil).
+		Execute(context.Background(), testAttempt(factorySnapshot, nil, repo))
+	if outcome.PublishHold == "" {
+		t.Fatalf("outcome = %+v: an agent's risk=low escaped the hold", outcome)
+	}
+	if !sink.has(protocol.EventLog, "reported_field_protected") {
+		t.Fatal("the attempted overwrite was not traced")
+	}
+}
+
+func TestCodePhasesReceiveThePinnedBaseSHA(t *testing.T) {
+	repo := initRepo(t)
+	attempt := testAttempt(`
+name: base
+roster:
+  writer: {model: test-model, system_prompt: s, user_prompt: u}
+phases:
+  - {name: check, kind: code, command: 'test "$JIG_BASE_SHA" = "pinned-sha"'}
+acceptance: [all_phases_passed]
+`, nil, repo)
+	attempt.BaseSHA = "pinned-sha"
+	outcome := newTestRunner(t, enginetest.New(), &recordingSink{}, nil).
+		Execute(context.Background(), attempt)
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("outcome = %+v, want the command to see JIG_BASE_SHA", outcome)
+	}
+}
+
+func TestAReportLongerThanTheOutputTailStillParses(t *testing.T) {
+	repo := initRepo(t)
+	long := strings.Repeat("x", protocol.MaxCommandOutputTailBytes*2)
+	outcome := newTestRunner(t, enginetest.New(), &recordingSink{}, nil).
+		Execute(context.Background(), testAttempt(`
+name: long
+roster:
+  writer: {model: test-model, system_prompt: s, user_prompt: u}
+phases:
+  - {name: report, kind: code, reports_fields: true, command: "printf '{\"risk\":\"low\",\"note\":\"`+long+`\"}'"}
+  - {name: gated, kind: code, command: "false", if: "risk == high"}
+acceptance: [all_phases_passed]
+`, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("outcome = %+v, want the long, unterminated report to parse", outcome)
+	}
+}
+
+func TestAReportLongerThanTheReportCapFailsRatherThanTruncating(t *testing.T) {
+	repo := initRepo(t)
+	outcome := newTestRunner(t, enginetest.New(), &recordingSink{}, nil).
+		Execute(context.Background(), testAttempt(fmt.Sprintf(`
+name: huge
+roster:
+  writer: {model: test-model, system_prompt: s, user_prompt: u}
+phases:
+  - {name: report, kind: code, reports_fields: true, command: "head -c %d /dev/zero | tr '\\0' x; echo"}
+acceptance: [all_phases_passed]
+`, protocol.MaxReportLineBytes+10), nil, repo))
+	if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "exceeds") {
+		t.Fatalf("outcome = %+v, want a failed phase naming the overflow", outcome)
+	}
+}
+
+func TestANotEqualHoldFailsClosedWhenTheFieldWasNeverReported(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	outcome := newTestRunner(t, fake, &recordingSink{}, nil).Execute(context.Background(), testAttempt(`
+name: fail-closed
+roster:
+  builder: {model: test-model, system_prompt: Build., user_prompt: Build., writes: ["src/"]}
+phases:
+  - {name: build, kind: agent, owner: builder}
+acceptance: [all_phases_passed]
+publish:
+  hold_when: "risk != low"
+`, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished || outcome.PublishHold == "" {
+		t.Fatalf("outcome = %+v, want work with no risk report held", outcome)
 	}
 }

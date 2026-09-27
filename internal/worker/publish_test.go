@@ -873,3 +873,31 @@ func TestMilestone2ExitGate(t *testing.T) {
 		t.Fatalf("job state = %q, want accepted", jobAfter.State)
 	}
 }
+
+func TestAPublishHoldEndsAcceptedUnpublishedWithoutTouchingTheRemote(t *testing.T) {
+	gateway := newFakeGateway()
+	inner := RunnerFunc(func(context.Context, *PreparedAttempt) Outcome {
+		return Outcome{State: protocol.AttemptAcceptedUnpublished,
+			Result: engineResult(t, []string{"src/auth.txt"}), PublishHold: "risk == high held"}
+	})
+	// Deliberately unbound: a hold must never reach the publish pipeline, so
+	// an unbound runner is the proof — bound or not, nothing is pushed.
+	runner := NewPublishingRunner(inner, gateway, PublishOptions{})
+	outcome := runner.Run(context.Background(), &PreparedAttempt{})
+	if outcome.State != protocol.AttemptAcceptedUnpublished || outcome.Error != "" {
+		t.Fatalf("outcome = %+v, want accepted_unpublished with no error", outcome)
+	}
+	var document struct {
+		Publish PublishSummary `json:"publish"`
+	}
+	if err := json.Unmarshal([]byte(outcome.Result), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Publish.State != PublishStateHeld || document.Publish.Code != "publish_held" ||
+		document.Publish.Detail != "risk == high held" {
+		t.Fatalf("publish summary = %+v, want held with the reason", document.Publish)
+	}
+	if created, adopted := gateway.counts(); created+adopted != 0 {
+		t.Fatal("a held publish must not create or adopt a pull request")
+	}
+}
