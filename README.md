@@ -65,6 +65,11 @@ You also need at least one agent CLI, authenticated:
 | Claude Code | `claude-code` (default) | `claude` logged in | `haiku`, `sonnet`, `opus`, … |
 | Codex | `codex` | `codex login` | Codex model ids, e.g. `gpt-5.6-sol` |
 
+Model aliases (`haiku`, `sonnet`, `opus`) resolve inside the CLI to the
+newest model it knows in that tier, so keep the CLI current: `jig run` and
+`jig worker` warn at startup when Claude Code is older than 2.1.280, the first
+release that serves Opus 5.5.
+
 One process runs one runtime: the engine holds a single adapter per attempt,
 so `--runtime` is an operator choice, not a per-role one. The `model:` value
 in a definition's roster goes straight to that CLI, which is why the stock
@@ -124,7 +129,8 @@ The shape:
 name: my-workflow
 roster:                      # one entry per agent role
   builder:
-    model: sonnet
+    model: opus
+    effort: medium           # optional: low | medium | high | xhigh | max
     system_prompt: |         # or system_prompt_path: <repo-relative file>
       You are a builder …
     user_prompt: |
@@ -169,6 +175,13 @@ Rules worth knowing before you write one:
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
   discovered at 2 a.m.
+- **Effort is per role, and optional.** `effort` goes to Claude Code as
+  `--effort`, and to Codex as `model_reasoning_effort` (Codex tops out at
+  `xhigh`, so `max` runs there). It sets how much a role thinks and verifies,
+  and thinking is billed as output. A useful split: `medium` for a builder
+  working to a plan, `high` for a reviewer hunting the edge cases the build
+  missed. Omit it to keep the CLI's default for the model, and omit it for
+  `haiku`, which does not take an effort level.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 

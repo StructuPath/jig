@@ -65,7 +65,7 @@ Common first-run failures:
   environment variable (and add that variable to the role's `env` allowlist).
 - *“seed codex auth: … is unreadable”* — run `codex login`, then
   `jig run --runtime codex …`. Also change the roster's `model:` values: the
-  stock definitions name Claude Code models (`haiku`, `sonnet`), and the value
+  stock definitions name Claude Code models (`haiku`, `sonnet`, `opus`), and the value
   is passed to whichever CLI you selected.
 
 Everything the run did is in the trace file, one JSON event per line:

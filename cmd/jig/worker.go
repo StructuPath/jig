@@ -114,6 +114,9 @@ func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "jig worker: %v\n", err)
 		return exitInfraFailed
 	}
+	if selected.Warning != "" {
+		fmt.Fprintf(stderr, "jig worker: warning: %s\n", selected.Warning)
+	}
 
 	// Every control-plane write rides a context the interrupt does not
 	// cancel: an interrupted attempt still has to report its terminal state,

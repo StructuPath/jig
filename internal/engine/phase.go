@@ -888,6 +888,7 @@ func (e *execution) runAgentPhaseAttempt(
 		options: runtime.Options{
 			SystemPrompt: systemPrompt,
 			Model:        role.Model,
+			Effort:       role.Effort,
 			Tools:        append([]string(nil), role.Tools...),
 			WorkDir:      e.attempt.WorktreePath,
 			Env:          subprocessEnv(e.runner.config.BaseEnv, role.Env, e.scratch.home),
@@ -896,7 +897,7 @@ func (e *execution) runAgentPhaseAttempt(
 	session := e.sessionFor(phase.Owner)
 	e.emit.emit(protocol.EventAgentStart, phase.Name, phase.Owner, map[string]any{
 		"model": role.Model, "session": session.Key, "can_resume": e.capability.CanResume,
-		"tools": role.Tools, "phase_attempt": entry,
+		"effort": role.Effort, "tools": role.Tools, "phase_attempt": entry,
 	})
 
 	// death wraps up one dead entry: roll the worktree back to the pre-phase

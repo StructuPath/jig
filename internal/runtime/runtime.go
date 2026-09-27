@@ -60,6 +60,7 @@ type Usage struct {
 type Options struct {
 	SystemPrompt string
 	Model        string
+	Effort       string
 	Tools        []string
 	WorkDir      string
 	Env          []string

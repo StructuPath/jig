@@ -128,6 +128,9 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "jig run: %v\n", err)
 		return exitInfraFailed
 	}
+	if selected.Warning != "" {
+		fmt.Fprintf(stderr, "jig run: warning: %s\n", selected.Warning)
+	}
 
 	result, err := controlplane.DirectRun(ctx, controlplane.DirectRunConfig{
 		DataDir:    *dataDir,

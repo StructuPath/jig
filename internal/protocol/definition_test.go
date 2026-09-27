@@ -338,3 +338,41 @@ phases:
       run: build
 `, "on_fial")
 }
+
+func TestRoleEffortIsParsedWhenInTheVocabulary(t *testing.T) {
+	for _, level := range EffortLevels {
+		spec := mustParse(t, `
+name: effort
+roster:
+  builder:
+    model: opus
+    effort: `+level+`
+    system_prompt: s
+    user_prompt: u
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+acceptance: [all_phases_passed]
+`)
+		if got := spec.Roster["builder"].Effort; got != level {
+			t.Fatalf("effort = %q, want %q", got, level)
+		}
+	}
+}
+
+func TestUnknownRoleEffortIsRejectedNamingRoleAndLevel(t *testing.T) {
+	mustReject(t, `
+name: bad
+roster:
+  builder:
+    model: opus
+    effort: extreme
+    system_prompt: s
+    user_prompt: u
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+`, `"builder"`, `"extreme"`, "low, medium, high, xhigh, max")
+}

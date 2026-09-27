@@ -41,6 +41,19 @@ const (
 	RepairExhaustedProceed = "proceed"
 )
 
+// EffortLevels is the accepted `effort:` vocabulary, lowest to highest. It is
+// Claude Code's `--effort` set; the Codex adapter maps it onto that CLI's
+// reasoning-effort setting.
+var EffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
+
+var effortLevels = func() map[string]bool {
+	levels := make(map[string]bool, len(EffortLevels))
+	for _, level := range EffortLevels {
+		levels[level] = true
+	}
+	return levels
+}()
+
 // DefinitionSpec is the parsed YAML form of a Job Definition (R1, KTD2): an
 // ordered phase chain, a per-role roster, and an acceptance predicate of
 // named checks. Validate enforces the save-time contract; nothing downstream
@@ -56,8 +69,11 @@ type DefinitionSpec struct {
 // role runs with. Prompts are content or a repo-relative path, exclusively.
 // Env is the per-role environment allowlist (KTD10); SensitiveEnv names the
 // subset whose values are redacted from every persisted trace (R15).
+// Effort, when set, is the per-role effort level handed to the runtime CLI;
+// empty leaves the CLI's own default for the model.
 type RoleSpec struct {
 	Model            string   `yaml:"model"`
+	Effort           string   `yaml:"effort"`
 	Thinking         string   `yaml:"thinking"`
 	SystemPrompt     string   `yaml:"system_prompt"`
 	SystemPromptPath string   `yaml:"system_prompt_path"`
@@ -191,6 +207,10 @@ func (spec *DefinitionSpec) Validate() error {
 func (role RoleSpec) validate(name string) error {
 	if strings.TrimSpace(role.Model) == "" {
 		return fmt.Errorf("role %q: model is required", name)
+	}
+	if role.Effort != "" && !effortLevels[role.Effort] {
+		return fmt.Errorf("role %q: effort %q is not one of %s",
+			name, role.Effort, strings.Join(EffortLevels, ", "))
 	}
 	if role.SystemPrompt == "" && role.SystemPromptPath == "" {
 		return fmt.Errorf(

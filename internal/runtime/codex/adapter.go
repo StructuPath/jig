@@ -335,7 +335,14 @@ func (a *Adapter) StartOrContinue(
 // `codex exec resume` accepts neither `--color` nor `--sandbox`, so the
 // bypass posture has to be expressed with the one flag both subcommands take.
 func (a *Adapter) arguments(session *runtime.Session, opts runtime.Options) ([]string, string) {
-	arguments := []string{"exec"}
+	var arguments []string
+	if effort := reasoningEffort(opts.Effort); effort != "" {
+		// A root-level config override, ahead of the subcommand: the root
+		// propagates -c into both `exec` and `exec resume`, so one placement
+		// serves both shapes.
+		arguments = append(arguments, "-c", `model_reasoning_effort="`+effort+`"`)
+	}
+	arguments = append(arguments, "exec")
 	resumedID := session.NativeID
 	if resumedID != "" {
 		arguments = append(arguments, "resume")
@@ -363,6 +370,17 @@ func (a *Adapter) arguments(session *runtime.Session, opts runtime.Options) ([]s
 	// carry untrusted context and argv is world-readable, so they never go on
 	// the command line.
 	return append(arguments, "-"), resumedID
+}
+
+// reasoningEffort maps a role's effort level (Claude Code's vocabulary, the
+// one definitions validate against) onto Codex's model_reasoning_effort.
+// Codex has no level above xhigh, so max runs at xhigh; empty stays empty and
+// leaves the CLI's own default in place.
+func reasoningEffort(effort string) string {
+	if effort == "max" {
+		return "xhigh"
+	}
+	return effort
 }
 
 // codexHandle is one in-flight send: the CLI process, its anchor-led process
