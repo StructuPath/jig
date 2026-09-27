@@ -188,6 +188,11 @@ lands the job in `accepted_unpublished` — a distinct state with a
 publish-only retry, not a failure: the phases passed and the work is on the
 branch `jig/<job-id>/<attempt>`.
 
+The same state is where a definition's `publish.hold_when` parks work on
+purpose: `factory.yaml` scores every change for risk and holds high-risk
+work with `publish: held` in its result. Read the risk reviewer's briefing in
+the trace, then the publish retry is your sign-off.
+
 `Ctrl-C` stops the worker in order: no new claims, in-flight attempts
 cancelled, terminal states recorded, ephemeral scratch destroyed.
 

@@ -120,6 +120,13 @@ var ErrSessionDiscontinuity = errors.New("codex resumed a different thread than 
 var ErrToolAllowlistUnsupported = errors.New(
 	"codex exec has no tool allowlist flag; a role tools: list cannot be enforced")
 
+// ErrBudgetUnsupported reports a role that declared a spend cap against a
+// runtime with no way to enforce one. `codex exec` has no per-run dollar
+// budget flag, and a cap that is silently dropped is worse than none: the
+// definition promised a bound the run does not have. It fails the send.
+var ErrBudgetUnsupported = errors.New(
+	"codex exec has no spend-cap flag; a role budget_usd cannot be enforced")
+
 // Adapter runs the Codex CLI. The zero value is not usable; New resolves the
 // executable once so agent subprocesses never depend on PATH from their own
 // (allowlisted) environment to find the CLI.
@@ -211,6 +218,9 @@ func (a *Adapter) StartOrContinue(
 	if len(opts.Tools) > 0 {
 		return nil, fmt.Errorf("%w (role asked for %s)",
 			ErrToolAllowlistUnsupported, strings.Join(opts.Tools, ","))
+	}
+	if opts.BudgetUSD > 0 {
+		return nil, fmt.Errorf("%w (role asked for $%.2f)", ErrBudgetUnsupported, opts.BudgetUSD)
 	}
 
 	arguments, resumedID := a.arguments(session, opts)

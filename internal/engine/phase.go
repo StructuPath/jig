@@ -216,18 +216,21 @@ type exchange struct {
 
 // execution is one attempt's run state.
 type execution struct {
-	runner       *Runner
-	attempt      Attempt
-	spec         *protocol.DefinitionSpec
-	capability   protocol.RuntimeCapability
-	emit         *emitter
-	scratch      *attemptScratch
-	timeouts     timeoutConfig
-	deadline     time.Time
-	sessions     map[string]*runtime.Session
-	sessionSeq   int
-	transcripts  map[string][]exchange
-	fieldView    map[string]any
+	runner      *Runner
+	attempt     Attempt
+	spec        *protocol.DefinitionSpec
+	capability  protocol.RuntimeCapability
+	emit        *emitter
+	scratch     *attemptScratch
+	timeouts    timeoutConfig
+	deadline    time.Time
+	sessions    map[string]*runtime.Session
+	sessionSeq  int
+	transcripts map[string][]exchange
+	fieldView   map[string]any
+	// publishHeld is the hold reason once publishHold() fired, so the summary
+	// says "held" where it would otherwise say "not_attempted".
+	publishHeld  string
 	results      []protocol.PhaseResult
 	gateReports  map[string]protocol.GateReport
 	seededRoles  map[string]bool
@@ -302,9 +305,32 @@ func (e *execution) run(ctx context.Context) worker.Outcome {
 			Error:  "acceptance predicate failed: " + acceptanceDiagnostic(acceptance),
 			Result: e.summaryJSON(&acceptance)}
 	}
+	// The declared publish hold is judged last, over the merged field view:
+	// accepted work a classifier marked for a person ends here with the hold
+	// on record, and the publishing runner reads it rather than pushing.
+	if hold := e.publishHold(); hold != "" {
+		e.publishHeld = hold
+		e.emit.emit(protocol.EventLog, "", "publish_held", map[string]any{"reason": hold})
+		return worker.Outcome{State: protocol.AttemptAcceptedUnpublished,
+			Result: e.summaryJSON(&acceptance), PublishHold: hold}
+	}
 	// Publish is U7; direct runs mark no-publish explicitly.
 	return worker.Outcome{State: protocol.AttemptAcceptedUnpublished,
 		Result: e.summaryJSON(&acceptance)}
+}
+
+// publishHold evaluates the definition's publish.hold_when against the field
+// view, returning the human-readable reason when it holds and "" otherwise.
+func (e *execution) publishHold() string {
+	if e.spec.Publish == nil || e.spec.Publish.HoldWhen == "" {
+		return ""
+	}
+	predicate, err := protocol.ParsePredicate(e.spec.Publish.HoldWhen)
+	if err != nil || !predicateHolds(predicate, e.fieldView) {
+		return ""
+	}
+	return fmt.Sprintf("publish.hold_when %q held (%s = %v)",
+		e.spec.Publish.HoldWhen, predicate.Field, e.fieldView[predicate.Field])
 }
 
 func acceptanceDiagnostic(acceptance acceptanceResult) string {
@@ -339,6 +365,10 @@ func (e *execution) summaryJSON(acceptance *acceptanceResult) string {
 		"phases":        boundedResults(e.results),
 		"changed_paths": paths,
 		"publish":       "not_attempted",
+	}
+	if e.publishHeld != "" {
+		summary["publish"] = "held"
+		summary["publish_hold"] = e.publishHeld
 	}
 	if acceptance != nil {
 		summary["acceptance"] = acceptance
@@ -472,7 +502,7 @@ func (e *execution) runChain(ctx context.Context) chainEnd {
 			return chainEnd{endCeiling, ""}
 		}
 		e.freshenLease(ctx)
-		if phase.If != "" && !truthy(e.fieldView[phase.If]) {
+		if phase.If != "" && !guardHolds(phase.If, e.fieldView) {
 			e.recordResult(protocol.PhaseResult{
 				Phase: phase.Name, Kind: phase.Kind, Status: phaseStatusSkipped,
 			})
@@ -754,10 +784,21 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 	if e.cancelled() {
 		return phaseRun{outcome: phaseCancelled, failure: "cancelled during phase " + phase.Name}
 	}
-	envelope := adapterEnvelope(phase.Command, result)
+	var reported map[string]any
+	if phase.ReportsFields && result.Passed() {
+		fields, err := reportedFields(result.OutputTail)
+		if err != nil {
+			// A reporting phase that did not report is a failed phase, not a
+			// silent success with nothing for the guards downstream to read.
+			result.ExitCode = -1
+			result.StartError = "reports_fields: " + err.Error()
+		}
+		reported = fields
+	}
+	envelope := adapterEnvelope(phase.Command, result, reported)
 	e.emit.emit(protocol.EventLog, phase.Name, "command_result", map[string]any{
 		"exit_code": result.ExitCode, "timed_out": result.TimedOut,
-		"output_tail": result.OutputTail,
+		"output_tail": result.OutputTail, "reported_fields": reported,
 	})
 
 	// Gates verify the adapter envelope's claims too; there is no session to
@@ -889,6 +930,7 @@ func (e *execution) runAgentPhaseAttempt(
 			SystemPrompt: systemPrompt,
 			Model:        role.Model,
 			Effort:       role.Effort,
+			BudgetUSD:    role.BudgetUSD,
 			Tools:        append([]string(nil), role.Tools...),
 			WorkDir:      e.attempt.WorktreePath,
 			Env:          subprocessEnv(e.runner.config.BaseEnv, role.Env, e.scratch.home),
@@ -897,7 +939,7 @@ func (e *execution) runAgentPhaseAttempt(
 	session := e.sessionFor(phase.Owner)
 	e.emit.emit(protocol.EventAgentStart, phase.Name, phase.Owner, map[string]any{
 		"model": role.Model, "session": session.Key, "can_resume": e.capability.CanResume,
-		"effort": role.Effort, "tools": role.Tools, "phase_attempt": entry,
+		"effort": role.Effort, "budget_usd": role.BudgetUSD, "tools": role.Tools, "phase_attempt": entry,
 	})
 
 	// death wraps up one dead entry: roll the worktree back to the pre-phase

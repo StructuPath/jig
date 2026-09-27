@@ -829,3 +829,12 @@ func TestEffortBecomesARootReasoningOverrideOnBothShapes(t *testing.T) {
 		t.Errorf("an unset effort must add no override, got %q", arguments)
 	}
 }
+
+func TestADeclaredBudgetFailsTheSendRatherThanBeingDropped(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	_, err := adapter.StartOrContinue(context.Background(), &runtime.Session{Key: "attempt-budget"}, "p",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(t.TempDir(), "ok"), BudgetUSD: 3})
+	if !errors.Is(err, ErrBudgetUnsupported) {
+		t.Fatalf("error = %v, want ErrBudgetUnsupported", err)
+	}
+}

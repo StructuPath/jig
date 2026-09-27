@@ -9,8 +9,10 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,10 +82,45 @@ func runShellCommand(
 	}
 }
 
+// reportedFields reads a reports_fields code phase's report: its last
+// non-empty output line, which must be a JSON object. Everything before it
+// is ordinary output — a script may log freely and report once, at the end.
+func reportedFields(outputTail string) (map[string]any, error) {
+	lines := strings.Split(strings.TrimRight(outputTail, "\n"), "\n")
+	last := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			last = trimmed
+			break
+		}
+	}
+	if last == "" {
+		return nil, errors.New("the command printed nothing to report")
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(last), &fields); err != nil {
+		return nil, fmt.Errorf("the last output line is not a JSON object: %w", err)
+	}
+	for key := range fields {
+		if adapterReservedFields[key] {
+			return nil, fmt.Errorf("reported field %q is reserved for the adapter envelope", key)
+		}
+	}
+	return fields, nil
+}
+
+// adapterReservedFields are the envelope fields the adapter owns; a
+// reports_fields script may not overwrite the record of its own exit.
+var adapterReservedFields = map[string]bool{
+	"status": true, "summary": true, "passed": true, "failures": true,
+	"exit_code": true, "output_tail": true,
+}
+
 // adapterEnvelope wraps a command result as an envelope (R8): the
 // sssf:VerifyOutput shape — status, passed, failures — plus the exit status
-// and output tail as the evidence a repair-target agent works from.
-func adapterEnvelope(command string, result commandResult) parsedEnvelope {
+// and output tail as the evidence a repair-target agent works from, plus
+// any fields a reports_fields phase declared.
+func adapterEnvelope(command string, result commandResult, reported map[string]any) parsedEnvelope {
 	status := protocol.EnvelopeFail
 	summary := fmt.Sprintf("command %q exited %d", command, result.ExitCode)
 	var failures []string
@@ -100,14 +137,16 @@ func adapterEnvelope(command string, result commandResult) parsedEnvelope {
 	default:
 		failures = append(failures, fmt.Sprintf("exit %d", result.ExitCode))
 	}
-	fields := map[string]any{
-		"status":      status,
-		"summary":     summary,
-		"passed":      result.Passed(),
-		"failures":    failures,
-		"exit_code":   result.ExitCode,
-		"output_tail": result.OutputTail,
+	fields := make(map[string]any, len(reported)+6)
+	for key, value := range reported {
+		fields[key] = value
 	}
+	fields["status"] = status
+	fields["summary"] = summary
+	fields["passed"] = result.Passed()
+	fields["failures"] = failures
+	fields["exit_code"] = result.ExitCode
+	fields["output_tail"] = result.OutputTail
 	raw, err := json.Marshal(fields)
 	if err != nil {
 		raw = []byte(`{"status":"fail","summary":"adapter envelope encoding failed"}`)

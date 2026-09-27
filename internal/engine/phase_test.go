@@ -1487,3 +1487,127 @@ acceptance: [all_phases_passed]
 		t.Fatalf("correction does not name the type problem: %.300q", calls[2].Prompt)
 	}
 }
+
+// ---- scenario: reported fields, comparison guards, the publish hold --------
+
+// factorySnapshot is the risk-gated tail of the factory shape: a code phase
+// classifies the change by reporting fields, a comparison guard routes an
+// extra review only for high risk, and the publish hold parks high-risk
+// work for a person.
+const factorySnapshot = `
+name: factory
+roster:
+  builder:
+    model: test-model
+    system_prompt: Build.
+    user_prompt: "Build the app."
+    writes: ["src/"]
+  reviewer:
+    model: test-model
+    system_prompt: Review.
+    user_prompt: "Review the work."
+    writes: []
+phases:
+  - {name: build, kind: agent, owner: builder}
+  - name: classify
+    kind: code
+    reports_fields: true
+    command: |
+      echo "scanning the diff"
+      if [ -f src/auth.txt ]; then echo '{"risk":"high","touched":["src/auth.txt"]}';
+      else echo '{"risk":"low","touched":[]}'; fi
+  - {name: security-review, kind: agent, owner: reviewer, if: "risk == high"}
+acceptance: [all_phases_passed]
+publish:
+  hold_when: "risk == high"
+`
+
+func TestHighRiskChangeGetsTheExtraReviewAndHoldsPublish(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/auth.txt": "token check"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built auth"})},
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "approved": true,
+			"summary": "security ok"})},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+	outcome := runner.Execute(context.Background(), testAttempt(factorySnapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	if fake.Remaining() != 0 {
+		t.Fatal("the security review did not run for a high-risk change")
+	}
+	if !strings.Contains(outcome.PublishHold, `"risk == high"`) ||
+		!strings.Contains(outcome.PublishHold, "risk = high") {
+		t.Fatalf("PublishHold = %q, want the held predicate and the field value", outcome.PublishHold)
+	}
+	if !sink.has(protocol.EventLog, "publish_held") {
+		t.Fatal("no publish_held trace event")
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(outcome.Result), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["publish"] != "held" || summary["publish_hold"] == nil {
+		t.Fatalf("summary publish = %v / %v, want held with a reason", summary["publish"], summary["publish_hold"])
+	}
+}
+
+func TestLowRiskChangeSkipsTheExtraReviewAndIsNotHeld(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+	outcome := runner.Execute(context.Background(), testAttempt(factorySnapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished || outcome.PublishHold != "" {
+		t.Fatalf("outcome = %+v, want accepted_unpublished with no hold", outcome)
+	}
+	if fake.Remaining() != 0 {
+		t.Fatal("the security review ran for a low-risk change")
+	}
+	if !sink.has(protocol.EventLog, "phase_skipped") || sink.has(protocol.EventLog, "publish_held") {
+		t.Fatal("expected the review skipped and no hold")
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(outcome.Result), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["publish"] != "not_attempted" {
+		t.Fatalf("summary publish = %v, want not_attempted", summary["publish"])
+	}
+}
+
+func TestAReportingPhaseThatDoesNotReportFails(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	snapshot := strings.Replace(factorySnapshot,
+		`else echo '{"risk":"low","touched":[]}'; fi`, `else echo "no report here"; fi`, 1)
+	outcome := newTestRunner(t, fake, &recordingSink{}, nil).
+		Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "reports_fields") {
+		t.Fatalf("outcome = %+v, want a failed attempt naming reports_fields", outcome)
+	}
+}
+
+func TestAReportedFieldMayNotOverwriteTheAdaptersOwn(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/app.txt": "v1"},
+			Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	snapshot := strings.Replace(factorySnapshot,
+		`else echo '{"risk":"low","touched":[]}'; fi`, `else echo '{"passed":true,"risk":"low"}'; fi`, 1)
+	outcome := newTestRunner(t, fake, &recordingSink{}, nil).
+		Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "reserved") {
+		t.Fatalf("outcome = %+v, want a failed attempt naming the reserved field", outcome)
+	}
+}

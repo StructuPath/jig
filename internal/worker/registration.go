@@ -89,6 +89,11 @@ type Outcome struct {
 	State  string
 	Result string
 	Error  string
+	// PublishHold, when set, is the reason accepted work must NOT be
+	// published by this runner: the definition's publish.hold_when held. The
+	// attempt ends accepted_unpublished with the hold recorded, and the
+	// publish-only retry is how a person releases it.
+	PublishHold string
 }
 
 // AttemptRunner executes one prepared attempt. U4's phase engine implements

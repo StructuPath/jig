@@ -43,9 +43,22 @@ func literalEquals(value any, literal string) bool {
 	}
 }
 
-// truthy is the `if: <envelope-field>` guard test (KTD2): the phase runs
-// iff a previous envelope set the field to something other than false,
-// zero, empty, or null.
+// guardHolds is the `if:` guard test (KTD2) over the chain's merged field
+// view. A bare field name is truthy(field); a `<field> ==|!= <literal>`
+// predicate is the same comparison repair edges use. Validation already
+// proved a multi-token guard parses, so a parse error here is unreachable
+// and reads as "guard did not hold" rather than a crash.
+func guardHolds(guard string, fields map[string]any) bool {
+	if !protocol.IsPredicate(guard) {
+		return truthy(fields[guard])
+	}
+	predicate, err := protocol.ParsePredicate(guard)
+	return err == nil && predicateHolds(predicate, fields)
+}
+
+// truthy is the bare-field `if:` guard test (KTD2): the phase runs iff a
+// previous envelope set the field to something other than false, zero,
+// empty, or null.
 func truthy(value any) bool {
 	switch typed := value.(type) {
 	case nil:

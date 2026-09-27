@@ -231,6 +231,10 @@ func (a *Adapter) StartOrContinue(
 	if opts.Effort != "" {
 		arguments = append(arguments, "--effort", opts.Effort)
 	}
+	if opts.BudgetUSD > 0 {
+		arguments = append(arguments, "--max-budget-usd",
+			strconv.FormatFloat(opts.BudgetUSD, 'f', -1, 64))
+	}
 	if opts.SystemPrompt != "" {
 		arguments = append(arguments, "--system-prompt", opts.SystemPrompt)
 	}

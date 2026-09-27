@@ -647,3 +647,31 @@ func TestVersionWarningFlagsOnlyReleasesOlderThanRecommended(t *testing.T) {
 		}
 	}
 }
+
+func TestBudgetIsPassedAsMaxBudgetUSDOnlyWhenSet(t *testing.T) {
+	adapter := NewWithExecutable(writeStub(t))
+	for budget, want := range map[float64]string{2.5: "--max-budget-usd\n2.5\n", 0: ""} {
+		stubDir := t.TempDir()
+		handle, err := adapter.StartOrContinue(context.Background(), &runtime.Session{Key: "budget"},
+			"prompt", runtime.Options{Model: "opus", BudgetUSD: budget, WorkDir: t.TempDir(),
+				Env: stubEnv(stubDir, "ok")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		drain(t, handle)
+		if _, err := handle.Result(); err != nil {
+			t.Fatal(err)
+		}
+		arguments, err := os.ReadFile(filepath.Join(stubDir, "args"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		argText := string(arguments)
+		if want != "" && !strings.Contains(argText, want) {
+			t.Errorf("budget %v: args missing %q:\n%s", budget, want, argText)
+		}
+		if want == "" && strings.Contains(argText, "--max-budget-usd") {
+			t.Errorf("an unset budget must add no flag, got:\n%s", argText)
+		}
+	}
+}

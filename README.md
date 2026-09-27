@@ -122,6 +122,7 @@ A definition is data, not a script. Five stock ones ship in
 | `two-phase.yaml` | an agent phase that writes, verified by a code phase |
 | `plan-build-test.yaml` | a **code-phase repair edge**: a red suite routes back to the builder |
 | `simple-sdlc.yaml` | an **agent-phase repair edge** (review → revise → re-review), a conditional retest, and per-phase commit messages |
+| `factory.yaml` | the **software factory**: plan → build → commit → test → a panel of specialist reviewers looping the builder until they approve, then a deterministic **risk gate** that holds high-risk work for a person |
 
 The shape:
 
@@ -131,6 +132,7 @@ roster:                      # one entry per agent role
   builder:
     model: opus
     effort: medium           # optional: low | medium | high | xhigh | max
+    budget_usd: 8            # optional: cap on what one send may spend
     system_prompt: |         # or system_prompt_path: <repo-relative file>
       You are a builder …
     user_prompt: |
@@ -152,7 +154,17 @@ phases:
     kind: code
     if: revised              # skipped unless a previous envelope set it truthy
     command: "go test ./..."
+  - name: classify-risk
+    kind: code
+    reports_fields: true     # the last output line is a JSON object of envelope fields
+    command: "scripts/risk.sh"
+  - name: review-risk
+    kind: agent
+    owner: reviewer
+    if: "risk == high"       # a comparison guard, same language as on_fail.when
 acceptance: [all_phases_passed, diff_matches_claims]
+publish:
+  hold_when: "risk == high"  # accepted but held for a person; publish retry releases it
 ```
 
 Rules worth knowing before you write one:
@@ -182,6 +194,25 @@ Rules worth knowing before you write one:
   working to a plan, `high` for a reviewer hunting the edge cases the build
   missed. Omit it to keep the CLI's default for the model, and omit it for
   `haiku`, which does not take an effort level.
+- **Spend is capped per role, and optional.** `budget_usd` is the most one
+  send by that role may cost; Claude Code enforces it as `--max-budget-usd`.
+  Codex has no such flag, and a cap it cannot enforce fails the send rather
+  than run uncapped — the same posture as a `tools` allowlist there.
+- **Code phases can report.** A code phase with `reports_fields: true`
+  prints a JSON object as its last output line, and those fields join the
+  envelope view that `if:` guards and `publish.hold_when` read. It is how a
+  deterministic script — a risk classifier scoring paths and diff size — gets
+  a say in routing without a model in the loop. The adapter's own fields
+  (`status`, `passed`, `exit_code`, …) are reserved.
+- **Guards compare as well as test.** `if: revised` runs a phase when a
+  previous envelope set the field truthy; `if: "risk == high"` runs it when
+  the comparison holds, in the same `<field> ==|!= <literal>` language as
+  `on_fail.when`.
+- **Publish can be held.** `publish: {hold_when: "<predicate>"}` is judged
+  after acceptance passes. When it holds, the attempt ends
+  `accepted_unpublished` with the hold recorded, nothing is pushed, and the
+  worktree and branch are retained — the publish-only retry is the human
+  sign-off that releases it. Low-risk work never waits.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 
