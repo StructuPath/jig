@@ -195,6 +195,28 @@ type leaseState struct {
 	cancel        bool
 }
 
+// attemptWaitsForCI reads the attempt's run snapshot — the definition frozen
+// at admission (R2) — and reports whether its publish.ci waits. A snapshot
+// that no longer parses cannot have been executed, so it is an error, not a
+// silent "no".
+func attemptWaitsForCI(ctx context.Context, tx *sql.Tx, attemptID string) (bool, error) {
+	var snapshot string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT r.snapshot FROM attempts a
+		JOIN jobs j ON j.id = a.job_id
+		JOIN runs r ON r.id = j.run_id
+		WHERE a.id = ?
+	`, attemptID).Scan(&snapshot); err != nil {
+		return false, unavailable(err)
+	}
+	spec, err := protocol.ParseDefinition([]byte(snapshot))
+	if err != nil {
+		return false, conflict("snapshot_unparseable",
+			"the run's frozen definition no longer parses: "+err.Error())
+	}
+	return spec.WaitsForCI(), nil
+}
+
 func loadLease(ctx context.Context, tx *sql.Tx, attemptID string) (leaseState, error) {
 	var value leaseState
 	var cancel int
@@ -526,6 +548,26 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 			return protocol.Attempt{}, conflict("publish_proof_required",
 				"an attempt is `accepted` only with a recorded proof-of-publish step (R12); "+
 					"complete as accepted_unpublished when publish did not finish")
+		}
+		// The same rule for CI, read from the run's frozen definition rather
+		// than from anything the worker says: a definition whose publish.ci
+		// waits is not `accepted` until a green CI run is on the ledger.
+		waits, err := attemptWaitsForCI(ctx, tx, attemptID)
+		if err != nil {
+			return protocol.Attempt{}, err
+		}
+		if waits {
+			var green int
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM publish_records WHERE attempt_id = ? AND step = ?
+			`, attemptID, protocol.PublishStepCI).Scan(&green); err != nil {
+				return protocol.Attempt{}, unavailable(err)
+			}
+			if green == 0 {
+				return protocol.Attempt{}, conflict("publish_ci_required",
+					"this definition waits for CI, so the attempt is `accepted` only with a "+
+						"recorded ci step; complete as accepted_unpublished while CI is not green")
+			}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `

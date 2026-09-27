@@ -77,6 +77,12 @@ func newHarness(t *testing.T) *harness {
 
 func (h *harness) seedRun(runID string, targets ...protocol.RunTarget) {
 	h.t.Helper()
+	h.seedRunWithSnapshot(runID, integrationSnapshot, targets...)
+}
+
+// seedRunWithSnapshot seeds a run frozen from the given definition source.
+func (h *harness) seedRunWithSnapshot(runID, snapshot string, targets ...protocol.RunTarget) {
+	h.t.Helper()
 	targetsJSON, err := json.Marshal(targets)
 	if err != nil {
 		h.t.Fatalf("encode targets: %v", err)
@@ -85,13 +91,13 @@ func (h *harness) seedRun(runID string, targets ...protocol.RunTarget) {
 	if _, err := h.db.Exec(`
 		INSERT INTO definitions(id, name, generation, source, created_at, updated_at)
 		VALUES (?, ?, 1, ?, ?, ?)
-	`, "def-"+runID, "fixture-"+runID, integrationSnapshot, now, now); err != nil {
+	`, "def-"+runID, "fixture-"+runID, snapshot, now, now); err != nil {
 		h.t.Fatalf("seed definition: %v", err)
 	}
 	if _, err := h.db.Exec(`
 		INSERT INTO runs(id, definition_id, definition_generation, snapshot, parameters, targets, state, created_at, updated_at)
 		VALUES (?, ?, 1, ?, '{}', ?, 'active', ?, ?)
-	`, runID, "def-"+runID, integrationSnapshot, string(targetsJSON), now, now); err != nil {
+	`, runID, "def-"+runID, snapshot, string(targetsJSON), now, now); err != nil {
 		h.t.Fatalf("seed run: %v", err)
 	}
 }

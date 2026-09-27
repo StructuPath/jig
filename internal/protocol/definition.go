@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -72,9 +73,44 @@ type DefinitionSpec struct {
 // attempt ends accepted_unpublished with a recorded hold instead of a branch
 // and pull request, and the operator's publish retry is the human review
 // step that releases it. A change a classifier scored `risk == high` waits
-// for a person; everything else ships.
+// for a person; everything else ships. CI, when it waits, makes a green CI
+// run on the pull request's head part of what `accepted` means.
 type PublishSpec struct {
-	HoldWhen string `yaml:"hold_when"`
+	HoldWhen string  `yaml:"hold_when"`
+	CI       *CISpec `yaml:"ci"`
+}
+
+// CISpec opts a definition into waiting for the pull request's CI after
+// publish. Timeout is a Go duration ("30m"); empty means DefaultCITimeout.
+type CISpec struct {
+	Wait    bool   `yaml:"wait"`
+	Timeout string `yaml:"timeout"`
+}
+
+// CI wait bounds. The timeout covers the whole wait for one head commit; the
+// ceiling keeps a typo like "30h" from parking a worker slot for a day.
+const (
+	DefaultCITimeout = 30 * time.Minute
+	MinCITimeout     = time.Minute
+	MaxCITimeout     = 6 * time.Hour
+)
+
+// WaitsForCI reports whether the definition gates acceptance on CI.
+func (spec *DefinitionSpec) WaitsForCI() bool {
+	return spec.Publish != nil && spec.Publish.CI != nil && spec.Publish.CI.Wait
+}
+
+// CITimeout is the validated CI wait budget, DefaultCITimeout when unset.
+// Call it only on a spec that passed Validate.
+func (spec *DefinitionSpec) CITimeout() time.Duration {
+	if !spec.WaitsForCI() || strings.TrimSpace(spec.Publish.CI.Timeout) == "" {
+		return DefaultCITimeout
+	}
+	timeout, err := time.ParseDuration(spec.Publish.CI.Timeout)
+	if err != nil {
+		return DefaultCITimeout
+	}
+	return timeout
 }
 
 // RoleSpec is one roster entry: the model, prompts, and allowlists an agent
@@ -238,11 +274,24 @@ func (spec *DefinitionSpec) validatePublish() error {
 	if spec.Publish == nil {
 		return nil
 	}
-	if strings.TrimSpace(spec.Publish.HoldWhen) == "" {
-		return fmt.Errorf("publish: hold_when is required when publish is declared")
+	hold := strings.TrimSpace(spec.Publish.HoldWhen)
+	if hold == "" && spec.Publish.CI == nil {
+		return fmt.Errorf("publish: declare hold_when, ci, or both")
 	}
-	if _, err := ParsePredicate(spec.Publish.HoldWhen); err != nil {
-		return fmt.Errorf("publish: hold_when: %w", err)
+	if hold != "" {
+		if _, err := ParsePredicate(spec.Publish.HoldWhen); err != nil {
+			return fmt.Errorf("publish: hold_when: %w", err)
+		}
+	}
+	if ci := spec.Publish.CI; ci != nil && strings.TrimSpace(ci.Timeout) != "" {
+		timeout, err := time.ParseDuration(ci.Timeout)
+		if err != nil {
+			return fmt.Errorf("publish: ci: timeout %q is not a duration like \"30m\"", ci.Timeout)
+		}
+		if timeout < MinCITimeout || timeout > MaxCITimeout {
+			return fmt.Errorf("publish: ci: timeout %s is outside %s..%s",
+				timeout, MinCITimeout, MaxCITimeout)
+		}
 	}
 	return nil
 }

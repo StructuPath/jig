@@ -165,6 +165,7 @@ phases:
 acceptance: [all_phases_passed, diff_matches_claims]
 publish:
   hold_when: "risk == high"  # accepted but held for a person; publish retry releases it
+  ci: {wait: true, timeout: 30m}  # accepted only once CI on the PR head is green
 ```
 
 Rules worth knowing before you write one:
@@ -221,6 +222,19 @@ Rules worth knowing before you write one:
   access to the control plane: jig has one trusted operator and no
   authentication (see *Loopback only*), so the operator's retry is the
   approval, with no separate approver identity.
+- **Publish can wait for CI.** `publish: {ci: {wait: true, timeout: 30m}}`
+  adds a fourth publish step after proof: the worker polls the check runs
+  and commit statuses on the branch's head through `gh api`, and the job is
+  `accepted` only when every one is green — the control plane enforces this
+  from the frozen definition, not the worker's word. A red check fails fast;
+  checks still pending at the timeout (default 30m, 1m–6h) fail too; a head
+  with no checks at all passes after two minutes, since that repository runs
+  no CI. Any of these ends the job `accepted_unpublished` with the branch and
+  pull request in place and the red checks named in the result. Fix the
+  branch — push to it yourself — and the publish-only retry judges CI on
+  whatever its head is by then. Neutral and skipped checks count as green.
+  The wait holds a worker slot, and a cancel during it ends the job the same
+  way. Omit `ci` and publish does not wait, exactly as before.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 

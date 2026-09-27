@@ -313,3 +313,117 @@ func TestPublishRetryIsRefusedForJobsThatAreNotAcceptedUnpublished(t *testing.T)
 		t.Fatalf("retry of a failed job: err=%v, want publish_retry_not_allowed", err)
 	}
 }
+
+// ciFixtureSnapshot is fixtureSnapshot with publish.ci opted in.
+const ciFixtureSnapshot = fixtureSnapshot + `publish:
+  ci:
+    wait: true
+`
+
+// optInToCI swaps the run's frozen definition for one whose publish waits
+// for CI — the fixture every CI-gate scenario starts from.
+func optInToCI(t *testing.T, store *Store, runID string) {
+	t.Helper()
+	if _, err := store.db.Exec(`UPDATE runs SET snapshot = ? WHERE id = ?`, ciFixtureSnapshot, runID); err != nil {
+		t.Fatalf("opt run %s into CI: %v", runID, err)
+	}
+}
+
+// A definition that waits for CI extends R12's "accepted means published"
+// to "accepted means published AND green". Like proof, that is checked by
+// the store against its own ledger and the run's frozen definition — never
+// taken from the worker's word — and the ci step sits after proof in the
+// fenced step order.
+func TestAcceptedRequiresARecordedCIStepWhenTheDefinitionWaitsForCI(t *testing.T) {
+	store, _ := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+	optInToCI(t, store, "run-1")
+	claim := claimAndStart(t, store, "run-1", repoA)
+	ctx := context.Background()
+
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepPush, shaB, ""); err != nil {
+		t.Fatalf("record push: %v", err)
+	}
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepCI, shaB, ""); err == nil ||
+		serviceCode(t, err) != "publish_step_out_of_order" {
+		t.Fatalf("ci before proof: err=%v, want publish_step_out_of_order", err)
+	}
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepPullRequest, "",
+		"https://github.com/example/repo-a/pull/3"); err != nil {
+		t.Fatalf("record pull request: %v", err)
+	}
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepProof, shaB, ""); err != nil {
+		t.Fatalf("record proof: %v", err)
+	}
+
+	_, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAccepted,
+	})
+	if err == nil || serviceCode(t, err) != "publish_ci_required" {
+		t.Fatalf("accepted with proof but no ci record: err=%v, want publish_ci_required", err)
+	}
+
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepCI, "green", ""); err == nil ||
+		serviceCode(t, err) != "invalid_publish_ref" {
+		t.Fatalf("ci with a non-SHA ref: err=%v, want invalid_publish_ref", err)
+	}
+	// CI may be judged on a later head than jig pushed (a person's fix on the
+	// branch), so the ci ref need not equal the push ref.
+	if _, err := recordStep(store, claim, tokenA, protocol.PublishStepCI, shaA, ""); err != nil {
+		t.Fatalf("record ci: %v", err)
+	}
+	accepted, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAccepted,
+	})
+	if err != nil {
+		t.Fatalf("complete accepted with a ci record: %v", err)
+	}
+	if accepted.State != protocol.AttemptAccepted {
+		t.Fatalf("attempt state = %q, want accepted", accepted.State)
+	}
+}
+
+// A definition that does not opt in is unchanged: proof alone is enough.
+func TestAcceptedNeedsNoCIStepWhenTheDefinitionDoesNotWait(t *testing.T) {
+	store, _ := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+	claim := claimAndStart(t, store, "run-1", repoA)
+	for _, step := range []struct{ name, ref, url string }{
+		{protocol.PublishStepPush, shaB, ""},
+		{protocol.PublishStepPullRequest, "", "https://github.com/example/repo-a/pull/4"},
+		{protocol.PublishStepProof, shaB, ""},
+	} {
+		if _, err := recordStep(store, claim, tokenA, step.name, step.ref, step.url); err != nil {
+			t.Fatalf("record %s: %v", step.name, err)
+		}
+	}
+	if _, err := store.CompleteAttempt(context.Background(), claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAccepted,
+	}); err != nil {
+		t.Fatalf("complete accepted without CI opt-in: %v", err)
+	}
+}
+
+// The publish-only retry hands the worker the run's frozen definition, so a
+// retry re-applies the same CI policy the first publish ran under.
+func TestPublishRetryCarriesTheRunSnapshot(t *testing.T) {
+	store, _ := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+	optInToCI(t, store, "run-1")
+	claim := claimAndStart(t, store, "run-1", repoA)
+	if _, err := store.CompleteAttempt(context.Background(), claim.Attempt.ID,
+		protocol.CompleteAttemptRequest{LeaseToken: tokenA, State: protocol.AttemptAcceptedUnpublished}); err != nil {
+		t.Fatalf("complete accepted_unpublished: %v", err)
+	}
+	retry, err := store.RetryPublish(context.Background(), claim.Job.ID,
+		protocol.PublishRetryRequest{WorkerID: workerA, LeaseToken: tokenB})
+	if err != nil {
+		t.Fatalf("publish retry: %v", err)
+	}
+	if retry.Snapshot != ciFixtureSnapshot {
+		t.Fatalf("retry snapshot = %q, want the run's frozen definition", retry.Snapshot)
+	}
+}

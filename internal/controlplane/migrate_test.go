@@ -169,3 +169,65 @@ func TestDuplicateAttemptEventSequenceInsertIsIgnored(t *testing.T) {
 		t.Fatalf("replay overwrote the original payload: %q", payload)
 	}
 }
+
+// 004 rebuilds publish_records to widen its step vocabulary with `ci`. A
+// rebuild is only safe if it carries every existing row across, so this
+// applies 001–003 by hand, records a proven step under the old schema, then
+// applies 004 and checks the row survived and the new vocabulary holds.
+func TestPublishCIStepMigrationPreservesRecordsAndWidensTheStepVocabulary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jig.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	apply := func(name string) {
+		t.Helper()
+		body, err := migrations.Files.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if _, err := db.Exec(string(body)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+	}
+	for _, name := range []string{"001_core.sql", "002_job_cancellation.sql", "003_admission_triggers.sql"} {
+		apply(name)
+	}
+	jobID := seedJob(t, db)
+	if err := insertAttempt(db, "attempt-1", jobID, 1, "running"); err != nil {
+		t.Fatalf("insert attempt: %v", err)
+	}
+	insertStep := func(step string) error {
+		_, err := db.Exec(`INSERT INTO publish_records(attempt_id, step, branch, remote_ref, completed_at)
+			VALUES ('attempt-1', ?, 'jig/job-1/1', '1111111111111111111111111111111111111111', 7)`, step)
+		return err
+	}
+	if err := insertStep("proof"); err != nil {
+		t.Fatalf("record proof under the 003 schema: %v", err)
+	}
+	if err := insertStep("ci"); err == nil {
+		t.Fatal("the 003 schema accepted a ci step; the migration under test would be a no-op")
+	}
+
+	apply("004_publish_ci_step.sql")
+
+	var branch, ref string
+	var completedAt int64
+	if err := db.QueryRow(`SELECT branch, remote_ref, completed_at FROM publish_records
+		WHERE attempt_id = 'attempt-1' AND step = 'proof'`).Scan(&branch, &ref, &completedAt); err != nil {
+		t.Fatalf("the proof record did not survive the rebuild: %v", err)
+	}
+	if branch != "jig/job-1/1" || completedAt != 7 {
+		t.Fatalf("proof record = %s %s %d after the rebuild, want it unchanged", branch, ref, completedAt)
+	}
+	if err := insertStep("ci"); err != nil {
+		t.Fatalf("record ci after 004: %v", err)
+	}
+	if err := insertStep("deploy"); err == nil {
+		t.Fatal("the rebuilt table accepted a step outside its vocabulary")
+	}
+	if err := insertStep("ci"); err == nil {
+		t.Fatal("the rebuilt table lost its (attempt_id, step) primary key")
+	}
+}

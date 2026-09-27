@@ -193,6 +193,12 @@ purpose: `factory.yaml` scores every change for risk and holds high-risk
 work with `publish: held` in its result. Read the risk reviewer's briefing in
 the trace, then the publish retry is your sign-off.
 
+`factory.yaml` also sets `publish.ci.wait`, so a published job is
+`accepted` only once CI on its pull request is green. Red CI lands it in
+`accepted_unpublished` with the failing checks in its result; push a fix to
+the `jig/<job-id>/<attempt>` branch and the publish retry re-checks CI on the
+new head.
+
 `Ctrl-C` stops the worker in order: no new claims, in-flight attempts
 cancelled, terminal states recorded, ephemeral scratch destroyed.
 
