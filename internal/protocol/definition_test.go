@@ -488,13 +488,13 @@ phases:
   - {name: test, kind: code, owner: builder, command: "go test ./..."}
   - {name: review, kind: agent, owner: reviewer}
 `
-	spec := mustParse(t, base+"publish: {ci: {wait: true, on_fail: {run: build, resume_from: test, budget: 1}}}\n")
+	spec := mustParse(t, base+"publish: {ci: {wait: true, on_fail: {run: build, budget: 1}}}\n")
 	repair := spec.Publish.CI.OnFail
-	if repair == nil || repair.Run != "build" || repair.ResumeFrom != "test" || repair.Budget != 1 {
-		t.Fatalf("on_fail = %+v, want run build, resume_from test, budget 1", repair)
+	if repair == nil || repair.Run != "build" || repair.Budget != 1 {
+		t.Fatalf("on_fail = %+v, want run build, budget 1", repair)
 	}
 	mustParse(t, base+fmt.Sprintf(
-		"publish: {ci: {wait: true, on_fail: {run: build, resume_from: review, budget: %d}}}\n", MaxCIRepairRounds))
+		"publish: {ci: {wait: true, on_fail: {run: build, budget: %d}}}\n", MaxCIRepairRounds))
 	if spec := mustParse(t, base+"publish: {ci: {wait: true}}\n"); spec.Publish.CI.OnFail != nil {
 		t.Fatalf("on_fail = %+v, want nil when undeclared", spec.Publish.CI.OnFail)
 	}
@@ -503,15 +503,12 @@ phases:
 		name, onFail string
 		want         []string
 	}{
-		{"no wait", "{run: build, resume_from: test, budget: 1}", []string{"wait: true"}},
-		{"undefined run", "{run: fix, resume_from: test, budget: 1}", []string{"run targets undefined phase", `"fix"`}},
-		{"code run", "{run: test, resume_from: review, budget: 1}", []string{`"test"`, "agent phase"}},
-		{"undefined resume_from", "{run: build, resume_from: lint, budget: 1}", []string{"resume_from targets undefined phase", `"lint"`}},
-		{"resume_from is run", "{run: build, resume_from: build, budget: 1}", []string{"must come after"}},
-		{"resume_from before run", "{run: review, resume_from: test, budget: 1}", []string{"must come after"}},
-		{"zero budget", "{run: build, resume_from: test}", []string{"budget 0", "outside"}},
-		{"budget over cap", fmt.Sprintf("{run: build, resume_from: test, budget: %d}", MaxCIRepairRounds+1),
-			[]string{"outside"}},
+		{"no wait", "{run: build, budget: 1}", []string{"wait: true"}},
+		{"undefined run", "{run: fix, budget: 1}", []string{"run targets undefined phase", `"fix"`}},
+		{"code run", "{run: test, budget: 1}", []string{`"test"`, "agent phase"}},
+		{"run is last", "{run: review, budget: 1}", []string{`"review"`, "last phase"}},
+		{"zero budget", "{run: build}", []string{"budget 0", "outside"}},
+		{"budget over cap", fmt.Sprintf("{run: build, budget: %d}", MaxCIRepairRounds+1), []string{"outside"}},
 	} {
 		t.Run(rejected.name, func(t *testing.T) {
 			wait := "true"
@@ -522,6 +519,10 @@ phases:
 				append([]string{"publish: ci: on_fail"}, rejected.want...)...)
 		})
 	}
+	// Skipping a phase between the fix and the end is not expressible: the
+	// field that would have allowed it does not exist.
+	mustReject(t, base+"publish: {ci: {wait: true, on_fail: {run: build, resume_from: review, budget: 1}}}\n",
+		"resume_from")
 }
 
 func TestNegativeRoleBudgetIsRejected(t *testing.T) {

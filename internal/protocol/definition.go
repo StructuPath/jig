@@ -92,17 +92,16 @@ type CISpec struct {
 
 // CIRepairSpec is the CI repair loop:
 //
-//	on_fail: {run: <agent phase>, resume_from: <later phase>, budget: N}
+//	on_fail: {run: <agent phase>, budget: N}
 //
-// A red CI run is handed to Run as its input envelope; the chain then re-runs
-// from ResumeFrom to its end, gates and repair edges live, before the fix may
-// be pushed and CI awaited again. ResumeFrom must come after Run so every
-// phase downstream of the fix (tests, reviewers, a risk classifier) judges
-// it. Budget bounds the rounds.
+// A red CI run is handed to Run as its input envelope; every phase after Run
+// then runs again, gates and repair edges live, before the fix may be pushed
+// and CI awaited again. There is deliberately no way to resume later in the
+// chain: a skipped phase would carry its verdict on the old code into
+// acceptance of the new. Budget bounds the rounds.
 type CIRepairSpec struct {
-	Run        string `yaml:"run"`
-	ResumeFrom string `yaml:"resume_from"`
-	Budget     int    `yaml:"budget"`
+	Run    string `yaml:"run"`
+	Budget int    `yaml:"budget"`
 }
 
 // CI wait bounds. The timeout covers the whole wait for one head commit; the
@@ -113,7 +112,7 @@ const (
 	MaxCITimeout     = 6 * time.Hour
 
 	// MaxCIRepairRounds caps publish.ci.on_fail's budget. Each round re-runs
-	// every phase from resume_from to the end, reviewers included, so a
+	// every phase after the repair phase, reviewers included, so a
 	// larger budget is mostly a larger bill for a fix that is not converging.
 	MaxCIRepairRounds = 3
 )
@@ -336,28 +335,15 @@ func (spec *DefinitionSpec) validateCIRepair(phases map[string]PhaseSpec) error 
 		return fmt.Errorf("publish: ci: on_fail: run phase %q is a %s phase; only an agent phase can fix code",
 			repair.Run, run.Kind)
 	}
-	if _, defined := phases[repair.ResumeFrom]; !defined {
-		return fmt.Errorf("publish: ci: on_fail: resume_from targets undefined phase %q", repair.ResumeFrom)
-	}
-	if spec.phaseIndex(repair.ResumeFrom) <= spec.phaseIndex(repair.Run) {
+	if spec.Phases[len(spec.Phases)-1].Name == repair.Run {
 		return fmt.Errorf(
-			"publish: ci: on_fail: resume_from %q must come after run %q, so the phases after the fix judge it",
-			repair.ResumeFrom, repair.Run)
+			"publish: ci: on_fail: run phase %q is the last phase, so nothing after it would judge the fix",
+			repair.Run)
 	}
 	if repair.Budget < 1 || repair.Budget > MaxCIRepairRounds {
 		return fmt.Errorf("publish: ci: on_fail: budget %d is outside 1..%d", repair.Budget, MaxCIRepairRounds)
 	}
 	return nil
-}
-
-// phaseIndex is a phase's position in the chain, -1 when undeclared.
-func (spec *DefinitionSpec) phaseIndex(name string) int {
-	for i, phase := range spec.Phases {
-		if phase.Name == name {
-			return i
-		}
-	}
-	return -1
 }
 
 func (role RoleSpec) validate(name string) error {
