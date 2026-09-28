@@ -102,27 +102,27 @@ Round state lives in the worker's `PublishingRunner.Run` loop. The engine owns c
 
 ## Implementation Units
 
-### U1. Protocol: `publish.ci.on_fail`, limits, round types
+### U1. Protocol: `publish.ci.on_fail` and its save-time contract
 
-- **Files:** `internal/protocol/definition.go`, `internal/protocol/definition_test.go`, `internal/protocol/publish.go`, `internal/protocol/limits.go`
-- **Approach:** add `CIRepairSpec` under `CISpec.OnFail`; `validatePublish` enforces R1 (wait required, `run` is agent, `resume_from` after `run`, budget in `1..MaxCIRepairRounds`, which is 3). Add `PublishCIRepairRecord`, authorization and record request types, and the log-size limits in KTD5.
-- **Tests:** each rejection named in R1; `factory.yaml` with `on_fail` validates; a definition without `on_fail` is byte-for-byte unchanged in behaviour.
+- **Files:** `internal/protocol/definition.go`, `internal/protocol/definition_test.go`
+- **Approach:** add `CIRepairSpec` as `CISpec.OnFail`, and `MaxCIRepairRounds` (3) beside the existing CI bounds in `definition.go`, where `DefaultCITimeout` and friends already live. `validatePublish` enforces R1: `ci.wait` must be true, `run` and `resume_from` must name defined phases, `run` must be an agent phase, `resume_from` must come strictly after `run`, and budget must be in `1..MaxCIRepairRounds`. Nothing else lands in U1: the round ledger types go in with U2, which first uses them, and the log limits go in with U4. Until U5 lands, a declared `on_fail` validates but never fires, so red CI ends the attempt exactly as it does today (KTD6). The PR for U1 must say so.
+- **Tests:** each rejection named in R1; a valid block parses with its fields intact; a definition without `on_fail` parses as it did before.
 
 ### U2. Control plane: round ledger and the accepted rule
 
-- **Files:** `migrations/005_publish_ci_repairs.sql`, `internal/controlplane/publish_ledger.go`, `internal/controlplane/store.go`, `internal/controlplane/http.go`, `internal/worker/client.go`, tests beside each.
+- **Files:** `internal/protocol/publish.go` (round record, authorization and record request types), `migrations/005_publish_ci_repairs.sql`, `internal/controlplane/publish_ledger.go`, `internal/controlplane/store.go`, `internal/controlplane/http.go`, `internal/worker/client.go`, tests beside each.
 - **Approach:** authorize round N only when the lease is valid, the snapshot declares `on_fail`, N = last round + 1, N ≤ budget, and `proof` is recorded. Record with idempotent replay (same values return the stored row; different values conflict). Extend `CompleteAttempt` (`store.go:555`) so that when rounds exist, `accepted` needs a `ci` record completed after the last round with `remote_ref != head_before` of that round (R6).
 - **Tests:** over-budget authorization refused; zombie lease refused; replay idempotence; `accepted` refused when `ci` predates the last round; migration from 004 keeps existing rows.
 
 ### U3. Engine: continuation and `RepairCI`
 
 - **Files:** `internal/engine/phase.go`, new `internal/engine/resume.go`, `internal/engine/resume_test.go`, `internal/worker/registration.go` (`Outcome` and `AttemptRunner` live there, lines 88 and 101; `Continuation` joins them).
-- **Approach:** on the accepted path only, `Execute` returns a continuation holding the execution state named in KTD2 minus scratch and sessions. `RepairCI` creates a fresh scratch, runs `run` with the synthesized envelope, runs the chain from `resume_from` to the end through the existing `runPhaseWithEdge`, then re-runs acceptance and `publishHold`. It returns an `Outcome` whose result lists only the round's touched paths, with `ci_repair_no_change` when there are none. The deadline and send counter carry over (R7). `Release` drops the state; `PublishingRunner` always calls it.
+- **Approach:** on the accepted path only, `Execute` returns a continuation holding the execution state named in KTD2 minus scratch and sessions. `RepairCI` creates a fresh scratch, runs `run` with the synthesized envelope, runs the chain from `resume_from` to the end through the existing `runPhaseWithEdge`, then re-runs acceptance and `publishHold`. It returns an `Outcome` whose result lists only the round's touched paths, with `ci_repair_no_change` when there are none. The deadline and send counter carry over (R7). `Release` drops the state; `PublishingRunner` always calls it. Two semantics are fixed here, matching existing repair dispatch: the `run` phase runs regardless of its own `if:` guard, because guards are judged only in `runChain` (`phase.go:513`) and repair targets go through `runPhaseOnce`; and each round's resumed segment starts with fresh per-edge budgets (`edgeUses` is local to a `runChain` call), while the attempt-wide send count and ceiling stay shared.
 - **Tests (scripted runtime):** a round re-runs exactly the phases from `resume_from` and not before; a reviewer rejection inside a round loops the builder under its own edge; a classifier field now `high` trips the hold and yields no push; the send budget and ceiling are shared across rounds; cancellation between phases ends the round.
 
 ### U4. Gateway: failing-check detail
 
-- **Files:** `internal/worker/publish.go` (`CICheck`, `GitHubCLIGateway`), `internal/worker/publish_ci_test.go`
+- **Files:** `internal/protocol/publish.go` (`MaxCIRepairLogBytesPerCheck`, `MaxCIRepairLogBytes`), `internal/worker/publish.go` (`CICheck`, `GitHubCLIGateway`), `internal/worker/publish_ci_test.go`
 - **Approach:** `CICheck` gains `CheckRunID` and `App`. A new `FailedCheckLogs(ctx, repository, checks)` fetches Actions job logs via `gh api` under `PublishCommandTimeout` and the stdout cap, keeping the bounded tail (KTD5). A log that cannot be read degrades to name, conclusion and URL with a note; it never fails the round.
 - **Tests:** tail bounding per check and in total; non-Actions checks carry no log; `gh` failure degrades without error.
 
