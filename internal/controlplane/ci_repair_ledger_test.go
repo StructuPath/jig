@@ -299,6 +299,11 @@ func TestAcceptedIsRefusedOnALedgerWithGreenOnARepairedHead(t *testing.T) {
 	if _, err := recordRound(store, claim, tokenA, 1, shaB, shaC, "lint"); err != nil {
 		t.Fatalf("record round 1: %v", err)
 	}
+	// Two rounds, and the planted record names the FIRST round's red head:
+	// the backstop must check every round, not only the last.
+	if _, err := recordRound(store, claim, tokenA, 2, shaC, shaD, "lint"); err != nil {
+		t.Fatalf("record round 2: %v", err)
+	}
 	if _, err := store.db.Exec(`
 		INSERT INTO publish_records(attempt_id, step, branch, remote_ref, pr_url, completed_at)
 		VALUES (?, ?, ?, ?, '', ?)
