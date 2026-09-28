@@ -256,6 +256,27 @@ Rules worth knowing before you write one:
   code is the risk to design for: `factory.yaml` scores edits to CI or lint
   configuration, and test files that lose more lines than they gain, as not
   low, so such a "fix" is held for a person.
+- **A flaky Actions job can be re-run before a round is spent.**
+  `publish: {ci: {wait: true, rerun: {budget: 1}}}` re-runs the failed
+  GitHub Actions jobs on the same head when CI is red on a head jig pushed,
+  before any repair round (or before the job ends red, with no `on_fail`).
+  It first waits, within the CI timeout, until nothing on the head is still
+  running, since GitHub will not re-run a job in a running workflow; then it
+  re-runs each failed job with `gh api -X POST
+  repos/{owner}/{repo}/actions/jobs/{id}/rerun`, freshening the lease before
+  every request, and awaits CI again, reading each re-run job as pending
+  until its new run replaces the old red one. GitHub refusing because a
+  workflow run is in progress is waited out and does not spend the budget;
+  any other refusal is recorded and falls through to repair or the end. If
+  any red check is not an Actions job (a commit status, another app), no
+  re-run happens. Re-runs never move the branch. The budget, 1–3, is per
+  attempt: a repair round's new head gets only what is left. Every re-run is
+  in the result's `ci_reruns` (`attempt`, `head`, `jobs`, `outcome`), and a
+  pass after one sets `ci_flaky` — it is reported as flaky, never as a clean
+  pass. Re-run waits run on wall-clock time, so time spent on them is time a
+  later repair round no longer has under the attempt's ceiling. The
+  publish-only retry never re-runs. `gh` needs permission to
+  re-run Actions jobs on the repository.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 

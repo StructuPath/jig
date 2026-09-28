@@ -75,6 +75,12 @@ func (g *e2eGateway) FailedCheckLogs(_ context.Context, _ string, checks []worke
 	return checks
 }
 
+// RerunActionsJob is never reached: the definition declares no re-runs, and
+// its checks are not Actions jobs.
+func (g *e2eGateway) RerunActionsJob(context.Context, string, int64) error {
+	return fmt.Errorf("unexpected re-run request")
+}
+
 func TestACIRepairRoundRunsThroughTheRealWorkerWiring(t *testing.T) {
 	repo := initRepo(t)
 	serverData, workerData := t.TempDir(), t.TempDir()

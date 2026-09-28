@@ -168,6 +168,9 @@ func (w *Worker) repairCI(
 			summary.State, summary.Code, summary.Detail = PublishStatePublished, "", ""
 			return summary
 		}
+		// Red on the round's own head: whatever re-run budget the earlier
+		// heads left applies here before the next round is spent (R5).
+		summary = w.rerunFlakyCI(ctx, gateway, options, target, summary, ci)
 	}
 	return summary
 }

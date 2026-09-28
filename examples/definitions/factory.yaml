@@ -387,5 +387,6 @@ publish:
   hold_when: "risk != low"
   ci:
     wait: true
+    rerun: {budget: 1}
     on_fail: {run: build, budget: 2}
     timeout: 30m

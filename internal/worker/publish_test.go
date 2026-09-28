@@ -39,6 +39,27 @@ type fakeGateway struct {
 	checks     func(sha string, poll int) ([]CICheck, error)
 	checkPolls int
 	checkedSHA []string
+	// rerun scripts re-run requests: it is called with the job id and the
+	// 1-based request count. Nil accepts every request. reruns lists the
+	// job ids of every request made, accepted or refused.
+	rerun  func(jobID int64, call int) error
+	reruns []int64
+}
+
+func (g *fakeGateway) RerunActionsJob(_ context.Context, _ string, jobID int64) error {
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+	g.reruns = append(g.reruns, jobID)
+	if g.rerun == nil {
+		return nil
+	}
+	return g.rerun(jobID, len(g.reruns))
+}
+
+func (g *fakeGateway) rerunRequests() []int64 {
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+	return append([]int64(nil), g.reruns...)
 }
 
 func newFakeGateway() *fakeGateway {

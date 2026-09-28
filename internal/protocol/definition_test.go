@@ -525,6 +525,36 @@ phases:
 		"resume_from")
 }
 
+func TestPublishCIRerunIsBoundedAndNeedsAWait(t *testing.T) {
+	const base = `
+name: ci-rerun
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if spec := mustParse(t, base+"publish: {ci: {wait: true}}\n"); spec.Publish.CI.Rerun != nil {
+		t.Fatalf("rerun = %+v, want nil when undeclared", spec.Publish.CI.Rerun)
+	}
+	for budget := 1; budget <= MaxCIReruns; budget++ {
+		spec := mustParse(t, base+fmt.Sprintf("publish: {ci: {wait: true, rerun: {budget: %d}}}\n", budget))
+		if spec.Publish.CI.Rerun == nil || spec.Publish.CI.Rerun.Budget != budget {
+			t.Fatalf("rerun = %+v, want budget %d", spec.Publish.CI.Rerun, budget)
+		}
+	}
+	if MaxCIReruns != 3 {
+		t.Fatalf("MaxCIReruns = %d, want 3", MaxCIReruns)
+	}
+	mustReject(t, base+"publish: {ci: {wait: false, rerun: {budget: 1}}}\n",
+		"publish: ci: rerun", "wait: true")
+	mustReject(t, base+"publish: {ci: {rerun: {budget: 1}}}\n",
+		"publish: ci: rerun", "wait: true")
+	mustReject(t, base+"publish: {ci: {wait: true, rerun: {}}}\n",
+		"publish: ci: rerun: budget 0", "outside 1..3")
+	mustReject(t, base+"publish: {ci: {wait: true, rerun: {budget: 4}}}\n",
+		"publish: ci: rerun: budget 4", "outside 1..3")
+}
+
 func TestNegativeRoleBudgetIsRejected(t *testing.T) {
 	spec := mustParse(t, `
 name: budget

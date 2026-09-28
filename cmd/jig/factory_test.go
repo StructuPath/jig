@@ -141,6 +141,10 @@ func TestTheFactoryRepairsRedCIThroughItsWholeReviewPanel(t *testing.T) {
 		spec.Publish.CI.OnFail.Budget < 1 {
 		t.Fatalf("publish.ci = %+v, want on_fail repairing through build", spec.Publish.CI)
 	}
+	// One re-run tells a flaky job from a broken one before a round is spent.
+	if spec.Publish.CI.Rerun == nil || spec.Publish.CI.Rerun.Budget != 1 {
+		t.Fatalf("publish.ci.rerun = %+v, want budget 1", spec.Publish.CI.Rerun)
+	}
 	after := map[string]bool{}
 	seen := false
 	for _, phase := range spec.Phases {
