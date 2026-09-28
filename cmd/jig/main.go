@@ -1,10 +1,11 @@
 // jig is a local-first software factory: one binary that runs repeatable,
 // phased coding-agent workflows against Git repositories.
 //
-// Five subcommands, one binary, no Node (R18): run is the serverless direct
+// Six subcommands, one binary, no Node (R18): run is the serverless direct
 // harness (U11), serve is the control plane with its embedded UI (U2/U6/U8),
-// worker is the execution host (U3/U4/U7), and def and trigger are the
-// operator's surface over definitions and admission (U5/U6).
+// worker is the execution host (U3/U4/U7), def and trigger are the
+// operator's surface over definitions and admission (U5/U6), and report reads
+// the factory's quality over a window (plan 2026-09-28-001, U3).
 package main
 
 import (
@@ -29,6 +30,7 @@ Usage:
   jig run      Run a definition directly against a local repository
   jig def      Validate, manage, and invoke job definitions
   jig trigger  Manage admission triggers (cron schedules, GitHub polling)
+  jig report   Summarize the factory's quality over a time window
   jig version  Print the release identity
 
 Run any subcommand with --help for its flags and exit codes.
@@ -61,6 +63,8 @@ func run(ctx context.Context, args []string) int {
 		return defCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "trigger":
 		return triggerCommand(ctx, args[1:], os.Stdout, os.Stderr)
+	case "report":
+		return reportCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "version", "--version":
 		fmt.Fprintf(os.Stdout, "jig %s\n", version)
 		return 0
