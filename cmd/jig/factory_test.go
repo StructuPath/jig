@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -157,5 +158,37 @@ func TestTheFactoryRepairsRedCIThroughItsWholeReviewPanel(t *testing.T) {
 		if !after[judge] {
 			t.Fatalf("%s does not run after build, so it would not judge a CI repair", judge)
 		}
+	}
+}
+
+func parseStock(t *testing.T, name string) *protocol.DefinitionSpec {
+	t.Helper()
+	source, err := os.ReadFile(stockDefinition(name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := protocol.ParseDefinition(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return spec
+}
+
+// The stock factory keeps its sequential panel (plan KTD7); the parallel
+// example groups exactly its three reviewers and is otherwise the same
+// definition, so the two cannot drift apart.
+func TestTheParallelFactoryIsTheStockFactoryWithItsPanelGrouped(t *testing.T) {
+	stock := parseStock(t, "factory.yaml")
+	parallel := parseStock(t, "factory-parallel.yaml")
+	if stock.Parallel != nil {
+		t.Fatalf("factory.yaml declares parallel: %v; the stock factory stays sequential", stock.Parallel)
+	}
+	want := protocol.ParallelGroup{"review-correctness", "review-security", "review-maintainability"}
+	if !reflect.DeepEqual(parallel.Parallel, want) {
+		t.Fatalf("factory-parallel.yaml groups %v, want %v", parallel.Parallel, want)
+	}
+	parallel.Name, parallel.Parallel = stock.Name, nil
+	if !reflect.DeepEqual(parallel, stock) {
+		t.Fatal("factory-parallel.yaml differs from factory.yaml beyond its name and its parallel group")
 	}
 }

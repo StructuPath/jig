@@ -1,0 +1,404 @@
+# factory-parallel.yaml — factory.yaml with its reviewer panel run in
+# parallel. Everything but the name and the `parallel:` line after `phases`
+# is the stock factory (a test holds the two in step), and the notes after
+# THE PARALLEL PANEL apply unchanged. The stock factory stays sequential
+# until this panel's semantics have been watched on real work (plan KTD7).
+#
+#   jig run --def examples/definitions/factory-parallel.yaml <repo> "add rate limiting to the API"
+#
+# THE PARALLEL PANEL. `parallel: [review-correctness, review-security,
+# review-maintainability]` runs the three reviewers at once, each in its own
+# ephemeral HOME and session. A group may hold only consecutive agent phases
+# whose roles are read-only (`writes: []`) and distinct; any change to the
+# worktree while the panel runs aborts the attempt. What changes against the
+# sequential panel:
+#
+#   - Prompts. Every reviewer is handed the envelope from before the panel
+#     (the tests), never a sibling's review. The phase after the panel gets
+#     the last reviewer's envelope, as it would sequentially.
+#   - Rejections. Edges resolve after all three finish, in declared order:
+#     the FIRST reviewer that rejected with budget left sends its blocking
+#     list to the builder, and then the WHOLE panel runs again — so an
+#     earlier approval is re-judged against the revision, and a later
+#     reviewer's rejection waits for the next panel run (its budget is not
+#     charged until it is the one dispatching). A reviewer whose budget is
+#     spent applies its `exhausted` policy: fail-job ends the attempt,
+#     proceed moves on to the next reviewer.
+#   - Bounds. The panel runs at most 1 + the sum of its reviewers' budgets
+#     times (here 1 + 3 + 3 + 3 = 10). Every run spends one send per reviewer
+#     at least, from the same attempt-wide send budget.
+#
+# THE RISK GATE. `classify-risk` is a code phase with `reports_fields: true`:
+# its last output line is a JSON object, and jig merges those fields into the
+# envelope view the guards and the publish hold read. The script is
+# deterministic — paths touched and lines changed, no model — so the same
+# diff always scores the same. Anything but `risk: low` runs one more review
+# and trips `publish.hold_when`, which parks the work: the attempt ends
+# accepted_unpublished with the hold on record, the worktree and branch are
+# retained, and the operator's publish retry is the human sign-off. Low-risk
+# work publishes on its own. Both predicates say `risk != low` rather than
+# `risk == high` so they fail closed: work the classifier never scored — a
+# missing or unexpected `risk` — is held, not shipped.
+#
+# THE CI GATE. `publish.ci.wait` makes green CI part of `accepted`: after the
+# pull request exists, the worker polls its head's checks for up to 30
+# minutes. Timed-out CI ends the job accepted_unpublished with the pending
+# checks named; push a fix to the branch and the publish retry re-judges CI
+# on the new head.
+#
+# THE CI REPAIR. `on_fail` repairs red CI inside the attempt, up to two
+# rounds. The failing checks and the tail of each failed Actions job's log
+# go to `build`; then EVERY phase after it runs again — commit, test, the
+# three reviewers, the risk classifier, the extra review — and only a fix
+# that passes all of them and is not held is pushed to the same pull
+# request. The classifier scores a change that edits CI or lint
+# configuration, or removes more test lines than it adds, as not low, so a
+# "fix" that weakens a check instead of the code is held for a person. A
+# round that fails, is held, or changes nothing ends the job
+# accepted_unpublished, as red CI did before; the publish retry judges CI
+# but never repairs.
+#
+# THE ROSTER. Builders and reviewers are `opus`; the planner and the extra
+# high-risk reviewer are `sonnet`. `effort` is medium for building to a plan
+# and high for reviewers hunting what the build missed. `budget_usd` caps what
+# one send may spend; the cap is enforced by the Claude Code CLI, and the
+# Codex runtime refuses a capped role rather than run it uncapped.
+#
+# EDIT BEFORE USE: the test command (it detects common entry points and
+# fails loudly when it finds none), the builder's `writes` allowlist (`**` is
+# the weakest boundary jig can enforce — narrow it, R10), and the risk
+# classifier's path pattern and line threshold, which should name what is
+# dangerous in YOUR repository.
+name: factory-parallel
+roster:
+  planner:
+    model: sonnet
+    budget_usd: 2
+    system_prompt: |
+      You are a read-only planner working in a git repository. You never
+      create, modify, or delete any file; you produce a plan the builder
+      will execute, and you report exclusively through your final JSON
+      envelope.
+    user_prompt: |
+      Task: {{prompt}}
+
+      Read enough of this repository to plan the change: which files to
+      touch, in what order, how the result will be verified, and what
+      "done" looks like — the concrete condition the reviewers will check.
+
+      Your final JSON must also include:
+        - "notes_for_next_agent": the plan itself, concrete enough to
+          execute without re-deriving it
+    env: [PATH]
+    writes: []
+  builder:
+    model: opus
+    effort: medium
+    budget_usd: 8
+    system_prompt: |
+      You are a builder working in a git repository. You execute the plan
+      you are handed, you write only what the task requires, and you report
+      honestly: claim only files you actually created or modified.
+
+      You may be run several times in one job. The first time you are
+      handed a plan. Every later time you are handed a REVIEW that rejected
+      your work — its "blocking" list is what you must fix, and nothing
+      else. Never weaken or delete a test to satisfy a reviewer.
+
+      Before you finish, write your commit message — one subject line, then
+      a blank line, then why — to the file $HOME/commit-message. It is your
+      own ephemeral home, outside the repository; it is never committed as a
+      file, and jig uses it as the message of the commit that carries your
+      work.
+    user_prompt: |
+      Task: {{prompt}}
+
+      The previous phase's report is above. If it is a review with
+      "approved": false, fix every blocking item it names. Otherwise,
+      execute the plan.
+
+      Write $HOME/commit-message, then report.
+
+      Your final JSON must also include:
+        - "changed_files": the repo-relative paths of every file you
+          created or modified
+        - "artifacts": the same paths, for existence verification
+        - "revised": true ONLY if you were fixing a review's blocking
+          items on this run; false when you were executing the plan
+    env: [PATH]
+    writes: ["**"]
+  correctness-reviewer:
+    model: opus
+    effort: high
+    budget_usd: 4
+    system_prompt: |
+      You are a read-only correctness reviewer. You judge whether the change
+      does what the task asked, completely and without regressions, against
+      the repository's own conventions. You never create, modify, or delete
+      any file.
+
+      A finding is a requirement you checked, with "met" true or false. Your
+      verdict must agree with your findings: never approve while a finding
+      is unmet or a blocking item stands. Never report "revised" — that
+      field belongs to the builder. List only problems you would block the
+      merge for; for each, give the file and line, why it is wrong, and how
+      to show it fails.
+
+      A change that deletes or weakens tests, lint rules, or CI configuration
+      is blocking unless the task asked for exactly that: a fix must make the
+      checks pass, not make them check less. This matters most when the
+      builder is repairing red CI.
+
+      Your "status" is "success" whenever you completed the review. The
+      verdict travels in "approved", never in "status": a rejection you
+      reported correctly is a phase that worked.
+    user_prompt: |
+      Task: {{prompt}}
+
+      Review the change in this worktree — `git diff HEAD~1` shows the
+      committed work, and any uncommitted changes are a revision in
+      progress.
+
+      Your final JSON must also include:
+        - "approved": true when the change is complete and correct
+        - "findings": a list of {"requirement": "<what you checked>",
+          "met": true|false, "evidence": "<path or observation>"}
+        - "blocking": a list of strings naming exactly what must change
+          before approval (an empty list when you approve)
+    env: [PATH]
+    writes: []
+  security-reviewer:
+    model: opus
+    effort: high
+    budget_usd: 4
+    system_prompt: |
+      You are a read-only security reviewer. You look only for security
+      defects the change introduces or leaves in place: injection, broken
+      authentication or authorization, secrets in code, unsafe
+      deserialization, path traversal, unvalidated input reaching a
+      dangerous sink, and dependencies pulled in without need. You never
+      create, modify, or delete any file, and you do not review style or
+      correctness — other reviewers own those.
+
+      A finding is a requirement you checked, with "met" true or false. Your
+      verdict must agree with your findings: never approve while a finding
+      is unmet or a blocking item stands. Never report "revised".
+
+      Your "status" is "success" whenever you completed the review. The
+      verdict travels in "approved", never in "status".
+    user_prompt: |
+      Task: {{prompt}}
+
+      Review the change in this worktree for security defects — `git diff
+      HEAD~1` shows the committed work, and any uncommitted changes are a
+      revision in progress. Read the code paths the change touches far
+      enough to know where its inputs come from.
+
+      Your final JSON must also include:
+        - "approved": true when you found nothing you would block for
+        - "findings": a list of {"requirement": "<what you checked>",
+          "met": true|false, "evidence": "<path or observation>"}
+        - "blocking": a list of strings naming exactly what must change
+          before approval (an empty list when you approve)
+    env: [PATH]
+    writes: []
+  maintainability-reviewer:
+    model: opus
+    effort: high
+    budget_usd: 4
+    system_prompt: |
+      You are a read-only maintainability reviewer. You judge whether the
+      change reads like the surrounding code — naming, structure, comment
+      density, idiom — and whether its tests would catch the bug it fixes
+      or the regression it risks. You never create, modify, or delete any
+      file, and you do not re-review correctness or security.
+
+      Block only for what a maintainer would refuse to merge; a preference
+      is a note in "findings" with "met": true, not a blocking item. Your
+      verdict must agree with your findings. Never report "revised".
+
+      Your "status" is "success" whenever you completed the review. The
+      verdict travels in "approved", never in "status".
+    user_prompt: |
+      Task: {{prompt}}
+
+      Review the change in this worktree — `git diff HEAD~1` shows the
+      committed work, and any uncommitted changes are a revision in
+      progress.
+
+      Your final JSON must also include:
+        - "approved": true when a maintainer would merge this as-is
+        - "findings": a list of {"requirement": "<what you checked>",
+          "met": true|false, "evidence": "<path or observation>"}
+        - "blocking": a list of strings naming exactly what must change
+          before approval (an empty list when you approve)
+    env: [PATH]
+    writes: []
+  risk-reviewer:
+    model: sonnet
+    effort: high
+    budget_usd: 3
+    system_prompt: |
+      You are a read-only reviewer brought in because a deterministic
+      classifier scored this change HIGH RISK — it touches sensitive paths
+      or is large. Your job is to write the briefing the human approver will
+      read: what the change does to the risky paths, what could go wrong in
+      production, and what to check before releasing it. You never create,
+      modify, or delete any file, and you do not block: the person does.
+
+      Your "status" is "success" whenever you completed the briefing.
+    user_prompt: |
+      Task: {{prompt}}
+
+      The classifier's report is above; its "risky_paths" are where to
+      look first. `git diff HEAD~1` shows the committed work.
+
+      Your final JSON must also include:
+        - "approved": true (you inform; the release decision is human)
+        - "briefing": a short plain-language summary for the approver
+        - "release_checks": a list of strings — what to verify before
+          releasing this change
+    env: [PATH]
+    writes: []
+phases:
+  - name: plan
+    kind: agent
+    owner: planner
+  - name: build
+    kind: agent
+    owner: builder
+    gates:
+      - {name: artifacts_exist}
+      - {name: diff_matches_claims}
+  # The commit phases stage with `git add -A` deliberately: by the time a
+  # code phase runs, the write boundary has already verified every path the
+  # agent changed against its allowlist and rolled back anything else (R10),
+  # so what is left in the worktree is exactly the authorized work.
+  - name: commit-build
+    kind: code
+    owner: builder
+    command: |
+      set -e
+      message="$HOME/commit-message"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "commit-build: nothing to commit"
+        exit 0
+      fi
+      if [ -s "$message" ]; then
+        git -c user.name=jig -c user.email=jig@localhost \
+            -c core.hooksPath=/dev/null commit -q -F "$message"
+        rm -f "$message"
+      else
+        echo 'commit-build: the build phase wrote no $HOME/commit-message; using the fallback'
+        git -c user.name=jig -c user.email=jig@localhost \
+            -c core.hooksPath=/dev/null commit -q -m "jig: build phase"
+      fi
+  - name: test
+    kind: code
+    owner: builder
+    command: >
+      if [ -f Justfile ] || [ -f justfile ]; then just test;
+      elif [ -f Makefile ]; then make test;
+      elif [ -f go.mod ]; then go test ./...;
+      elif [ -f package.json ]; then npm test --silent;
+      else echo "factory: no test command detected — edit the test phase"; exit 1; fi
+    on_fail: {run: build, then: rerun-self, budget: 3, exhausted: fail-job}
+  - name: review-correctness
+    kind: agent
+    owner: correctness-reviewer
+    gates:
+      - {name: verdict_consistent}
+    on_fail: {when: "approved == false", run: build, then: rerun-self, budget: 3, exhausted: fail-job}
+  - name: review-security
+    kind: agent
+    owner: security-reviewer
+    gates:
+      - {name: verdict_consistent}
+    on_fail: {when: "approved == false", run: build, then: rerun-self, budget: 3, exhausted: fail-job}
+  - name: review-maintainability
+    kind: agent
+    owner: maintainability-reviewer
+    gates:
+      - {name: verdict_consistent}
+    on_fail: {when: "approved == false", run: build, then: rerun-self, budget: 3, exhausted: fail-job}
+  - name: commit-revision
+    kind: code
+    owner: builder
+    if: revised
+    command: |
+      set -e
+      message="$HOME/commit-message"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "commit-revision: nothing to commit"
+        exit 0
+      fi
+      if [ -s "$message" ]; then
+        git -c user.name=jig -c user.email=jig@localhost \
+            -c core.hooksPath=/dev/null commit -q -F "$message"
+        rm -f "$message"
+      else
+        echo 'commit-revision: the builder wrote no $HOME/commit-message; using the fallback'
+        git -c user.name=jig -c user.email=jig@localhost \
+            -c core.hooksPath=/dev/null commit -q -m "jig: revision after review"
+      fi
+  - name: retest
+    kind: code
+    owner: builder
+    if: revised
+    command: >
+      if [ -f Justfile ] || [ -f justfile ]; then just test;
+      elif [ -f Makefile ]; then make test;
+      elif [ -f go.mod ]; then go test ./...;
+      elif [ -f package.json ]; then npm test --silent;
+      else echo "factory: no test command detected — edit the retest phase"; exit 1; fi
+  # Deterministic risk classification. JIG_BASE_SHA is the commit the run was
+  # pinned to, so the diff from there is the whole change, however many
+  # commits it took. The last line printed is the report; everything before
+  # it is ordinary output. Fields a reporting phase sets are protected: a
+  # later agent envelope cannot overwrite `risk`.
+  - name: classify-risk
+    kind: code
+    reports_fields: true
+    command: |
+      set -eu
+      base="${JIG_BASE_SHA:?JIG_BASE_SHA is required}"
+      pattern='(^|/)(auth|authn|authz|login|session|secret|token|password|crypto|migrations?|schema|deploy|infra|terraform|helm|k8s)([./_-]|$)|(^|/)\.github/|(^|/)Dockerfile|(^|/)go\.mod$|(^|/)package(-lock)?\.json$'
+      # Checks a change could weaken to get CI green: lint and test runner
+      # configuration is always sensitive, and a test file that loses more
+      # lines than it gains is too. Adding tests is ordinary work.
+      checks='(^|/)\.(golangci|eslintrc|prettierrc|stylelintrc|flake8|pylintrc|rubocop)[^/]*$|(^|/)(jest|vitest|karma|playwright)\.config\.[a-z]+$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini|\.pre-commit-config\.yaml)$'
+      tests='(_test\.go|_test\.py|\.(test|spec)\.[cm]?[jt]sx?|_spec\.rb)$|(^|/)(tests?|__tests__|spec)/'
+      threshold=400
+      files=$(git diff --name-only "$base" HEAD)
+      lines=$(git diff --numstat "$base" HEAD | awk '{ total += $1 + $2 } END { print total + 0 }')
+      # The pattern reaches awk through the environment: `awk -v` would
+      # process its backslashes and turn `\.` into "any character".
+      shrunk=$(git diff --numstat "$base" HEAD | tests="$tests" awk '$3 ~ ENVIRON["tests"] && $2 > $1 { print $3 }')
+      risky=$( { printf '%s\n' "$files" | grep -E "$pattern|$checks" || true; printf '%s\n' "$shrunk"; } | sed '/^$/d' | sort -u)
+      risky_json=$(printf '%s\n' "$risky" | sed '/^$/d' | sed 's/\\/\\\\/g; s/"/\\"/g; s/.*/"&"/' | paste -sd, -)
+      risk=low
+      reason="no sensitive paths, $lines lines changed (threshold $threshold)"
+      if [ -n "$shrunk" ]; then
+        risk=high; reason="removes more test lines than it adds"
+      elif [ -n "$risky" ]; then
+        risk=high; reason="touches sensitive paths"
+      elif [ "$lines" -gt "$threshold" ]; then
+        risk=high; reason="$lines lines changed exceeds threshold $threshold"
+      fi
+      echo "classify-risk: $risk — $reason"
+      printf '{"risk":"%s","risk_reason":"%s","changed_lines":%s,"risky_paths":[%s]}\n' \
+        "$risk" "$reason" "$lines" "$risky_json"
+  - name: review-risk
+    kind: agent
+    owner: risk-reviewer
+    if: "risk != low"
+parallel: [review-correctness, review-security, review-maintainability]
+acceptance: [all_phases_passed, verdict_consistent, diff_matches_claims]
+publish:
+  hold_when: "risk != low"
+  ci:
+    wait: true
+    on_fail: {run: build, budget: 2}
+    timeout: 30m
