@@ -620,6 +620,10 @@ func TestMembersKeepPrivateHandoffNotesThatMergeAtTheJoin(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("from security"), 0o600); err != nil {
 			t.Errorf("write security notes: %v", err)
 		}
+		// An edit to a seeded note is the member's own work, and is kept.
+		if err := os.WriteFile(filepath.Join(dir, "plan.md"), []byte("the plan, annotated"), 0o600); err != nil {
+			t.Errorf("annotate the plan: %v", err)
+		}
 	}
 	f.fake.Route(buildRole, built)
 	f.fake.Route(correctnessRole, correctness)
@@ -639,10 +643,15 @@ func TestMembersKeepPrivateHandoffNotesThatMergeAtTheJoin(t *testing.T) {
 		if err != nil || string(body) != want {
 			t.Fatalf("%s's merged notes = %q, %v; want %q", member, body, err, want)
 		}
-		// Only what the member wrote is published, not what it was seeded with.
-		if _, err := os.Stat(filepath.Join(shared, "parallel", member, "plan.md")); !os.IsNotExist(err) {
-			t.Fatalf("%s republished the pre-group notes it was seeded with: %v", member, err)
-		}
+	}
+	// Only what a member wrote or changed is published, not what it was
+	// seeded with: correctness left the plan alone, security annotated it.
+	if _, err := os.Stat(filepath.Join(shared, "parallel", "review-correctness", "plan.md")); !os.IsNotExist(err) {
+		t.Fatalf("correctness republished the pre-group notes it was seeded with: %v", err)
+	}
+	annotated, err := os.ReadFile(filepath.Join(shared, "parallel", "review-security", "plan.md"))
+	if err != nil || string(annotated) != "the plan, annotated" {
+		t.Fatalf("security's edit to a seeded note = %q, %v; want it published", annotated, err)
 	}
 	if body, err := os.ReadFile(filepath.Join(shared, "plan.md")); err != nil || string(body) != "the plan" {
 		t.Fatalf("the pre-group notes changed: %q, %v", body, err)
