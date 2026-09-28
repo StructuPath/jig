@@ -64,11 +64,12 @@ func NewHandler(store *Store, uiToken string, logger *slog.Logger) http.Handler 
 	mux.HandleFunc("POST /api/worktrees/{attempt_id}/release", api.releaseWorktree)
 	// Publish routes register themselves from publish_ledger.go (U7), the
 	// admission-trigger routes from schedule.go (U6), and trace ingestion plus
-	// the read-only surface from ingest.go (U8), where their handlers live
-	// beside the store methods they call.
+	// the read-only surface from ingest.go (U8), and the quality report from
+	// report.go, where their handlers live beside the store methods they call.
 	api.registerPublishRoutes(mux)
 	api.registerTriggerRoutes(mux)
 	api.registerIngestRoutes(mux)
+	api.registerReportRoutes(mux)
 	return mux
 }
 

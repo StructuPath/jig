@@ -781,7 +781,6 @@ acceptance: [all_phases_passed]
 		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
 	}
 
-	type triple struct{ Type, Phase, Name string }
 	want := []triple{
 		{protocol.EventLog, "", "attempt_start"},
 		{protocol.EventPhaseStart, "plan", ""},
@@ -813,6 +812,15 @@ acceptance: [all_phases_passed]
 		{protocol.EventPhaseEnd, "report", ""},
 		{protocol.EventLog, "", "acceptance"},
 	}
+	requireSequence(t, sink, want)
+	passed := agentEndPayload{Outcome: protocol.AgentPassed, Sends: 1}
+	requireAgentEnds(t, sink, passed, passed, passed)
+}
+
+type triple struct{ Type, Phase, Name string }
+
+func requireSequence(t *testing.T, sink *recordingSink, want []triple) {
+	t.Helper()
 	events := sink.all()
 	if len(events) != len(want) {
 		var got []string
@@ -830,6 +838,52 @@ acceptance: [all_phases_passed]
 			t.Fatalf("event %d seq = %d, want %d (per-attempt monotonic)", i, event.Seq, i+1)
 		}
 	}
+}
+
+// The exits the three-phase chain never takes: a dead entry closes its
+// agent_start before its phase_death, and an entry refused its first send by
+// the attempt's send budget closes its agent_start before the attempt's
+// terminal error.
+func TestDeathAndSendBudgetExitsEmitTheExactExpectedEventSequence(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Crash: true},
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+		config.MaxAttemptSends = 2
+	})
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+  - {name: review, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	requireSequence(t, sink, []triple{
+		{protocol.EventLog, "", "attempt_start"},
+		{protocol.EventPhaseStart, "build", ""},
+		{protocol.EventAgentStart, "build", "builder"},
+		{protocol.EventAgentEnd, "build", "builder"},
+		{protocol.EventPhaseDeath, "build", "builder"},
+		{protocol.EventPhaseStart, "build", ""},
+		{protocol.EventAgentStart, "build", "builder"},
+		{protocol.EventHandoff, "build", "builder"},
+		{protocol.EventAgentEnd, "build", "builder"},
+		{protocol.EventPhaseEnd, "build", ""},
+		{protocol.EventPhaseStart, "review", ""},
+		{protocol.EventAgentStart, "review", "builder"},
+		{protocol.EventAgentEnd, "review", "builder"},
+		{protocol.EventError, "", "attempt_send_budget_exhausted"},
+	})
+	requireAgentEnds(t, sink,
+		agentEndPayload{Outcome: protocol.AgentDied, Sends: 1, UnmeteredSends: 1},
+		agentEndPayload{Outcome: protocol.AgentPassed, Sends: 1},
+		agentEndPayload{Outcome: protocol.AgentSendBudget},
+	)
 }
 
 // ---- cancellation ----------------------------------------------------------
@@ -1108,6 +1162,11 @@ phases:
 	if fake.Remaining() != 0 {
 		t.Fatalf("unconsumed scripted steps: %d", fake.Remaining())
 	}
+	// The breach turns the failure into an abort, and the entry's sends are
+	// still recorded.
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentAborted, Sends: protocol.ParseBudgetPerEmission + 1,
+	})
 }
 
 // ---- scenario: the send ladder is really bounded ---------------------------
@@ -1291,6 +1350,9 @@ phases:
 	if _, err := os.Stat(filepath.Join(repo, "src", "ok.txt")); err != nil {
 		t.Fatalf("the allowed write was discarded on the way out: %v", err)
 	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentAborted, Sends: 1, UnmeteredSends: 1,
+	})
 }
 
 func TestACancelledAttemptStillEnforcesTheWriteBoundary(t *testing.T) {
@@ -1703,5 +1765,336 @@ publish:
 `, nil, repo))
 	if outcome.State != protocol.AttemptAcceptedUnpublished || outcome.PublishHold == "" {
 		t.Fatalf("outcome = %+v, want work with no risk report held", outcome)
+	}
+}
+
+// ---- scenario: spend on every exit (R1, KTD2) ------------------------------
+
+type agentEndPayload struct {
+	Outcome        string  `json:"outcome"`
+	Cost           float64 `json:"cost"`
+	Tokens         int     `json:"tokens"`
+	Sends          int     `json:"sends"`
+	UnmeteredSends int     `json:"unmetered_sends"`
+}
+
+func (s *recordingSink) agentEnds(t *testing.T) []agentEndPayload {
+	t.Helper()
+	var ends []agentEndPayload
+	for _, event := range s.all() {
+		if event.Type != protocol.EventAgentEnd {
+			continue
+		}
+		var payload agentEndPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatalf("agent_end payload %s: %v", event.Payload, err)
+		}
+		ends = append(ends, payload)
+	}
+	return ends
+}
+
+// index is the position of the first event of the type and name, or -1.
+func (s *recordingSink) index(eventType, name string) int {
+	for i, event := range s.all() {
+		if event.Type == eventType && (name == "" || event.Name == name) {
+			return i
+		}
+	}
+	return -1
+}
+
+func requireAgentEnds(t *testing.T, sink *recordingSink, want ...agentEndPayload) {
+	t.Helper()
+	got := sink.agentEnds(t)
+	if len(got) != len(want) {
+		t.Fatalf("agent_end events = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("agent_end %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// requireBefore pins that the entry's agent_end precedes the event that
+// closes the phase or the attempt, so spend is never recorded after the trace
+// says it is over.
+func requireBefore(t *testing.T, sink *recordingSink, eventType, name string) {
+	t.Helper()
+	end, closing := sink.index(protocol.EventAgentEnd, ""), sink.index(eventType, name)
+	if end < 0 || closing < 0 || end > closing {
+		t.Fatalf("agent_end at %d, %s/%s at %d: agent_end must come first", end, eventType, name, closing)
+	}
+}
+
+func TestAPassingAgentPhaseRecordsItsSpend(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		Text:  envelope(map[string]any{"status": "success", "summary": "done"}),
+		Usage: runtime.Usage{TotalTokens: 120, CostUSD: 0.25},
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentPassed, Cost: 0.25, Tokens: 120, Sends: 1,
+	})
+}
+
+func TestAnAgentReportingFailStillRecordsItsSpend(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		Text:  envelope(map[string]any{"status": "fail", "summary": "I could not do it"}),
+		Usage: runtime.Usage{TotalTokens: 80, CostUSD: 0.5},
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentFailed, Cost: 0.5, Tokens: 80, Sends: 1,
+	})
+	requireBefore(t, sink, protocol.EventPhaseEnd, "")
+}
+
+// A runtime error ends the phase before anything is parsed, but the CLI still
+// reported what the send cost, and that money was spent.
+func TestARuntimeErrorSendContributesItsReportedUsage(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		IsError: true,
+		Text:    "API Error: 529 overloaded",
+		Usage:   runtime.Usage{TotalTokens: 30, CostUSD: 0.125},
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentFailed, Cost: 0.125, Tokens: 30, Sends: 1,
+	})
+	requireBefore(t, sink, protocol.EventPhaseEnd, "")
+}
+
+// Each entry of a phase closes its own agent_start. The killed send never
+// returned a result, so its scripted usage is never read: it counts as
+// unmetered, not as free and not as its would-be cost.
+func TestADeadEntryReportsItsKilledSendAsUnmeteredAndTheReentryItsOwnSpend(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Hang: true, Usage: runtime.Usage{TotalTokens: 999, CostUSD: 9}},
+		enginetest.Step{
+			Text:  envelope(map[string]any{"status": "success", "summary": "recovered"}),
+			Usage: runtime.Usage{TotalTokens: 40, CostUSD: 0.25},
+		},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+		config.NoOutputTimeout = 100 * time.Millisecond
+	})
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	requireAgentEnds(t, sink,
+		agentEndPayload{Outcome: protocol.AgentDied, Sends: 1, UnmeteredSends: 1},
+		agentEndPayload{Outcome: protocol.AgentPassed, Cost: 0.25, Tokens: 40, Sends: 1},
+	)
+	requireBefore(t, sink, protocol.EventPhaseDeath, "")
+}
+
+func TestASendBudgetExhaustionRecordsSpendBeforeItsTerminalEvent(t *testing.T) {
+	repo := initRepo(t)
+	const cap = 3
+	steps := make([]enginetest.Step, 0, cap)
+	for i := 0; i < cap; i++ {
+		steps = append(steps, enginetest.Step{
+			Text:  "never parseable " + fmt.Sprint(i),
+			Usage: runtime.Usage{TotalTokens: 10, CostUSD: 0.125},
+		})
+	}
+	fake := enginetest.New(steps...)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+		config.MaxAttemptSends = cap
+	})
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentSendBudget, Cost: 0.375, Tokens: 30, Sends: cap,
+	})
+	requireBefore(t, sink, protocol.EventError, "attempt_send_budget_exhausted")
+}
+
+// The send the budget refuses never starts, so an entry that opens on an
+// exhausted budget still closes its agent_start, with nothing sent.
+func TestAnEntryRefusedItsFirstSendStillClosesItsAgentStart(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		Text:  envelope(map[string]any{"status": "success", "summary": "planned"}),
+		Usage: runtime.Usage{TotalTokens: 10, CostUSD: 0.5},
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+		config.MaxAttemptSends = 1
+	})
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: plan, kind: agent, owner: builder}
+  - {name: build, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	requireAgentEnds(t, sink,
+		agentEndPayload{Outcome: protocol.AgentPassed, Cost: 0.5, Tokens: 10, Sends: 1},
+		agentEndPayload{Outcome: protocol.AgentSendBudget},
+	)
+	if got := sink.count(protocol.EventAgentStart, ""); got != 2 {
+		t.Fatalf("agent_start events = %d, want 2", got)
+	}
+}
+
+func TestACeilingHitRecordsTheKilledSendBeforeItsTerminalEvent(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{Hang: true, Usage: runtime.Usage{CostUSD: 9}})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+		config.AttemptCeiling = 100 * time.Millisecond
+		config.NoOutputTimeout = time.Minute // the ceiling must fire first
+	})
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentCeiling, Sends: 1, UnmeteredSends: 1,
+	})
+	requireBefore(t, sink, protocol.EventError, "attempt_ceiling_exceeded")
+}
+
+func TestACancelledEntryRecordsTheKilledSend(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{Hang: true, Usage: runtime.Usage{CostUSD: 9}})
+	cancelled := make(chan struct{})
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(cancelled)
+	}()
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	attempt := testAttempt(snapshot, nil, repo)
+	attempt.Cancelled = cancelled
+	if outcome := runner.Execute(context.Background(), attempt); outcome.State != protocol.AttemptCancelled {
+		t.Fatalf("state = %q, want cancelled", outcome.State)
+	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentCancelled, Sends: 1, UnmeteredSends: 1,
+	})
+}
+
+// An entry that breaches the write boundary is aborted, and what it spent
+// getting there is recorded all the same.
+func TestAnAbortedEntryRecordsItsSpend(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(enginetest.Step{
+		Files: map[string]string{"stray.txt": "outside the allowlist"},
+		Text:  envelope(map[string]any{"status": "success", "summary": "done"}),
+		Usage: runtime.Usage{TotalTokens: 10, CostUSD: 0.5},
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentAborted, Cost: 0.5, Tokens: 10, Sends: 1,
+	})
+}
+
+// The unit's verification: over a scripted attempt, agent_end cost sums to
+// the usage of every send that returned a result, and unmetered_sends to the
+// sends that did not — here a crash, an unparseable emission, its parse
+// correction, and a runtime error in a later phase.
+func TestAgentEndSpendSumsToEveryMeteredSendOverAnAttempt(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Crash: true, Usage: runtime.Usage{CostUSD: 9}},
+		enginetest.Step{Text: "not an envelope", Usage: runtime.Usage{TotalTokens: 1, CostUSD: 0.5}},
+		enginetest.Step{
+			Text:  envelope(map[string]any{"status": "success", "summary": "built"}),
+			Usage: runtime.Usage{TotalTokens: 2, CostUSD: 0.25},
+		},
+		enginetest.Step{IsError: true, Text: "rate limited", Usage: runtime.Usage{TotalTokens: 4, CostUSD: 0.125}},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+  - {name: review, kind: agent, owner: builder}
+`
+	if outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)); outcome.State != protocol.AttemptFailed {
+		t.Fatalf("state = %q, want failed", outcome.State)
+	}
+	var cost float64
+	var tokens, sends, unmetered int
+	for _, end := range sink.agentEnds(t) {
+		cost += end.Cost
+		tokens += end.Tokens
+		sends += end.Sends
+		unmetered += end.UnmeteredSends
+	}
+	if cost != 0.875 || tokens != 7 || unmetered != 1 || sends != len(fake.Calls()) {
+		t.Fatalf("summed agent_end: cost %v tokens %d unmetered %d sends %d; want 0.875, 7, 1, %d",
+			cost, tokens, unmetered, sends, len(fake.Calls()))
 	}
 }
