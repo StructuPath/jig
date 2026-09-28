@@ -91,7 +91,7 @@ the whole path from here to a browsable accepted run.
 
 ---
 
-## The three surfaces
+## The four surfaces
 
 **`jig run`** — the direct harness. Loads a definition file, freezes a run
 against the local repository at its current HEAD, executes the chain
@@ -107,6 +107,9 @@ and publishes accepted work as a branch and pull request.
 **`jig def` and `jig trigger`** — authoring and admission. Validate a
 definition offline, save it, invoke it, and stand up the schedules and GitHub
 polls that invoke it unattended. Every read command takes `--json`.
+
+**`jig report`** — measurement. Jobs, accepts, publish outcomes, CI repair,
+re-runs, and spend over a time window, read from the control plane's ledger.
 
 ---
 
@@ -322,6 +325,40 @@ their terminal state, and destroys their ephemeral scratch.
 
 ---
 
+## Measuring the factory
+
+```sh
+jig report                          # the last seven days
+jig report --since 24h
+jig report --since 2026-09-01T00:00:00Z --until 2026-09-15T00:00:00Z
+jig report --json                   # the GET /api/report object, verbatim
+```
+
+`jig report` reads the control plane's ledger over a window and changes
+nothing. A job is in the window when it is terminal and was last updated in
+`[since, until)`. `--since` takes a duration back from now (`7d`, `24h`,
+`90m`) or an RFC3339 timestamp; `--until` takes a timestamp and defaults to
+now. The prose form prints one short table per section:
+
+| Section | What it counts |
+|---|---|
+| Jobs | terminal jobs by state |
+| Accepts | clean accepts (green CI on a head jig pushed, or a definition that does not wait for CI), person-fixed accepts (green CI on a head jig did not push), and accepts the ledger cannot classify |
+| Publish | publish outcomes of accepted work, the held rate, and failure codes |
+| CI repair | attempts that waited for CI, first-pass greens, repair entry and success rates, rounds, stop codes, and the `ci_timeout` and retried-still-red rates |
+| Re-runs | flaky-check re-runs, and passes that came only after one |
+| Spend | total agent spend, spend per clean accept, and each outcome's share |
+
+A rate with nothing to divide by prints `n/a`, never `0%`.
+
+Two limits are printed with every report. jig does not watch CI after an
+accept, so there is no post-merge CI rate. And spend is a floor: a send
+killed before it returned a result has no cost to record (the report counts
+these as unmetered sends), and spend recorded by jig v0.2.0 or earlier
+omits phases that did not pass.
+
+---
+
 ## Operational notes
 
 These are the things that will surprise you if nobody says them out loud.
@@ -412,6 +449,10 @@ The plan this repository was built from is
 `docs/plans/2026-08-05-001-feat-jig-software-factory-plan.md`. It carries the
 requirements (R1–R21) and key technical decisions (KTD1–KTD12) that the code
 comments cite by name.
+
+To trial the factory on a real repository and judge it by the numbers, follow
+[`docs/dogfooding.md`](docs/dogfooding.md): preflight, a spend-ceiling check
+before each batch, and a results table filled from `jig report`.
 
 ---
 

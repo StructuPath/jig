@@ -1022,9 +1022,16 @@ func publishBody(target publishTarget, head string, changedPaths []string) strin
 	return body.String()
 }
 
+// maxPublishHistory bounds publish_history: the summaries publish-only
+// retries replaced, oldest first.
+const maxPublishHistory = 5
+
 // withPublishSummary replaces the engine's "publish": "not_attempted" marker
-// with what publish actually did. The size discipline is the engine's: cut
-// inputs, never serialized bytes, so the document always parses.
+// with what publish actually did. A summary it replaces (a retry's
+// predecessor) moves to publish_history first, so the stop codes and rounds
+// an attempt went through outlive the retry that followed them (R15). The
+// size discipline is the engine's: cut inputs, never serialized bytes, so the
+// document always parses.
 func withPublishSummary(result string, summary PublishSummary) string {
 	document := map[string]any{}
 	if strings.TrimSpace(result) != "" {
@@ -1034,9 +1041,31 @@ func withPublishSummary(result string, summary PublishSummary) string {
 			}
 		}
 	}
+	history, _ := document["publish_history"].([]any)
+	if previous, ok := document["publish"].(map[string]any); ok {
+		// Only a summary object is history: the engine's "not_attempted"
+		// string is the absence of one.
+		history = append(history, previous)
+	}
+	if len(history) > maxPublishHistory {
+		history = history[len(history)-maxPublishHistory:]
+	}
 	document["publish"] = summary
-	if body, err := json.Marshal(document); err == nil && len(body) <= protocol.MaxResultBytes {
-		return string(body)
+	for {
+		if len(history) == 0 {
+			delete(document, "publish_history")
+		} else {
+			document["publish_history"] = history
+		}
+		if body, err := json.Marshal(document); err == nil && len(body) <= protocol.MaxResultBytes {
+			return string(body)
+		}
+		if len(history) == 0 {
+			break
+		}
+		// History gives first, oldest entry first: the phase detail and the
+		// current verdict stay as long as they can.
+		history = history[1:]
 	}
 	// The phase envelopes are the heavy part; the verdict and the proof are
 	// what a retry and an operator need.
