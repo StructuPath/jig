@@ -154,6 +154,22 @@ Round state lives in the worker's `PublishingRunner.Run` loop. The engine owns c
 
 **Exit gate:** on a scratch GitHub repository whose CI runs a check the local `tests_pass` gate does not (for example `gofmt -l` failing on purpose), three real `factory.yaml` runs with Claude Code: one goes red and then green within budget, one exhausts the budget and ends `accepted_unpublished` naming both heads, and one has a person push during the CI wait and runs no round. All three have trace timelines that name every round.
 
+**Exit gate: run 2026-09-28, passed.** It used a private scratch repository, `StructuPath/jig-ci-repair-scratch`, whose CI runs *hidden* conventions: the rules are a base64 repo secret decoded at CI time, and the active rule list is a secret too, so logs show `***`. The rules apply only to new exported functions, so `main` passes and offers no example to copy, and CI reports only the first failing rule. The runs used the stock `factory.yaml`, real Claude Code 2.1.283 and a live `jig serve` + `jig worker` built from the U6 branch.
+
+| Run | Hidden rules | Result | Rounds | Cost |
+|---|---|---|---|---|
+| 1 | `changes` | red → round 1 added CHANGES.md → green, `accepted` (PR #1) | 1 | $3.03 |
+| 2 | `changes,example,bench` | red → round 1 → red → round 2 → red, `accepted_unpublished` / `ci_repair_exhausted`, PR #3 at round 2's head, ledger chain 7a04ddd2 → 3f4eac56 → 5b36e239, no `ci` record | 2 | $5.03 |
+| 3 | `changes` + a person's push while CI ran | `ci_repair_head_moved`: red on 485bd14a, a head jig did not push; no round, no ledger row | 0 | $1.89 |
+
+Every round received the failed job's real log tail (10–10.05 KB) and re-ran every phase after `build`, all three reviewers and the classifier included. No scratch survived the runs.
+
+**Not a clean first pass. Three things surfaced, all fixed:**
+- **Two jig bugs the fakes could not see.** `gh` refuses to print Actions job logs (they contain escape codes) without `--allow-escape-sequences`, so every repair would have lost its log. On macOS, jig seeded Claude's login from a stale `~/.claude/.credentials.json` before the keychain, and the first attempt at run 1 died on "OAuth session expired" before any work.
+- **One leak in the gate's own design.** An earlier run 2 passed the rule list through a repo *variable*, which GitHub prints in the log's `env:` block. The round's builder read `CI_RULES=changes,example,bench` from the log tail and satisfied all three rules in one round, so it was accepted rather than exhausted: correct agent behaviour, wrong test. With the list moved into a secret, run 2 exhausted as designed.
+
+Total spend $13.08 (plus $3.13 for the leaked run 2).
+
 ---
 
 ## Risks & Dependencies
