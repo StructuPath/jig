@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 
 	"github.com/StructuPath/jig/internal/engine"
@@ -110,8 +111,7 @@ func selectRuntime(ctx context.Context, name string, seedAuth bool) (selectedRun
 }
 
 // seedClaudeAuth is the darwin-aware Claude Code seeder (KTD11): the minimum
-// auth material the CLI needs inside the ephemeral HOME. The credentials file
-// when it exists; otherwise the macOS keychain secret extracted into the
+// auth material the CLI needs inside the ephemeral HOME, written to the
 // ephemeral HOME's credentials file — the CLI's keychain lookup does not
 // survive a HOME change. Onboarding state rides along so print mode skips
 // first-run prompts. (Same seeding the U4 live smoke proved out.)
@@ -123,16 +123,13 @@ func seedClaudeAuth(home, _ string, _ protocol.RoleSpec) error {
 	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
 		return err
 	}
-	credentials, readErr := os.ReadFile(filepath.Join(real, ".claude", ".credentials.json"))
-	if readErr != nil {
-		extracted, keychainErr := exec.Command("security",
-			"find-generic-password", "-s", "Claude Code-credentials", "-w").Output()
-		if keychainErr != nil {
-			return fmt.Errorf(
-				"seed claude auth: no credentials file and no keychain item (%v); "+
-					"use --no-seed-auth if the CLI authenticates through its environment", keychainErr)
-		}
-		credentials = extracted
+	credentials, err := claudeCredentials(goruntime.GOOS,
+		func() ([]byte, error) { return os.ReadFile(filepath.Join(real, ".claude", ".credentials.json")) },
+		func() ([]byte, error) {
+			return exec.Command("security", "find-generic-password", "-s", "Claude Code-credentials", "-w").Output()
+		})
+	if err != nil {
+		return err
 	}
 	if err := os.WriteFile(
 		filepath.Join(home, ".claude", ".credentials.json"), credentials, 0o600); err != nil {
@@ -144,6 +141,26 @@ func seedClaudeAuth(home, _ string, _ protocol.RoleSpec) error {
 		}
 	}
 	return nil
+}
+
+// claudeCredentials finds the Claude Code login the way the CLI itself does.
+// On macOS the CLI keeps its live login in the keychain, and a
+// ~/.claude/.credentials.json there is at best a stale leftover (the CI
+// repair exit gate met one: every agent failed "OAuth session expired"), so
+// the keychain wins and the file is only the fallback. Elsewhere the file is
+// the login.
+func claudeCredentials(goos string, readFile, keychain func() ([]byte, error)) ([]byte, error) {
+	if goos == "darwin" {
+		if credentials, err := keychain(); err == nil && len(credentials) > 0 {
+			return credentials, nil
+		}
+	}
+	credentials, err := readFile()
+	if err != nil {
+		return nil, fmt.Errorf("seed claude auth: no keychain item and no credentials file (%v); "+
+			"use --no-seed-auth if the CLI authenticates through its environment", err)
+	}
+	return credentials, nil
 }
 
 // seedCodexAuth is the Codex analogue (KTD11, U10's finding): Codex reads its

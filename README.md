@@ -339,7 +339,7 @@ seeds each one's auth material into that HOME:
 
 | Runtime | Seeded from | Into the ephemeral HOME |
 |---|---|---|
-| Claude Code | `~/.claude/.credentials.json`, or the macOS keychain item `Claude Code-credentials`; plus `~/.claude.json` onboarding state | `~/.claude/.credentials.json`, `~/.claude.json` |
+| Claude Code | on macOS the keychain item `Claude Code-credentials` (where the CLI keeps its live login), falling back to `~/.claude/.credentials.json`; elsewhere that file; plus `~/.claude.json` onboarding state | `~/.claude/.credentials.json`, `~/.claude.json` |
 | Codex | `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`), plus `config.toml` when present | `$HOME/.codex/auth.json`, `$HOME/.codex/sessions/` |
 
 Two consequences:
