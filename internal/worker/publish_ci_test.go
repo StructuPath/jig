@@ -7,6 +7,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -196,6 +197,114 @@ func TestRedCIEndsAcceptedUnpublishedAndTheRetryJudgesTheCurrentHead(t *testing.
 	}
 	if created, _ := gateway.counts(); created != 1 {
 		t.Fatalf("gateway created %d pull requests, want 1", created)
+	}
+	if history := publishHistoryOf(t, attempt.Result); len(history) != 0 {
+		t.Fatalf("first publish history = %+v, want none", history)
+	}
+	history := publishHistoryOf(t, retried.Result)
+	if len(history) != 1 || history[0].Code != "ci_failed" || history[0].CIRef != redSHA ||
+		len(history[0].CIFailures) != 1 || history[0].CIFailures[0].Name != "test" {
+		t.Fatalf("retry history = %+v, want the red run's ci_failed with its failing test check", history)
+	}
+}
+
+// publishHistoryOf decodes the summaries publish-only retries replaced.
+func publishHistoryOf(t *testing.T, result string) []PublishSummary {
+	t.Helper()
+	var document struct {
+		History []PublishSummary `json:"publish_history"`
+	}
+	if err := json.Unmarshal([]byte(result), &document); err != nil {
+		t.Fatalf("decode publish history from %q: %v", result, err)
+	}
+	return document.History
+}
+
+// ---- publish history across retries (R15) -----------------------------------
+
+// A repair-exhausted attempt that a person fixes and retries is accepted,
+// and its history still carries the stop code and the rounds it ran.
+func TestARetryAfterExhaustedRepairKeepsTheRoundsInHistory(t *testing.T) {
+	s := newRepairScenario(t, 1, 2, fixRound())
+	attempt, summary := s.run(t)
+	if summary.Code != "ci_repair_exhausted" {
+		t.Fatalf("summary = %+v, want ci_repair_exhausted", summary)
+	}
+	pushToBranch(t, s.originDir, s.branch)
+	retried, err := s.w.RetryPublish(context.Background(), s.job.ID, s.gateway, fastCIOptions())
+	if err != nil {
+		t.Fatalf("publish retry: %v", err)
+	}
+	if retried.ID != attempt.ID || retried.State != protocol.AttemptAccepted {
+		t.Fatalf("retried = %s %s, want attempt %s accepted", retried.ID, retried.State, attempt.ID)
+	}
+	history := publishHistoryOf(t, retried.Result)
+	if len(history) != 1 || history[0].Code != "ci_repair_exhausted" ||
+		len(history[0].CIRepairs) != 1 || history[0].CIRepairs[0].Outcome != "pushed" {
+		t.Fatalf("history = %+v, want the exhausted summary with its one pushed round", history)
+	}
+}
+
+// historyCodes lists the codes publish_history holds, oldest first.
+func historyCodes(t *testing.T, result string) []string {
+	t.Helper()
+	var codes []string
+	for _, entry := range publishHistoryOf(t, result) {
+		codes = append(codes, entry.Code)
+	}
+	return codes
+}
+
+// Each retry appends the summary it replaces; only the newest five stay.
+func TestPublishHistoryKeepsTheLastFiveRetries(t *testing.T) {
+	result := withPublishSummary(`{"publish":"not_attempted"}`,
+		PublishSummary{State: PublishStateFailed, Code: "run-0"})
+	if codes := historyCodes(t, result); len(codes) != 0 {
+		t.Fatalf("first publish history = %v, want none", codes)
+	}
+	for retry := 1; retry <= 6; retry++ {
+		result = withPublishSummary(result,
+			PublishSummary{State: PublishStateFailed, Code: fmt.Sprintf("run-%d", retry)})
+	}
+	if codes := historyCodes(t, result); !slices.Equal(codes,
+		[]string{"run-1", "run-2", "run-3", "run-4", "run-5"}) {
+		t.Fatalf("history = %v, want run-1..run-5 oldest first", codes)
+	}
+	if summary := publishSummaryOf(t, result); summary.Code != "run-6" {
+		t.Fatalf("publish = %+v, want the latest run", summary)
+	}
+}
+
+// A history that would breach the result cap loses its oldest entries first,
+// before the phase detail or the verdict give anything up.
+func TestPublishHistoryOverTheCapDropsTheOldestFirst(t *testing.T) {
+	bulky := func(code string) PublishSummary {
+		return PublishSummary{State: PublishStateFailed, Code: code,
+			Detail: strings.Repeat("x", protocol.MaxResultBytes/4)}
+	}
+	result := withPublishSummary(`{"phases":{"build":"done"},"publish":"not_attempted"}`, bulky("run-0"))
+	for retry := 1; retry <= 5; retry++ {
+		result = withPublishSummary(result, bulky(fmt.Sprintf("run-%d", retry)))
+		if len(result) > protocol.MaxResultBytes {
+			t.Fatalf("retry %d result is %d bytes, over the cap", retry, len(result))
+		}
+	}
+	codes := historyCodes(t, result)
+	if len(codes) == 0 || len(codes) >= 5 || codes[len(codes)-1] != "run-4" {
+		t.Fatalf("history = %v, want a newest-last suffix ending at run-4", codes)
+	}
+	if want := fmt.Sprintf("run-%d", 5-len(codes)); codes[0] != want {
+		t.Fatalf("history = %v, want it to start at %s", codes, want)
+	}
+	var document map[string]any
+	if err := json.Unmarshal([]byte(result), &document); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if document["phases"] == nil || document["truncated"] != nil {
+		t.Fatalf("result = %s, want the phase detail kept while history can give", result)
+	}
+	if publishSummaryOf(t, result).Code != "run-5" {
+		t.Fatal("the current verdict was not kept")
 	}
 }
 
