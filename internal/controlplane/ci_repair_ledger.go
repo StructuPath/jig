@@ -313,12 +313,30 @@ func (s *Store) AttemptCIRepairs(ctx context.Context, attemptID string) ([]proto
 	return records, nil
 }
 
-// requireCIGreenPastRepairs is CompleteAttempt's rule for attempts that ran
-// repair rounds (R6): the green ci record must not name a head any round
-// found red. It does not require the last pushed head, because a person may
-// push a fix after the rounds run out and the publish-only retry must still
-// be able to accept it. Ordering needs no check here: the ledger refuses a
-// round once ci is recorded, so a ci record always postdates every round.
+// refuseGreenOnRepairedHead is R6 at the moment a ci record is written: a
+// green run may not name a head any repair round found red. It does not
+// require the last pushed head, because a person may push a fix after the
+// rounds run out and the publish-only retry must still be able to accept it.
+func refuseGreenOnRepairedHead(ctx context.Context, tx *sql.Tx, attemptID, head string) error {
+	var repaired int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM publish_ci_repairs WHERE attempt_id = ? AND head_before = ?
+	`, attemptID, head).Scan(&repaired); err != nil {
+		return unavailable(err)
+	}
+	if repaired > 0 {
+		return conflict("publish_ci_on_repaired_head", fmt.Sprintf(
+			"CI cannot be recorded green on %s: a repair round already found that head red", head))
+	}
+	return nil
+}
+
+// requireCIGreenPastRepairs is CompleteAttempt's backstop for R6. The ci
+// record is refused on a repaired head when it is written, so this can only
+// fire on a ledger written before that rule existed or edited by hand; it
+// keeps `accepted` honest either way. Ordering needs no check: the ledger
+// refuses a round once ci is recorded, so a ci record always postdates
+// every round.
 func requireCIGreenPastRepairs(ctx context.Context, tx *sql.Tx, attemptID string) error {
 	var repaired int
 	if err := tx.QueryRowContext(ctx, `
@@ -330,8 +348,7 @@ func requireCIGreenPastRepairs(ctx context.Context, tx *sql.Tx, attemptID string
 	}
 	if repaired > 0 {
 		return conflict("publish_ci_on_repaired_head",
-			"the recorded green CI names a head a repair round found red; "+
-				"complete as accepted_unpublished and re-judge CI on the current head")
+			"the recorded green CI names a head a repair round found red")
 	}
 	return nil
 }

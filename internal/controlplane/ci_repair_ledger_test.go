@@ -139,6 +139,8 @@ func TestCIRepairRoundsChainFromProofWithinTheFrozenBudget(t *testing.T) {
 	wantCode(t, err, "ci_repair_conflict", "round 1 replayed with a different head")
 	_, err = recordRound(store, claim, tokenA, 1, shaB, shaC, "lint")
 	wantCode(t, err, "ci_repair_conflict", "round 1 replayed with different checks")
+	_, err = recordRound(store, claim, tokenA, 1, shaA, shaC, "lint", "test (ubuntu)")
+	wantCode(t, err, "ci_repair_conflict", "round 1 replayed over a different head_before")
 
 	_, err = authorizeRound(store, claim, tokenA, 2, shaB)
 	wantCode(t, err, "ci_repair_head_mismatch", "round 2 over round 1's red head")
@@ -248,14 +250,18 @@ func TestCIRepairRecordsAreValidated(t *testing.T) {
 	wantCode(t, err, "publish_branch_mismatch", "another attempt's branch")
 }
 
-// `accepted` after rounds needs a green head no round found red (R6). It
-// need not be the last pushed head: a person's later fix is acceptable.
-func TestAcceptedAfterRepairRoundsRefusesAGreenRunOnARepairedHead(t *testing.T) {
+// After rounds, CI may be recorded green only on a head no round found red
+// (R6), and that is refused when the ci row is written: the row is
+// permanent, so a bad one would leave the job unable ever to be accepted.
+// The green head need not be the last pushed one: a person's later fix is
+// acceptable.
+func TestGreenCIOnAHeadARoundFoundRedIsRefusedWhenRecorded(t *testing.T) {
 	for _, tc := range []struct {
 		name, greenHead, wantCode string
 	}{
 		{"green on the head round 1 repaired", shaB, "publish_ci_on_repaired_head"},
-		{"green on the pushed fix", shaC, ""},
+		{"green on the head round 2 repaired", shaC, "publish_ci_on_repaired_head"},
+		{"green on the last pushed fix", shaD, ""},
 		{"green on a person's later fix", shaE, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -264,20 +270,44 @@ func TestAcceptedAfterRepairRoundsRefusesAGreenRunOnARepairedHead(t *testing.T) 
 			if _, err := recordRound(store, claim, tokenA, 1, shaB, shaC, "lint"); err != nil {
 				t.Fatalf("record round 1: %v", err)
 			}
-			if _, err := recordStep(store, claim, tokenA, protocol.PublishStepCI, tc.greenHead, ""); err != nil {
+			if _, err := recordRound(store, claim, tokenA, 2, shaC, shaD, "lint"); err != nil {
+				t.Fatalf("record round 2: %v", err)
+			}
+			_, err := recordStep(store, claim, tokenA, protocol.PublishStepCI, tc.greenHead, "")
+			if tc.wantCode != "" {
+				wantCode(t, err, tc.wantCode, "record ci")
+				return
+			}
+			if err != nil {
 				t.Fatalf("record ci: %v", err)
 			}
 			attempt, err := store.CompleteAttempt(context.Background(), claim.Attempt.ID,
 				protocol.CompleteAttemptRequest{LeaseToken: tokenA, State: protocol.AttemptAccepted})
-			if tc.wantCode != "" {
-				wantCode(t, err, tc.wantCode, "complete accepted")
-				return
-			}
 			if err != nil || attempt.State != protocol.AttemptAccepted {
 				t.Fatalf("complete accepted: attempt=%+v err=%v", attempt, err)
 			}
 		})
 	}
+}
+
+// CompleteAttempt keeps R6 as a backstop for a ledger that holds a green
+// record on a repaired head anyway (written before the record-time rule, or
+// by hand): `accepted` is still refused.
+func TestAcceptedIsRefusedOnALedgerWithGreenOnARepairedHead(t *testing.T) {
+	store, clock, claim := claimRepairable(t, repairFixtureSnapshot)
+	publishThroughProof(t, store, claim, shaB)
+	if _, err := recordRound(store, claim, tokenA, 1, shaB, shaC, "lint"); err != nil {
+		t.Fatalf("record round 1: %v", err)
+	}
+	if _, err := store.db.Exec(`
+		INSERT INTO publish_records(attempt_id, step, branch, remote_ref, pr_url, completed_at)
+		VALUES (?, ?, ?, ?, '', ?)
+	`, claim.Attempt.ID, protocol.PublishStepCI, publishBranchOf(claim), shaB, clock.Now().UnixMilli()); err != nil {
+		t.Fatalf("plant a green record on the repaired head: %v", err)
+	}
+	_, err := store.CompleteAttempt(context.Background(), claim.Attempt.ID,
+		protocol.CompleteAttemptRequest{LeaseToken: tokenA, State: protocol.AttemptAccepted})
+	wantCode(t, err, "publish_ci_on_repaired_head", "complete accepted")
 }
 
 // Without rounds the CI gate is unchanged: green on the proof head accepts.
