@@ -228,7 +228,9 @@ func TestAnOlderSameNamedCheckDoesNotReplaceTheRerun(t *testing.T) {
 // out and asked again, and does not spend the budget.
 func TestAnInProgressRefusalIsRetriedWithoutSpendingTheBudget(t *testing.T) {
 	s, _ := newRerunScenario(t, 1, 0, flakyTest)
+	var pollsAt []int
 	s.gateway.rerun = func(_ int64, call int) error {
+		pollsAt = append(pollsAt, s.gateway.checkPolls)
 		if call <= 2 {
 			return publishFailure(ciRerunInProgress, "This workflow is already running")
 		}
@@ -237,6 +239,11 @@ func TestAnInProgressRefusalIsRetriedWithoutSpendingTheBudget(t *testing.T) {
 	attempt, summary := s.run(t)
 	if attempt.State != protocol.AttemptAccepted || !summary.CIFlaky {
 		t.Fatalf("attempt = %s summary = %+v, want accepted after the retried re-run", attempt.State, summary)
+	}
+	for i := 1; i < len(pollsAt); i++ {
+		if pollsAt[i] <= pollsAt[i-1] {
+			t.Fatalf("CI polls at each request = %v: a refusal was asked again without waiting on CI", pollsAt)
+		}
 	}
 	assertReruns(t, summary, CIRerunSummary{Attempt: 1, Outcome: "passed"})
 	if requests := s.gateway.rerunRequests(); !slices.Equal(requests, []int64{11, 11, 11}) {
@@ -485,6 +492,28 @@ func TestAPersonsPushWhileSettlingEndsTheRerun(t *testing.T) {
 	if len(s.gateway.rerunRequests()) != 0 || len(s.continuation.failures) != 0 ||
 		remoteBranches(t, s.originDir)[s.branch] != personal {
 		t.Fatal("a re-run or a repair round ran on top of a person's push")
+	}
+}
+
+// CI red on a head jig did not push (a person pushed before CI was judged)
+// is theirs to fix: no re-run is requested on it.
+func TestRedCIOnAPersonsHeadIsNotRerun(t *testing.T) {
+	s, _ := newRerunScenario(t, 1, 0, nil)
+	var personal string
+	s.gateway.checks = func(_ string, poll int) ([]CICheck, error) {
+		if poll == 1 {
+			personal = pushToBranch(t, s.originDir, s.branch)
+			return []CICheck{actionsJob("test", CIPending, 11)}, nil
+		}
+		return []CICheck{actionsJob("test", CIFail, 11)}, nil
+	}
+	attempt, summary := s.run(t)
+	if attempt.State != protocol.AttemptAcceptedUnpublished || summary.Code != "ci_failed" || summary.CIRef != personal {
+		t.Fatalf("attempt = %s summary = %+v, want ci_failed on the person's head %s", attempt.State, summary, personal)
+	}
+	if len(s.gateway.rerunRequests()) != 0 || len(summary.CIReruns) != 0 {
+		t.Fatalf("requests = %v ci_reruns = %+v, want no re-run on a person's head",
+			s.gateway.rerunRequests(), summary.CIReruns)
 	}
 }
 
