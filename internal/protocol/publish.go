@@ -201,6 +201,18 @@ const (
 	MaxCIRepairCheckNameBytes = 200
 )
 
+// CI repair log bounds. A failed GitHub Actions job's log reaches the repair
+// agent as its last MaxCIRepairLogBytesPerCheck bytes (the failure is almost
+// always at the end), and all logs together stay within MaxCIRepairLogBytes,
+// so at most MaxCIRepairLoggedChecks checks carry one. Logs are untrusted
+// text headed for an agent with write access: bounded here, framed as data
+// in the prompt.
+const (
+	MaxCIRepairLogBytesPerCheck = 16 << 10
+	MaxCIRepairLogBytes         = 64 << 10
+	MaxCIRepairLoggedChecks     = MaxCIRepairLogBytes / MaxCIRepairLogBytesPerCheck
+)
+
 // CIRepairRecord is one recorded CI repair round (publish.ci.on_fail): CI
 // was red on HeadBefore, a repair ran the chain again, and HeadAfter is the
 // fix it pushed to the same branch. Rounds chain: round 1's HeadBefore is

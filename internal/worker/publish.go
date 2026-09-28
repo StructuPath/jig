@@ -165,6 +165,10 @@ type PullRequestGateway interface {
 	// and legacy commit statuses alike, each normalized to pending, pass, or
 	// fail.
 	CommitChecks(ctx context.Context, repository, sha string) ([]CICheck, error)
+	// FailedCheckLogs returns checks with the tail of each GitHub Actions
+	// job's log attached, within the CI repair log bounds. It never fails:
+	// a log that cannot be read leaves a LogNote saying why.
+	FailedCheckLogs(ctx context.Context, repository string, checks []CICheck) []CICheck
 }
 
 // CI check verdicts, normalized across check runs and commit statuses.
@@ -183,6 +187,14 @@ type CICheck struct {
 	// for the diagnostic.
 	Conclusion string `json:"conclusion,omitempty"`
 	URL        string `json:"url,omitempty"`
+	// CheckRunID and App identify a check run; for App "github-actions" the
+	// check run id is the Actions job id, which is how its log is found.
+	CheckRunID int64  `json:"check_run_id,omitempty"`
+	App        string `json:"app,omitempty"`
+	// LogTail is the end of the job's log, attached for a CI repair round;
+	// LogNote says why there is none.
+	LogTail string `json:"log_tail,omitempty"`
+	LogNote string `json:"log_note,omitempty"`
 }
 
 // ---- publish options -------------------------------------------------------
@@ -1289,11 +1301,14 @@ type GitHubCLIGateway struct {
 	// construction without a gh binary.
 	LookPath func(string) (string, error)
 	Run      func(ctx context.Context, name string, arguments ...string) (stdout, stderr []byte, stdoutTooLarge, stderrTooLarge bool, err error)
+	// RunTail is Run for output whose END matters (a CI job log): it keeps
+	// the last tailBytes of stdout rather than the first.
+	RunTail func(ctx context.Context, tailBytes int, name string, arguments ...string) (tail, stderr []byte, err error)
 }
 
 // NewGitHubCLIGateway builds the production gateway.
 func NewGitHubCLIGateway() *GitHubCLIGateway {
-	return &GitHubCLIGateway{LookPath: exec.LookPath, Run: runBoundedCommand}
+	return &GitHubCLIGateway{LookPath: exec.LookPath, Run: runBoundedCommand, RunTail: runTailCommand}
 }
 
 func (g *GitHubCLIGateway) lookPath() func(string) (string, error) {
@@ -1411,7 +1426,7 @@ func (g *GitHubCLIGateway) CommitChecks(ctx context.Context, repository, sha str
 	}
 	runs, err := g.apiLines(ctx, "gh api check-runs",
 		"repos/"+project+"/commits/"+sha+"/check-runs?per_page=100",
-		`.check_runs[] | {name: .name, status: .status, conclusion: (.conclusion // ""), url: (.html_url // "")}`)
+		`.check_runs[] | {name: .name, status: .status, conclusion: (.conclusion // ""), url: (.html_url // ""), id: .id, app: (.app.slug // "")}`)
 	if err != nil {
 		return nil, err
 	}
@@ -1423,12 +1438,15 @@ func (g *GitHubCLIGateway) CommitChecks(ctx context.Context, repository, sha str
 	}
 	checks := make([]CICheck, 0, len(runs)+len(statuses))
 	for _, line := range runs {
-		var run struct{ Name, Status, Conclusion, URL string }
+		var run struct {
+			Name, Status, Conclusion, URL, App string
+			ID                                 int64
+		}
 		if err := json.Unmarshal(line, &run); err != nil {
 			return nil, publishFailure("gh_malformed_output", "gh api check-runs returned unreadable JSON")
 		}
 		checks = append(checks, CICheck{Name: run.Name, Verdict: checkRunVerdict(run.Status, run.Conclusion),
-			Conclusion: run.Conclusion, URL: run.URL})
+			Conclusion: run.Conclusion, URL: run.URL, CheckRunID: run.ID, App: run.App})
 	}
 	for _, line := range statuses {
 		var status struct{ Name, State, URL string }
@@ -1439,6 +1457,97 @@ func (g *GitHubCLIGateway) CommitChecks(ctx context.Context, repository, sha str
 			Conclusion: status.State, URL: status.URL})
 	}
 	return checks, nil
+}
+
+// FailedCheckLogs attaches the tail of each failed GitHub Actions job's log,
+// read with `gh api repos/{project}/actions/jobs/{id}/logs`. Only Actions
+// check runs have a log this way (their check run id is the job id); other
+// checks keep name, conclusion, and URL. Only failed checks are read, logs
+// are kept for at most MaxCIRepairLoggedChecks of them, and at most
+// maxCILogReads reads are attempted, each under the publish command
+// timeout — failed reads count — so a hanging gh costs a bounded time.
+// Nothing here fails the caller: an unreadable log becomes a LogNote.
+func (g *GitHubCLIGateway) FailedCheckLogs(ctx context.Context, repository string, checks []CICheck) []CICheck {
+	annotated := append([]CICheck(nil), checks...)
+	project, projectErr := githubProject(repository)
+	_, ghErr := g.lookPath()("gh")
+	logged, reads := 0, 0
+	for i := range annotated {
+		check := &annotated[i]
+		switch {
+		case check.Verdict != CIFail:
+			continue
+		case check.App != "github-actions" || check.CheckRunID <= 0:
+			check.LogNote = "no log: not a GitHub Actions job"
+		case projectErr != nil:
+			check.LogNote = "no log: " + projectErr.Error()
+		case ghErr != nil:
+			check.LogNote = "no log: the GitHub CLI (gh) was not found on PATH"
+		case logged == protocol.MaxCIRepairLoggedChecks:
+			check.LogNote = fmt.Sprintf("no log: the log budget went to the first %d failed jobs",
+				protocol.MaxCIRepairLoggedChecks)
+		case reads == maxCILogReads:
+			check.LogNote = fmt.Sprintf("no log: %d log reads were already attempted", maxCILogReads)
+		default:
+			reads++
+			// Read twice the kept size: cleaning (timestamps, ANSI codes)
+			// shrinks it, and the cut lands on a line boundary.
+			read := 2 * protocol.MaxCIRepairLogBytesPerCheck
+			tail, stderr, err := g.runTail()(ctx, read, "gh",
+				"api", "-H", "Accept: application/vnd.github+json",
+				fmt.Sprintf("repos/%s/actions/jobs/%d/logs", project, check.CheckRunID))
+			if err != nil {
+				check.LogNote = boundedText("log unavailable: "+ghDiagnostic("gh api job logs", err, stderr,
+					false, false).Error(), protocol.MaxCIRepairCheckNameBytes)
+				continue
+			}
+			check.LogTail = cleanLogTail(tail, protocol.MaxCIRepairLogBytesPerCheck, len(tail) >= read)
+			logged++
+		}
+	}
+	return annotated
+}
+
+// maxCILogReads bounds the log reads one FailedCheckLogs call attempts,
+// failures included: twice the kept logs leaves room for expired or
+// unreadable ones without letting a hanging gh cost more than
+// maxCILogReads × PublishCommandTimeout.
+const maxCILogReads = 2 * protocol.MaxCIRepairLoggedChecks
+
+var (
+	logTimestamp = regexp.MustCompile(`(?m)^\d{4}-\d{2}-\d{2}T[0-9:.]+Z ?`)
+	logANSI      = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+)
+
+// cleanLogTail keeps the last limit bytes of a job log, starting on a whole
+// line, with Actions' per-line timestamps and terminal escape codes
+// stripped and the result valid UTF-8. cut says raw was itself cut from a
+// longer log, so its first line is a fragment and is dropped too.
+func cleanLogTail(raw []byte, limit int, cut bool) string {
+	text := string(raw)
+	if cut {
+		text = dropFirstLine(text)
+	}
+	text = logANSI.ReplaceAllString(logTimestamp.ReplaceAllString(text, ""), "")
+	text = strings.ToValidUTF8(text, "")
+	if len(text) > limit {
+		text = dropFirstLine(text[len(text)-limit:])
+	}
+	return strings.ToValidUTF8(text, "")
+}
+
+func dropFirstLine(text string) string {
+	if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+		return text[newline+1:]
+	}
+	return ""
+}
+
+func (g *GitHubCLIGateway) runTail() func(context.Context, int, string, ...string) ([]byte, []byte, error) {
+	if g.RunTail != nil {
+		return g.RunTail
+	}
+	return runTailCommand
 }
 
 func (g *GitHubCLIGateway) apiLines(ctx context.Context, label, path, filter string) ([][]byte, error) {
@@ -1588,6 +1697,39 @@ func runBoundedCommand(ctx context.Context, name string, arguments ...string) ([
 	}
 	return stdout.Bytes(), stderr.Bytes(), stdout.truncated, stderr.truncated, err
 }
+
+// runTailCommand runs a command under the publish timeout and keeps only the
+// last tailBytes of its stdout.
+func runTailCommand(ctx context.Context, tailBytes int, name string, arguments ...string) ([]byte, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, protocol.PublishCommandTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, name, arguments...)
+	stdout := &tailBuffer{limit: tailBytes}
+	stderr := &limitBuffer{limit: protocol.MaxPublishStderrBytes}
+	command.Stdout = stdout
+	command.Stderr = stderr
+	err := command.Run()
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+// tailBuffer keeps the last limit bytes written to it.
+type tailBuffer struct {
+	data  []byte
+	limit int
+}
+
+func (b *tailBuffer) Write(value []byte) (int, error) {
+	b.data = append(b.data, value...)
+	if len(b.data) > b.limit {
+		b.data = append(b.data[:0], b.data[len(b.data)-b.limit:]...)
+	}
+	return len(value), nil
+}
+
+func (b *tailBuffer) Bytes() []byte { return b.data }
 
 type limitBuffer struct {
 	buffer    bytes.Buffer

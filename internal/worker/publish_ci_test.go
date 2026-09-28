@@ -8,6 +8,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -455,5 +456,183 @@ func TestCIRepairRoundsTravelTheClientAndHTTPSurface(t *testing.T) {
 	rounds, err := w.client.AttemptCIRepairs(ctx, claim.Attempt.ID)
 	if err != nil || len(rounds) != 1 || rounds[0].FailedChecks[0] != "lint" {
 		t.Fatalf("list rounds: %+v err=%v", rounds, err)
+	}
+}
+
+// ---- CI repair logs (U4) ------------------------------------------------------
+
+// Check runs carry their id and app, which is how an Actions job's log is
+// found later.
+func TestCommitChecksCarriesTheCheckRunIDAndApp(t *testing.T) {
+	gateway := &GitHubCLIGateway{
+		LookPath: func(string) (string, error) { return "/usr/bin/gh", nil },
+		Run: func(_ context.Context, _ string, arguments ...string) ([]byte, []byte, bool, bool, error) {
+			if joined := strings.Join(arguments, " "); strings.Contains(joined, "/check-runs") {
+				if !strings.Contains(joined, "id: .id") || !strings.Contains(joined, "app: (.app.slug") {
+					t.Fatalf("the check-runs query does not ask for id and app: %s", joined)
+				}
+				return []byte(`{"name":"lint","status":"completed","conclusion":"failure","url":"https://ci/9","id":987,"app":"github-actions"}` + "\n"), nil, false, false, nil
+			}
+			return nil, nil, false, false, nil
+		},
+	}
+	checks, err := gateway.CommitChecks(context.Background(), "github.com/example/repo",
+		"0123456789abcdef0123456789abcdef01234567")
+	if err != nil || len(checks) != 1 || checks[0].CheckRunID != 987 || checks[0].App != "github-actions" {
+		t.Fatalf("checks = %+v err=%v, want id 987 from app github-actions", checks, err)
+	}
+}
+
+// actionsLog is a job log the way Actions serves it: a timestamp on every
+// line, colour codes, and the failure at the very end.
+func actionsLog(lines int) []byte {
+	var log strings.Builder
+	for i := 0; i < lines; i++ {
+		fmt.Fprintf(&log, "2026-09-28T03:04:05.1234567Z \x1b[36mstep output line %06d\x1b[0m\n", i)
+	}
+	log.WriteString("2026-09-28T03:04:06.0000000Z --- FAIL: TestCheckout (0.01s)\n")
+	return []byte(log.String())
+}
+
+// FailedCheckLogs attaches a bounded, cleaned tail to Actions jobs only,
+// within the log budget, and never fails: every check without a log says
+// why.
+func TestFailedCheckLogsAttachesBoundedTailsToActionsJobsOnly(t *testing.T) {
+	var paths []string
+	gateway := &GitHubCLIGateway{
+		LookPath: func(string) (string, error) { return "/usr/bin/gh", nil },
+		RunTail: func(_ context.Context, tailBytes int, _ string, arguments ...string) ([]byte, []byte, error) {
+			path := arguments[len(arguments)-1]
+			paths = append(paths, path)
+			if strings.Contains(path, "/jobs/3/") {
+				return nil, []byte("HTTP 410: logs expired"), errors.New("exit status 1")
+			}
+			log := actionsLog(2000)
+			if len(log) > tailBytes {
+				log = log[len(log)-tailBytes:]
+			}
+			return log, nil, nil
+		},
+	}
+	checks := []CICheck{{Name: "legacy-status", Verdict: CIFail}}
+	for id := int64(1); id <= 6; id++ {
+		checks = append(checks, CICheck{Name: fmt.Sprintf("job-%d", id), Verdict: CIFail,
+			App: "github-actions", CheckRunID: id})
+	}
+	annotated := gateway.FailedCheckLogs(context.Background(), "github.com/example/repo", checks)
+
+	if checks[1].LogTail != "" {
+		t.Fatal("FailedCheckLogs mutated its input")
+	}
+	if annotated[0].LogTail != "" || !strings.Contains(annotated[0].LogNote, "not a GitHub Actions job") {
+		t.Fatalf("status check = %+v, want no log and a note", annotated[0])
+	}
+	if !strings.Contains(annotated[3].LogNote, "log unavailable") || !strings.Contains(annotated[3].LogNote, "410") {
+		t.Fatalf("job 3 = %+v, want the gh failure as a note", annotated[3])
+	}
+	for _, i := range []int{1, 2, 4, 5} {
+		tail := annotated[i].LogTail
+		if len(tail) == 0 || len(tail) > protocol.MaxCIRepairLogBytesPerCheck {
+			t.Fatalf("job %d tail is %d bytes, want 1..%d", i, len(tail), protocol.MaxCIRepairLogBytesPerCheck)
+		}
+		if !strings.HasSuffix(tail, "--- FAIL: TestCheckout (0.01s)\n") {
+			t.Fatalf("job %d tail lost the failure at the end: %q", i, tail[len(tail)-80:])
+		}
+		if strings.Contains(tail, "2026-09-28T") || strings.Contains(tail, "\x1b[") {
+			t.Fatalf("job %d tail kept timestamps or escape codes", i)
+		}
+		if !strings.HasPrefix(tail, "step output line ") {
+			t.Fatalf("job %d tail does not start on a line boundary: %q", i, tail[:40])
+		}
+	}
+	if annotated[6].LogTail != "" || !strings.Contains(annotated[6].LogNote, "budget") {
+		t.Fatalf("job 6 = %+v, want no log: the budget went to the first %d jobs",
+			annotated[6], protocol.MaxCIRepairLoggedChecks)
+	}
+	if len(paths) != 5 || paths[0] != "repos/example/repo/actions/jobs/1/logs" {
+		t.Fatalf("log reads = %v, want jobs 1-5 (3 failed and did not use budget)", paths)
+	}
+}
+
+// Without gh, or for a repository jig cannot publish to, every check gets
+// a note and nothing is run.
+func TestFailedCheckLogsDegradesToNotes(t *testing.T) {
+	actions := []CICheck{{Name: "lint", Verdict: CIFail, App: "github-actions", CheckRunID: 1}}
+	noGH := &GitHubCLIGateway{
+		LookPath: func(string) (string, error) { return "", errors.New("not found") },
+		RunTail: func(context.Context, int, string, ...string) ([]byte, []byte, error) {
+			t.Fatal("ran gh without gh")
+			return nil, nil, nil
+		},
+	}
+	if got := noGH.FailedCheckLogs(context.Background(), "github.com/example/repo", actions); !strings.Contains(got[0].LogNote, "gh") {
+		t.Fatalf("without gh = %+v, want a note naming gh", got[0])
+	}
+	withGH := &GitHubCLIGateway{
+		LookPath: func(string) (string, error) { return "/usr/bin/gh", nil },
+		RunTail: func(context.Context, int, string, ...string) ([]byte, []byte, error) {
+			t.Fatal("read a log for a repository jig cannot publish to")
+			return nil, nil, nil
+		},
+	}
+	if got := withGH.FailedCheckLogs(context.Background(), "gitlab.com/example/repo", actions); !strings.Contains(got[0].LogNote, "publishes to GitHub only") {
+		t.Fatalf("non-GitHub repository = %+v, want the unsupported-remote note", got[0])
+	}
+}
+
+// A clean log longer than the cap keeps its last whole lines, and never
+// more than the cap.
+func TestCleanLogTailKeepsTheLastWholeLinesWithinTheCap(t *testing.T) {
+	var log strings.Builder
+	for i := 0; log.Len() < 3*protocol.MaxCIRepairLogBytesPerCheck; i++ {
+		fmt.Fprintf(&log, "plain output line %06d\n", i)
+	}
+	log.WriteString("--- FAIL: TestLast\n")
+	tail := cleanLogTail([]byte(log.String()), protocol.MaxCIRepairLogBytesPerCheck, false)
+	if len(tail) > protocol.MaxCIRepairLogBytesPerCheck || len(tail) < protocol.MaxCIRepairLogBytesPerCheck-100 {
+		t.Fatalf("tail is %d bytes, want just under %d", len(tail), protocol.MaxCIRepairLogBytesPerCheck)
+	}
+	if !strings.HasSuffix(tail, "--- FAIL: TestLast\n") || !strings.HasPrefix(tail, "plain output line ") {
+		t.Fatalf("tail lost its end or starts mid-line: %q … %q", tail[:30], tail[len(tail)-30:])
+	}
+	if whole := cleanLogTail([]byte("one\ntwo\n"), protocol.MaxCIRepairLogBytesPerCheck, false); whole != "one\ntwo\n" {
+		t.Fatalf("an uncut short log = %q, want it whole", whole)
+	}
+}
+
+// The tail runner keeps the END of a command's output.
+func TestRunTailCommandKeepsTheEndOfTheOutput(t *testing.T) {
+	tail, _, err := runTailCommand(context.Background(), 12, "sh", "-c",
+		`i=0; while [ $i -lt 5000 ]; do printf 'line %d\n' $i; i=$((i+1)); done; printf 'THE END\n'`)
+	if err != nil || string(tail) != "999\nTHE END\n" {
+		t.Fatalf("tail = %q err=%v, want the last 12 bytes", tail, err)
+	}
+}
+
+// Only failed checks are read, and reads are capped whether or not they
+// succeed, so a hanging gh costs a bounded time.
+func TestFailedCheckLogsReadsOnlyFailuresAndCapsAttempts(t *testing.T) {
+	reads := 0
+	gateway := &GitHubCLIGateway{
+		LookPath: func(string) (string, error) { return "/usr/bin/gh", nil },
+		RunTail: func(context.Context, int, string, ...string) ([]byte, []byte, error) {
+			reads++
+			return nil, nil, context.DeadlineExceeded
+		},
+	}
+	checks := []CICheck{{Name: "passing", Verdict: CIPass, App: "github-actions", CheckRunID: 99}}
+	for id := int64(1); id <= 12; id++ {
+		checks = append(checks, CICheck{Name: fmt.Sprintf("job-%d", id), Verdict: CIFail,
+			App: "github-actions", CheckRunID: id})
+	}
+	annotated := gateway.FailedCheckLogs(context.Background(), "github.com/example/repo", checks)
+	if reads != maxCILogReads {
+		t.Fatalf("reads = %d, want the cap of %d even though every read failed", reads, maxCILogReads)
+	}
+	if annotated[0].LogNote != "" || annotated[0].LogTail != "" {
+		t.Fatalf("passing check = %+v, want it untouched", annotated[0])
+	}
+	if last := annotated[len(annotated)-1]; !strings.Contains(last.LogNote, "reads were already attempted") {
+		t.Fatalf("check past the read cap = %+v, want a note", last)
 	}
 }
