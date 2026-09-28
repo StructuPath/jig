@@ -41,9 +41,10 @@ type Event struct {
 }
 
 // Usage is one send's cost accounting. Spend accumulates across retries at
-// the engine (every send costs); ContextTokens is occupancy — only the last
-// send's value is current. Runtimes that do not report cost leave zeros
-// (capability flag ReportsCost=false).
+// the engine (every send costs), so CostUSD is this send's cost alone, never
+// a session running total; ContextTokens is occupancy — only the last send's
+// value is current. Runtimes that do not report cost leave zeros (capability
+// flag ReportsCost=false).
 type Usage struct {
 	InputTokens   int
 	OutputTokens  int
@@ -71,11 +72,14 @@ type Options struct {
 // engine-chosen stable name (attempt-scoped by declaration, KTD5); NativeID
 // is the per-CLI identity the adapter mints on the first send and reuses to
 // continue. Sends counts completed sends so create-or-continue is a property
-// of the session, not a separate method.
+// of the session, not a separate method. ReportedCostUSD is the running total
+// the CLI last reported for this conversation, kept by adapters whose CLI
+// reports cost that way so they can hand back a per-send Usage.CostUSD.
 type Session struct {
-	Key      string
-	NativeID string
-	Sends    int
+	Key             string
+	NativeID        string
+	Sends           int
+	ReportedCostUSD float64
 }
 
 // Result is one send's terminal outcome: the final response text plus

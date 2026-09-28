@@ -23,7 +23,8 @@ import (
 // stubScript stands in for the CLI. It echoes back the session id it was
 // given (--session-id or --resume), the way the real CLI does, so session
 // continuity is observable; STUB_MODE=coldstart makes it answer under a
-// different session instead.
+// different session instead. STUB_TOTAL_COST is the session's running cost
+// total the result reports, the way the real CLI reports total_cost_usd.
 const stubScript = `#!/bin/sh
 case "$1" in
   --version) echo "9.9.9 (Claude Code)"; exit 0 ;;
@@ -65,7 +66,7 @@ case "$STUB_MODE" in
     printf '{"type":"result","result":"survived the flood","is_error":false,"session_id":"%s"}\n' "$SESSION" ;;
   *)
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"x.txt"}},{"type":"text","text":"working on it"}]}}'
-    printf '{"type":"result","result":"hello from stub","is_error":false,"total_cost_usd":0.5,"session_id":"%s","usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":2}}\n' "$SESSION"
+    printf '{"type":"result","result":"hello from stub","is_error":false,"total_cost_usd":%s,"session_id":"%s","usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":2}}\n' "${STUB_TOTAL_COST:-0.5}" "$SESSION"
     ;;
 esac
 `
@@ -185,14 +186,21 @@ func TestFirstSendCreatesTheSessionAndTheSecondResumesIt(t *testing.T) {
 		t.Errorf("tool_call event missing: %s", joined)
 	}
 
-	// Second send: same session continues via --resume.
+	// Second send: same session continues via --resume. The CLI reports the
+	// session's running total, so the send's own cost is the difference.
+	opts.Env = append(opts.Env, "STUB_TOTAL_COST=1.25")
 	handle, err = adapter.StartOrContinue(context.Background(), session, "second prompt", opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	drain(t, handle)
-	if _, err := handle.Result(); err != nil {
+	result, err = handle.Result()
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.Usage.CostUSD != 0.75 || session.ReportedCostUSD != 1.25 {
+		t.Fatalf("resumed send cost = %v (session total %v), want 0.75 of 1.25",
+			result.Usage.CostUSD, session.ReportedCostUSD)
 	}
 	if session.Sends != 2 {
 		t.Fatalf("session sends = %d, want 2", session.Sends)
