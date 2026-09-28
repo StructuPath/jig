@@ -1448,22 +1448,25 @@ func (e *execution) rolePrompt(content, path string) (string, error) {
 func composePrompt(
 	template string, parameters map[string]string, previous *parsedEnvelope, handoffDir string,
 ) string {
-	text := template
-	for name, value := range parameters {
-		text = strings.ReplaceAll(text, "{{"+name+"}}", value)
-	}
 	previousJSON := "(none)"
 	if previous != nil {
 		previousJSON = string(previous.Raw)
 	}
-	if strings.Contains(text, "{{previous_envelope}}") {
-		text = strings.ReplaceAll(text, "{{previous_envelope}}", previousJSON)
-	} else {
+	// One pass over the TEMPLATE: placeholders are found only in what the
+	// definition wrote, never in what substitution inserts. A parameter value
+	// or a previous envelope (which may carry CI log text) that contains
+	// "{{handoff_dir}}" is data, and must neither be rewritten nor decide
+	// which sections the prompt gets.
+	pairs := make([]string, 0, 2*len(parameters)+4)
+	for name, value := range parameters {
+		pairs = append(pairs, "{{"+name+"}}", value)
+	}
+	pairs = append(pairs, "{{previous_envelope}}", previousJSON, "{{handoff_dir}}", handoffDir)
+	text := strings.NewReplacer(pairs...).Replace(template)
+	if !strings.Contains(template, "{{previous_envelope}}") {
 		text += "\n\n## Previous envelope\n" + previousJSON
 	}
-	if strings.Contains(text, "{{handoff_dir}}") {
-		text = strings.ReplaceAll(text, "{{handoff_dir}}", handoffDir)
-	} else {
+	if !strings.Contains(template, "{{handoff_dir}}") {
 		text += "\n\n## Handoff directory\nShare working notes for later phases in: " + handoffDir
 	}
 	text += "\n\nWhen you are done, respond with ONLY a JSON object with these fields: " +

@@ -1462,18 +1462,21 @@ func (g *GitHubCLIGateway) CommitChecks(ctx context.Context, repository, sha str
 // FailedCheckLogs attaches the tail of each failed GitHub Actions job's log,
 // read with `gh api repos/{project}/actions/jobs/{id}/logs`. Only Actions
 // check runs have a log this way (their check run id is the job id); other
-// checks keep name, conclusion, and URL. Logs are fetched for at most
-// MaxCIRepairLoggedChecks checks, each under the publish command timeout,
-// so the worst case is bounded. Nothing here fails the caller: an
-// unreadable log becomes a LogNote.
+// checks keep name, conclusion, and URL. Only failed checks are read, logs
+// are kept for at most MaxCIRepairLoggedChecks of them, and at most
+// maxCILogReads reads are attempted, each under the publish command
+// timeout — failed reads count — so a hanging gh costs a bounded time.
+// Nothing here fails the caller: an unreadable log becomes a LogNote.
 func (g *GitHubCLIGateway) FailedCheckLogs(ctx context.Context, repository string, checks []CICheck) []CICheck {
 	annotated := append([]CICheck(nil), checks...)
 	project, projectErr := githubProject(repository)
 	_, ghErr := g.lookPath()("gh")
-	logged := 0
+	logged, reads := 0, 0
 	for i := range annotated {
 		check := &annotated[i]
 		switch {
+		case check.Verdict != CIFail:
+			continue
 		case check.App != "github-actions" || check.CheckRunID <= 0:
 			check.LogNote = "no log: not a GitHub Actions job"
 		case projectErr != nil:
@@ -1483,7 +1486,10 @@ func (g *GitHubCLIGateway) FailedCheckLogs(ctx context.Context, repository strin
 		case logged == protocol.MaxCIRepairLoggedChecks:
 			check.LogNote = fmt.Sprintf("no log: the log budget went to the first %d failed jobs",
 				protocol.MaxCIRepairLoggedChecks)
+		case reads == maxCILogReads:
+			check.LogNote = fmt.Sprintf("no log: %d log reads were already attempted", maxCILogReads)
 		default:
+			reads++
 			// Read twice the kept size: cleaning (timestamps, ANSI codes)
 			// shrinks it, and the cut lands on a line boundary.
 			read := 2 * protocol.MaxCIRepairLogBytesPerCheck
@@ -1501,6 +1507,12 @@ func (g *GitHubCLIGateway) FailedCheckLogs(ctx context.Context, repository strin
 	}
 	return annotated
 }
+
+// maxCILogReads bounds the log reads one FailedCheckLogs call attempts,
+// failures included: twice the kept logs leaves room for expired or
+// unreadable ones without letting a hanging gh cost more than
+// maxCILogReads × PublishCommandTimeout.
+const maxCILogReads = 2 * protocol.MaxCIRepairLoggedChecks
 
 var (
 	logTimestamp = regexp.MustCompile(`(?m)^\d{4}-\d{2}-\d{2}T[0-9:.]+Z ?`)

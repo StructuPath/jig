@@ -138,7 +138,7 @@ func (e *execution) repairRound(ctx context.Context, round int, failure worker.C
 	}
 	input := ciFailureEnvelope(failure)
 	e.emit.emit(protocol.EventLog, repair.Run, "ci_repair_start", map[string]any{
-		"round": round, "head": failure.Head, "failed_checks": input.Fields["failed_checks"],
+		"round": round, "head": input.Fields["head"], "failed_checks": traceChecks(input),
 	})
 	run := e.runPhaseOnce(ctx, e.spec.Phases[index], &input)
 	if end := run.attemptEnd(); end != nil {
@@ -148,6 +148,24 @@ func (e *execution) repairRound(ctx context.Context, round int, failure worker.C
 		return chainEnd{endFailed, fmt.Sprintf("CI repair phase %q: %s", repair.Run, run.failure)}
 	}
 	return e.runChain(ctx, index+1, run.envelopeRef())
+}
+
+// traceChecks is the failed checks as the trace records them: without log
+// text. A log tail goes to the agent once; persisting it in the control
+// plane's trace would keep anything GitHub failed to mask for as long as
+// the trace lives, and would push the event past its payload cap.
+func traceChecks(input parsedEnvelope) []map[string]any {
+	listed, _ := input.Fields["failed_checks"].([]map[string]string)
+	projected := make([]map[string]any, 0, len(listed))
+	for _, check := range listed {
+		entry := map[string]any{"name": check["name"], "conclusion": check["conclusion"], "url": check["url"],
+			"log_bytes": len(check["log_tail"])}
+		if note := check["log_note"]; note != "" {
+			entry["log_note"] = note
+		}
+		projected = append(projected, entry)
+	}
+	return projected
 }
 
 // keepEnd keeps the last limit bytes of value.

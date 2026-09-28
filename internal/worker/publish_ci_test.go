@@ -608,3 +608,31 @@ func TestRunTailCommandKeepsTheEndOfTheOutput(t *testing.T) {
 		t.Fatalf("tail = %q err=%v, want the last 12 bytes", tail, err)
 	}
 }
+
+// Only failed checks are read, and reads are capped whether or not they
+// succeed, so a hanging gh costs a bounded time.
+func TestFailedCheckLogsReadsOnlyFailuresAndCapsAttempts(t *testing.T) {
+	reads := 0
+	gateway := &GitHubCLIGateway{
+		LookPath: func(string) (string, error) { return "/usr/bin/gh", nil },
+		RunTail: func(context.Context, int, string, ...string) ([]byte, []byte, error) {
+			reads++
+			return nil, nil, context.DeadlineExceeded
+		},
+	}
+	checks := []CICheck{{Name: "passing", Verdict: CIPass, App: "github-actions", CheckRunID: 99}}
+	for id := int64(1); id <= 12; id++ {
+		checks = append(checks, CICheck{Name: fmt.Sprintf("job-%d", id), Verdict: CIFail,
+			App: "github-actions", CheckRunID: id})
+	}
+	annotated := gateway.FailedCheckLogs(context.Background(), "github.com/example/repo", checks)
+	if reads != maxCILogReads {
+		t.Fatalf("reads = %d, want the cap of %d even though every read failed", reads, maxCILogReads)
+	}
+	if annotated[0].LogNote != "" || annotated[0].LogTail != "" {
+		t.Fatalf("passing check = %+v, want it untouched", annotated[0])
+	}
+	if last := annotated[len(annotated)-1]; !strings.Contains(last.LogNote, "reads were already attempted") {
+		t.Fatalf("check past the read cap = %+v, want a note", last)
+	}
+}
