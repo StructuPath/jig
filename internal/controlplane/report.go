@@ -621,7 +621,7 @@ func (s *Store) reportSpend(ctx context.Context, since, until int64, byID map[st
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT a.job_id,
 		       COALESCE(SUM(json_extract(CAST(e.payload AS TEXT), '$.payload.cost')), 0),
-		       COALESCE(SUM(json_extract(CAST(e.payload AS TEXT), '$.payload.unmetered_sends')), 0)
+		       CAST(COALESCE(SUM(json_extract(CAST(e.payload AS TEXT), '$.payload.unmetered_sends')), 0) AS INTEGER)
 		FROM events e JOIN attempts a ON a.id = e.attempt_id
 		WHERE e.type = ? AND json_valid(CAST(e.payload AS TEXT))
 		  AND a.job_id IN (`+reportWindowJobs+`)
