@@ -60,6 +60,10 @@ type Step struct {
 	Delay time.Duration
 	// ProcessGroup is the process group the handle reports.
 	ProcessGroup int64
+	// Do, when set, runs first as the call starts, with the call as
+	// recorded — what an agent does outside the worktree (its handoff notes)
+	// or a runtime that panics. It may block.
+	Do func(Call)
 }
 
 // Call records one StartOrContinue invocation for assertions.
@@ -173,8 +177,12 @@ func (r *Runtime) StartOrContinue(
 		Send:       session.Sends,
 		Options:    opts,
 	})
+	call := r.calls[len(r.calls)-1]
 	r.mutex.Unlock()
 
+	if step.Do != nil {
+		step.Do(call)
+	}
 	for path, content := range step.Files {
 		target, err := resolvePath(path, opts)
 		if err != nil {

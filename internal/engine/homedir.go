@@ -36,16 +36,21 @@ type attemptScratch struct {
 	// the chain's HOME rather than inside it, created when a member first
 	// runs (parallel.go).
 	members string
+	// memberHandoff holds one private handoff directory per parallel group
+	// member, so concurrent members never read or overwrite each other's
+	// notes; the notes join handoff only when the group's run merges.
+	memberHandoff string
 }
 
 // createScratch materializes the attempt's scratch family under root, 0700.
 func createScratch(root, attemptID string) (*attemptScratch, error) {
 	base := filepath.Join(root, attemptID)
 	scratch := &attemptScratch{
-		root:    base,
-		home:    filepath.Join(base, "home"),
-		handoff: filepath.Join(base, "handoff"),
-		members: filepath.Join(base, "members"),
+		root:          base,
+		home:          filepath.Join(base, "home"),
+		handoff:       filepath.Join(base, "handoff"),
+		members:       filepath.Join(base, "members"),
+		memberHandoff: filepath.Join(base, "member-handoff"),
 	}
 	for _, dir := range []string{scratch.home, scratch.handoff} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

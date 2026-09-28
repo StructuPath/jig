@@ -29,6 +29,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -65,10 +66,23 @@ type memberTerminal struct {
 func (e *execution) runGroup(
 	ctx context.Context, members []protocol.PhaseSpec, previous *parsedEnvelope, edgeUses map[string]int,
 ) (*chainEnd, *parsedEnvelope) {
+	// Guards are judged once, on the group's first run. A repair between
+	// runs can change the field a guard reads, and a re-judged guard would
+	// let the repair skip the very reviewer that rejected it — recorded as
+	// skipped, which acceptance counts as passed. Sequential rerun-self never
+	// re-checks a guard either: a member that ran runs again, one that was
+	// skipped stays skipped.
+	var skipped []bool
 	for groupRun := 1; ; groupRun++ {
-		runs, end := e.runGroupOnce(ctx, members, previous, groupRun)
+		runs, end := e.runGroupOnce(ctx, members, previous, groupRun, skipped)
 		if end != nil {
 			return end, nil
+		}
+		if skipped == nil {
+			skipped = make([]bool, len(members))
+			for i := range runs {
+				skipped[i] = runs[i].skipped
+			}
 		}
 		last := previous
 		rerun := false
@@ -106,11 +120,13 @@ func (e *execution) runGroup(
 	}
 }
 
-// runGroupOnce runs every member whose guard holds, concurrently, then
-// enforces the boundary and merges. A non-nil chainEnd means nothing was
-// merged.
+// runGroupOnce runs every member that is not skipped, concurrently, then
+// enforces the boundary and merges. On the first run (firstSkipped nil)
+// each member's guard decides; on every later run firstSkipped does. A
+// non-nil chainEnd means nothing was merged.
 func (e *execution) runGroupOnce(
 	ctx context.Context, members []protocol.PhaseSpec, previous *parsedEnvelope, groupRun int,
+	firstSkipped []bool,
 ) ([]memberRun, *chainEnd) {
 	if e.cancelled() {
 		return nil, &chainEnd{endCancelled, "cancelled before the parallel group"}
@@ -125,12 +141,17 @@ func (e *execution) runGroupOnce(
 	e.emit.emit(protocol.EventLog, "", "parallel_group_start",
 		map[string]any{"members": names, "run": groupRun})
 
-	// Every guard is judged against the view that preceded the group —
-	// validation guarantees no guard reads a field a sibling reports.
+	// Every guard is judged against the view that preceded the group's
+	// first run — validation guarantees no guard reads a field a sibling
+	// reports, and runGroup keeps a repair from re-judging one.
 	runs := make([]memberRun, len(members))
 	var active []int
 	for i, member := range members {
-		if member.If != "" && !guardHolds(member.If, e.fieldView) {
+		skip := member.If != "" && !guardHolds(member.If, e.fieldView)
+		if firstSkipped != nil {
+			skip = firstSkipped[i]
+		}
+		if skip {
 			runs[i].skipped = true
 			e.emit.emit(protocol.EventLog, member.Name, "phase_skipped",
 				map[string]string{"guard": member.If})
@@ -150,7 +171,12 @@ func (e *execution) runGroupOnce(
 			if err != nil {
 				return nil, e.groupInfra(names, err.Error())
 			}
-			view.beginGroupRun()
+			if err := view.beginGroupRun(); err != nil {
+				return nil, e.groupInfra(names, err.Error())
+			}
+			// Whatever a member left in its private handoff directory is
+			// published at the merge below or discarded here, never both.
+			defer os.RemoveAll(view.scratch.handoff)
 			owner := members[i].Owner
 			if err := view.seedRole(owner, e.spec.Roster[owner]); err != nil {
 				return nil, e.groupInfra(names, fmt.Sprintf(
@@ -177,6 +203,13 @@ func (e *execution) runGroupOnce(
 		}
 		for name, report := range view.gateReports {
 			e.gateReports[name] = report
+		}
+		// A member's handoff notes join the chain's handoff directory only
+		// now, in declared order, each under its own folder: no sibling
+		// could read them mid-run, and none can overwrite another's.
+		if err := publishMemberHandoff(view.scratch.handoff, e.scratch.handoff, i, member.Name); err != nil {
+			e.emit.emit(protocol.EventError, member.Name, "handoff_merge_failed",
+				map[string]string{"error": err.Error()})
 		}
 	}
 	e.emit.emit(protocol.EventLog, "", "parallel_group_end",
@@ -206,6 +239,8 @@ func (e *execution) runMembers(
 
 	deaths := make([]int, len(members))
 	var terminals []memberTerminal
+	var panicked bool
+	var panicValue any
 	for pending := active; len(pending) > 0; {
 		results := make([]memberResult, len(members))
 		var wait sync.WaitGroup
@@ -235,10 +270,9 @@ func (e *execution) runMembers(
 			result := results[i]
 			switch {
 			case result.panicked:
-				// A panic in a member is a panic in the chain, exactly as it
-				// would be sequentially — surfaced here, on the chain's own
-				// goroutine, where Execute's deferred cleanup still runs.
-				panic(result.panicValue)
+				if !panicked {
+					panicked, panicValue = true, result.panicValue
+				}
 			case endsAttempt(result.run.outcome):
 				terminals = append(terminals, memberTerminal{index: i, run: result.run})
 			case result.died:
@@ -254,10 +288,25 @@ func (e *execution) runMembers(
 				runs[i].run = result.run
 			}
 		}
-		if len(terminals) > 0 {
+		if panicked || len(terminals) > 0 {
 			break
 		}
 		pending = next
+	}
+
+	if panicked {
+		// A panic in a member is a panic in the chain, exactly as it would
+		// be sequentially — re-raised on the chain's own goroutine, where
+		// Execute's deferred cleanup still runs. Siblings kept running until
+		// the stop, so the worktree is enforced first: a sibling's write
+		// must not outlive the attempt just because another member crashed.
+		_, breaches, err := enforceBoundary(
+			context.WithoutCancel(ctx), e.attempt.WorktreePath, before, []string{})
+		e.emit.emit(protocol.EventError, "", "parallel_group_panic", map[string]any{
+			"parallel_group": names, "panic": fmt.Sprint(panicValue),
+			"breaches": breaches, "enforcement_error": errorText(err),
+		})
+		panic(panicValue)
 	}
 
 	// The one enforcement, detached from the caller's context: cancellation
@@ -274,6 +323,13 @@ func (e *execution) runMembers(
 		return groupTerminalEnd(terminals)
 	}
 	return nil
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // endsAttempt reports whether a member's outcome ends the attempt.
@@ -359,6 +415,7 @@ func (e *execution) memberView(index int, member protocol.PhaseSpec) (*execution
 	}
 	scratch := *e.scratch
 	scratch.home = home
+	scratch.handoff = filepath.Join(e.scratch.memberHandoff, strconv.Itoa(index))
 	view := &execution{
 		runner:      e.runner,
 		attempt:     e.attempt,
@@ -383,10 +440,72 @@ func (e *execution) memberView(index int, member protocol.PhaseSpec) (*execution
 }
 
 // beginGroupRun clears what one group run's merge reads, keeping what the
-// member carries across runs: its session, transcript, and seeded HOME.
-func (e *execution) beginGroupRun() {
+// member carries across runs: its session, transcript, and seeded HOME. Its
+// private handoff directory starts empty every run.
+func (e *execution) beginGroupRun() error {
 	e.results = nil
 	e.pendingFields = nil
 	e.gateReports = make(map[string]protocol.GateReport)
 	e.touchedPaths = make(map[string]bool)
+	if err := os.RemoveAll(e.scratch.handoff); err != nil {
+		return fmt.Errorf("reset member handoff directory: %w", err)
+	}
+	if err := os.MkdirAll(e.scratch.handoff, 0o700); err != nil {
+		return fmt.Errorf("create member handoff directory: %w", err)
+	}
+	return nil
+}
+
+// memberHandoffFolder is where a member's notes land inside the chain's
+// handoff directory: handoff/parallel/<phase>, or the member's index when
+// its phase name is not a plain path element.
+func memberHandoffFolder(shared string, index int, phase string) string {
+	name := phase
+	if !filepath.IsLocal(name) || strings.ContainsAny(name, `/\`) {
+		name = "member-" + strconv.Itoa(index)
+	}
+	return filepath.Join(shared, "parallel", name)
+}
+
+// publishMemberHandoff copies a member's private notes into the chain's
+// handoff directory, replacing what an earlier run of the same member put
+// there. Only regular files and directories are copied: a symlink is how an
+// agent would point the next phase at something outside the scratch family.
+func publishMemberHandoff(private, shared string, index int, phase string) error {
+	entries, err := os.ReadDir(private)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	target := memberHandoffFolder(shared, index, phase)
+	if err := os.RemoveAll(target); err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	return filepath.WalkDir(private, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(private, path)
+		if err != nil {
+			return err
+		}
+		destination := filepath.Join(target, relative)
+		switch {
+		case entry.IsDir():
+			return os.MkdirAll(destination, 0o700)
+		case entry.Type().IsRegular():
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(destination, body, 0o600)
+		default:
+			return nil
+		}
+	})
 }

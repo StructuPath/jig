@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -518,6 +519,134 @@ func TestAMemberDeathReentersOnlyThatMemberAfterSiblingsFinish(t *testing.T) {
 }
 
 const twoMemberGroup = "parallel: [review-correctness, review-security]"
+
+// A repair that flips the field a member's guard reads must not skip the
+// member that rejected it: guards are judged on the group's first run only.
+// Sequentially, rerun-self never re-checks a guard, and a skipped phase
+// counts as passed — so a re-judged guard would let a repair silence its own
+// reviewer. A member skipped on the first run stays skipped.
+func TestARepairCannotFlipAGuardToSkipTheReviewerThatRejectedIt(t *testing.T) {
+	snapshot := strings.Replace(panelSnapshot(nil, panelGroup),
+		"    owner: security\n", "    owner: security\n    if: \"touches_auth == true\"\n", 1)
+	snapshot = strings.Replace(snapshot,
+		"    owner: maintainability\n", "    owner: maintainability\n    if: \"touches_db == true\"\n", 1)
+	f := newRepairFixture(t, snapshot, nil)
+	built := writes(map[string]string{"src/app.txt": "v1"}, "built the app")
+	built.Text = envelope(map[string]any{"status": "success", "summary": "built the app",
+		"touches_auth": true, "touches_db": false})
+	rebuilt := writes(map[string]string{"src/app.txt": "v2"}, "rebuilt")
+	rebuilt.Text = envelope(map[string]any{"status": "success", "summary": "moved the auth check away",
+		"touches_auth": false, "touches_db": true})
+	f.fake.Route(buildRole, built, rebuilt)
+	f.fake.Route(correctnessRole, approve("correct", nil), approve("correct", nil))
+	f.fake.Route(securityRole, reject("auth bypass"), approve("secure now", nil))
+	f.fake.Route(closerRole, success("wrapped up", nil))
+
+	outcome := executeWithin(t, f, 20*time.Second)
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("outcome = %s (%s), want accepted", outcome.State, outcome.Error)
+	}
+	if got := len(callsFor(f.fake, securityRole)); got != 2 {
+		t.Fatalf("security ran %d time(s), want 2: the repair flipped its guard, and it must re-judge anyway", got)
+	}
+	if got := len(callsFor(f.fake, maintainabilityRole)); got != 0 {
+		t.Fatalf("maintainability ran %d time(s): skipped on the first run, it must stay skipped", got)
+	}
+	statuses := phaseStatuses(t, outcome.Result)["review-security"]
+	if statuses[len(statuses)-1] != protocol.EnvelopeSuccess {
+		t.Fatalf("security's last result = %v, want its approval, never a skip", statuses)
+	}
+}
+
+var handoffLine = regexp.MustCompile(`Share working notes for later phases in: (\S+)`)
+
+func handoffDir(t *testing.T, prompt string) string {
+	t.Helper()
+	match := handoffLine.FindStringSubmatch(prompt)
+	if match == nil {
+		t.Errorf("prompt names no handoff directory: %.300q", prompt)
+		return ""
+	}
+	return match[1]
+}
+
+// Members never share a handoff directory: a sibling cannot read another's
+// notes mid-run, and two notes with the same name both survive, merged into
+// the chain's handoff directory in declared order under per-member folders.
+func TestMembersKeepPrivateHandoffNotesThatMergeAtTheJoin(t *testing.T) {
+	f := newRepairFixture(t, panelSnapshot(nil, twoMemberGroup), nil)
+	wrote := make(chan struct{})
+	correctness := approve("correct", nil)
+	correctness.Do = func(call enginetest.Call) {
+		defer close(wrote)
+		dir := handoffDir(t, call.Prompt)
+		if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("from correctness"), 0o600); err != nil {
+			t.Errorf("write correctness notes: %v", err)
+		}
+	}
+	security := approve("secure", nil)
+	security.Do = func(call enginetest.Call) {
+		<-wrote
+		dir := handoffDir(t, call.Prompt)
+		if _, err := os.Stat(filepath.Join(dir, "notes.md")); !os.IsNotExist(err) {
+			t.Errorf("security can see a sibling's notes mid-run in %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("from security"), 0o600); err != nil {
+			t.Errorf("write security notes: %v", err)
+		}
+	}
+	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+	f.fake.Route(correctnessRole, correctness)
+	f.fake.Route(securityRole, security)
+	f.fake.Route(maintainabilityRole, approve("maintainable", nil))
+	f.fake.Route(closerRole, success("wrapped up", nil))
+
+	outcome := executeWithin(t, f, 20*time.Second)
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("outcome = %s (%s), want accepted", outcome.State, outcome.Error)
+	}
+	shared := filepath.Join(f.scratch, "attempt-1", "handoff")
+	for member, want := range map[string]string{
+		"review-correctness": "from correctness", "review-security": "from security",
+	} {
+		body, err := os.ReadFile(filepath.Join(shared, "parallel", member, "notes.md"))
+		if err != nil || string(body) != want {
+			t.Fatalf("%s's merged notes = %q, %v; want %q", member, body, err, want)
+		}
+	}
+	if got := handoffDir(t, callsFor(f.fake, closerRole)[0].Prompt); got != shared {
+		t.Fatalf("the phase after the group was pointed at %s, want the chain's handoff %s", got, shared)
+	}
+}
+
+// A member that panics is a panic in the chain, but only after the group's
+// one enforcement: a sibling's worktree write is rolled back first.
+func TestAPanickingMemberStillHasItsSiblingsWritesRolledBack(t *testing.T) {
+	f := newRepairFixture(t, panelSnapshot(nil, twoMemberGroup), nil)
+	correctnessStarted := make(chan struct{})
+	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+	f.fake.Route(correctnessRole, enginetest.Step{Hang: true, Started: correctnessStarted,
+		Files: map[string]string{"planted.txt": "written before the crash"}})
+	f.fake.Route(securityRole, enginetest.Step{Do: func(enginetest.Call) {
+		<-correctnessStarted
+		panic("runtime blew up")
+	}})
+
+	recovered := func() (value any) {
+		defer func() { value = recover() }()
+		f.runner.Execute(context.Background(), f.attempt)
+		return nil
+	}()
+	if recovered != "runtime blew up" {
+		t.Fatalf("Execute recovered %v, want the member's panic re-raised", recovered)
+	}
+	if _, err := os.Stat(filepath.Join(f.repo, "planted.txt")); !os.IsNotExist(err) {
+		t.Fatalf("a sibling's write survived the panic: %v", err)
+	}
+	if !f.sink.has(protocol.EventError, "parallel_group_panic") {
+		t.Fatal("no parallel_group_panic event recording what enforcement found")
+	}
+}
 
 // A member that fails without firing its edge ends the attempt at the join,
 // as it would have sequentially: nothing after the group runs.
