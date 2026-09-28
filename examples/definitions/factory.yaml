@@ -30,9 +30,21 @@
 #
 # THE CI GATE. `publish.ci.wait` makes green CI part of `accepted`: after the
 # pull request exists, the worker polls its head's checks for up to 30
-# minutes. Red or timed-out CI ends the job accepted_unpublished with the
-# failing checks named; push a fix to the branch and the publish retry
-# re-judges CI on the new head.
+# minutes. Timed-out CI ends the job accepted_unpublished with the pending
+# checks named; push a fix to the branch and the publish retry re-judges CI
+# on the new head.
+#
+# THE CI REPAIR. `on_fail` repairs red CI inside the attempt, up to two
+# rounds. The failing checks and the tail of each failed Actions job's log
+# go to `build`; then EVERY phase after it runs again — commit, test, the
+# three reviewers, the risk classifier, the extra review — and only a fix
+# that passes all of them and is not held is pushed to the same pull
+# request. The classifier scores a change that edits CI or lint
+# configuration, or removes more test lines than it adds, as not low, so a
+# "fix" that weakens a check instead of the code is held for a person. A
+# round that fails, is held, or changes nothing ends the job
+# accepted_unpublished, as red CI did before; the publish retry judges CI
+# but never repairs.
 #
 # THE ROSTER. Builders and reviewers are `opus`; the planner and the extra
 # high-risk reviewer are `sonnet`. `effort` is medium for building to a plan
@@ -119,6 +131,11 @@ roster:
       field belongs to the builder. List only problems you would block the
       merge for; for each, give the file and line, why it is wrong, and how
       to show it fails.
+
+      A change that deletes or weakens tests, lint rules, or CI configuration
+      is blocking unless the task asked for exactly that: a fix must make the
+      checks pass, not make them check less. This matters most when the
+      builder is repairing red CI.
 
       Your "status" is "success" whenever you completed the review. The
       verdict travels in "approved", never in "status": a rejection you
@@ -335,15 +352,25 @@ phases:
     command: |
       set -eu
       base="${JIG_BASE_SHA:?JIG_BASE_SHA is required}"
-      pattern='(^|/)(auth|authn|authz|login|session|secret|token|password|crypto|migrations?|schema|deploy|infra|terraform|helm|k8s)([./_-]|$)|(^|/)\.github/workflows/|(^|/)Dockerfile|(^|/)go\.mod$|(^|/)package(-lock)?\.json$'
+      pattern='(^|/)(auth|authn|authz|login|session|secret|token|password|crypto|migrations?|schema|deploy|infra|terraform|helm|k8s)([./_-]|$)|(^|/)\.github/|(^|/)Dockerfile|(^|/)go\.mod$|(^|/)package(-lock)?\.json$'
+      # Checks a change could weaken to get CI green: lint and test runner
+      # configuration is always sensitive, and a test file that loses more
+      # lines than it gains is too. Adding tests is ordinary work.
+      checks='(^|/)\.(golangci|eslintrc|prettierrc|stylelintrc|flake8|pylintrc|rubocop)[^/]*$|(^|/)(jest|vitest|karma|playwright)\.config\.[a-z]+$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini|\.pre-commit-config\.yaml)$'
+      tests='(_test\.go|_test\.py|\.(test|spec)\.[cm]?[jt]sx?|_spec\.rb)$|(^|/)(tests?|__tests__|spec)/'
       threshold=400
       files=$(git diff --name-only "$base" HEAD)
       lines=$(git diff --numstat "$base" HEAD | awk '{ total += $1 + $2 } END { print total + 0 }')
-      risky=$(printf '%s\n' "$files" | grep -E "$pattern" || true)
+      # The pattern reaches awk through the environment: `awk -v` would
+      # process its backslashes and turn `\.` into "any character".
+      shrunk=$(git diff --numstat "$base" HEAD | tests="$tests" awk '$3 ~ ENVIRON["tests"] && $2 > $1 { print $3 }')
+      risky=$( { printf '%s\n' "$files" | grep -E "$pattern|$checks" || true; printf '%s\n' "$shrunk"; } | sed '/^$/d' | sort -u)
       risky_json=$(printf '%s\n' "$risky" | sed '/^$/d' | sed 's/\\/\\\\/g; s/"/\\"/g; s/.*/"&"/' | paste -sd, -)
       risk=low
       reason="no sensitive paths, $lines lines changed (threshold $threshold)"
-      if [ -n "$risky" ]; then
+      if [ -n "$shrunk" ]; then
+        risk=high; reason="removes more test lines than it adds"
+      elif [ -n "$risky" ]; then
         risk=high; reason="touches sensitive paths"
       elif [ "$lines" -gt "$threshold" ]; then
         risk=high; reason="$lines lines changed exceeds threshold $threshold"
@@ -360,4 +387,5 @@ publish:
   hold_when: "risk != low"
   ci:
     wait: true
+    on_fail: {run: build, budget: 2}
     timeout: 30m
