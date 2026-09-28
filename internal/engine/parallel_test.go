@@ -759,6 +759,23 @@ func TestAMemberOnTheSendBudgetStopsItsSiblingAndEndsTheAttempt(t *testing.T) {
 	if !f.sink.has(protocol.EventError, "attempt_send_budget_exhausted") {
 		t.Fatal("no attempt_send_budget_exhausted event")
 	}
+	// The stopped sibling still closes its agent_start, with its killed send
+	// counted as unmetered rather than free (R1).
+	var stopped struct {
+		Outcome   string `json:"outcome"`
+		Unmetered int    `json:"unmetered_sends"`
+	}
+	for _, event := range f.sink.all() {
+		if event.Type == protocol.EventAgentEnd && event.Phase == "review-correctness" {
+			if err := json.Unmarshal(event.Payload, &stopped); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if stopped.Outcome != protocol.AgentStopped || stopped.Unmetered != 1 {
+		t.Fatalf("stopped sibling's agent_end = %+v, want outcome %q with 1 unmetered send",
+			stopped, protocol.AgentStopped)
+	}
 }
 
 // Precedence: a breach outranks the send budget, which proves the one

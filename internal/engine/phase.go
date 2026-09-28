@@ -816,6 +816,8 @@ func (run phaseRun) agentOutcome() string {
 		return protocol.AgentCeiling
 	case phaseSendBudget:
 		return protocol.AgentSendBudget
+	case phaseStopped:
+		return protocol.AgentStopped
 	}
 	return protocol.AgentFailed
 }
@@ -1189,13 +1191,9 @@ func (e *execution) runAgentPhaseAttempt(
 			if _, terminal := e.enforceWriteBoundary(
 				ctx, phase, entry, started, before, role.Writes); terminal != nil {
 				terminal.failure = detail + " — and " + terminal.failure
+				agentEnd(terminal.agentOutcome())
 				return *terminal, false
 			}
-		if _, terminal := e.enforceWriteBoundary(
-			ctx, phase, entry, started, before, role.Writes); terminal != nil {
-			terminal.failure = detail + " — and " + terminal.failure
-			agentEnd(terminal.agentOutcome())
-			return *terminal, false
 		}
 		agentEnd(protocol.AgentFailed)
 		e.recordResult(protocol.PhaseResult{
@@ -1301,6 +1299,7 @@ func (e *execution) runAgentPhaseAttempt(
 	if !e.grouped {
 		touched, terminal := e.enforceWriteBoundary(ctx, phase, entry, started, before, role.Writes)
 		if terminal != nil {
+			agentEnd(terminal.agentOutcome())
 			return *terminal, false
 		}
 		for _, path := range touched {
@@ -1310,17 +1309,6 @@ func (e *execution) runAgentPhaseAttempt(
 			e.emit.emit(protocol.EventLog, phase.Name, "paths_touched",
 				map[string]any{"role": phase.Owner, "paths": touched})
 		}
-	touched, terminal := e.enforceWriteBoundary(ctx, phase, entry, started, before, role.Writes)
-	if terminal != nil {
-		agentEnd(terminal.agentOutcome())
-		return *terminal, false
-	}
-	for _, path := range touched {
-		e.touchedPaths[path] = true
-	}
-	if len(touched) > 0 {
-		e.emit.emit(protocol.EventLog, phase.Name, "paths_touched",
-			map[string]any{"role": phase.Owner, "paths": touched})
 	}
 
 	e.mergeAgentFields(phase.Name, phase.Owner, envelope.Fields)
@@ -1495,7 +1483,7 @@ func (s *agentSender) send(ctx context.Context, prompt string) (runtime.Result, 
 			s.abandon(handle)
 			return runtime.Result{}, sendCancelled, "cancelled during phase " + s.phase
 		case <-s.stop:
-			killAndDrain(handle)
+			s.abandon(handle)
 			return runtime.Result{}, sendStopped, "stopped during phase " + s.phase +
 				": a parallel group sibling ended the attempt"
 		}
