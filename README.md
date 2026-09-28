@@ -429,6 +429,10 @@ The plan this repository was built from is
 requirements (R1–R21) and key technical decisions (KTD1–KTD12) that the code
 comments cite by name.
 
+To trial the factory on a real repository and judge it by the numbers, follow
+[`docs/dogfooding.md`](docs/dogfooding.md): preflight, a spend-ceiling check
+before each batch, and a results table filled from `jig report`.
+
 ---
 
 ## License

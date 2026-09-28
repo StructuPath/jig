@@ -168,7 +168,7 @@ Every round received the failed job's real log tail (10–10.05 KB) and re-ran e
 - **Two jig bugs the fakes could not see.** `gh` refuses to print Actions job logs (they contain escape codes) without `--allow-escape-sequences`, so every repair would have lost its log. On macOS, jig seeded Claude's login from a stale `~/.claude/.credentials.json` before the keychain, and the first attempt at run 1 died on "OAuth session expired" before any work.
 - **One leak in the gate's own design.** An earlier run 2 passed the rule list through a repo *variable*, which GitHub prints in the log's `env:` block. The round's builder read `CI_RULES=changes,example,bench` from the log tail and satisfied all three rules in one round, so it was accepted rather than exhausted: correct agent behaviour, wrong test. With the list moved into a secret, run 2 exhausted as designed.
 
-Spend: $9.95 for the three gate runs; $13.08 including the leaked run 2 ($3.13). The failed-auth attempt spent nothing.
+Spend: $9.95 for the three gate runs; $13.08 including the leaked run 2 ($3.13). The failed-auth attempt spent nothing. These figures, and the per-run costs above, are upper bounds: U1 of the follow-up plan (PR #25) found that Claude Code's `total_cost_usd` is cumulative per session, and v0.2.0 summed it per send, so every resumed session was overcounted.
 
 ---
 
