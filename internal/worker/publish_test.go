@@ -77,6 +77,10 @@ func (g *fakeGateway) CommitChecks(_ context.Context, _ string, sha string) ([]C
 	return g.checks(sha, g.checkPolls)
 }
 
+func (g *fakeGateway) FailedCheckLogs(_ context.Context, _ string, checks []CICheck) []CICheck {
+	return checks
+}
+
 func (g *fakeGateway) counts() (created, adopted int) {
 	g.mutex.Lock()
 	defer g.mutex.Unlock()

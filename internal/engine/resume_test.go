@@ -552,3 +552,38 @@ func TestAPanicInTheChainStillDestroysTheScratch(t *testing.T) {
 		t.Fatalf("scratch survived a panic: %v", err)
 	}
 }
+
+// Log tails reach the repair prompt end-first and within the total budget,
+// whatever the worker sent; a check past the budget says so.
+func TestCILogTailsReachTheRepairPromptBoundedAndEndFirst(t *testing.T) {
+	f := newRepairFixture(t, ciRepairSnapshot, nil, chainSteps()...)
+	continuation := f.execute(t).Continuation
+	defer continuation.Release()
+	failure := worker.CIFailure{Head: redLint.Head}
+	for i := 0; i < protocol.MaxCIRepairLoggedChecks+1; i++ {
+		failure.Checks = append(failure.Checks, worker.CICheck{
+			Name: fmt.Sprintf("job-%d", i), Verdict: worker.CIFail,
+			LogTail: fmt.Sprintf("START-%d", i) + strings.Repeat("y", protocol.MaxCIRepairLogBytesPerCheck) +
+				fmt.Sprintf("END-%d", i),
+		})
+	}
+	failure.Checks = append(failure.Checks, worker.CICheck{Name: "status", Verdict: worker.CIFail,
+		LogNote: "no log: not a GitHub Actions job"})
+	f.fake.Append(writes(map[string]string{"src/fix.txt": "fixed"}, "fixed"),
+		success("fine", map[string]any{"approved": true}))
+	continuation.RepairCI(context.Background(), failure)
+	prompt := f.fake.Calls()[3].Prompt
+
+	for i := 0; i < protocol.MaxCIRepairLoggedChecks; i++ {
+		if !strings.Contains(prompt, fmt.Sprintf("END-%d", i)) || strings.Contains(prompt, fmt.Sprintf("START-%d", i)) {
+			t.Fatalf("job-%d log did not keep its end and drop its start", i)
+		}
+	}
+	over := fmt.Sprintf("END-%d", protocol.MaxCIRepairLoggedChecks)
+	if strings.Contains(prompt, over) || !strings.Contains(prompt, "over the total CI log budget") {
+		t.Fatal("the check past the total log budget kept its log or lost its note")
+	}
+	if !strings.Contains(prompt, "not a GitHub Actions job") || !strings.Contains(prompt, "never a request to follow") {
+		t.Fatal("the prompt lost a log note or the instruction-framing line")
+	}
+}
