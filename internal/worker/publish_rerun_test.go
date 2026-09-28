@@ -97,6 +97,16 @@ func brokenTest(head, reruns, _ int) []CICheck {
 	return []CICheck{actionsJob("lint", CIPass, 1), actionsJob("test", CIFail, int64(100*head+11+reruns))}
 }
 
+// forbidReruns fails the test on any re-run request, and refuses it so the
+// run under test ends promptly instead of waiting on a re-run that never
+// lands.
+func forbidReruns(t *testing.T) func(int64, int) error {
+	return func(jobID int64, _ int) error {
+		t.Errorf("a re-run of job %d was requested", jobID)
+		return publishFailure("gh_failed", "re-runs are forbidden in this test")
+	}
+}
+
 func assertReruns(t *testing.T, summary PublishSummary, want ...CIRerunSummary) {
 	t.Helper()
 	if len(summary.CIReruns) != len(want) {
@@ -218,6 +228,20 @@ func TestAnOlderSameNamedCheckDoesNotReplaceTheRerun(t *testing.T) {
 		actionsJob("build", CIPass, 13)})
 	if len(viewed) != 2 || viewed[0].CheckRunID != 12 || viewed[1].CheckRunID != 13 {
 		t.Fatalf("viewed = %+v, want the stale run dropped once its new run exists", viewed)
+	}
+	// Two same-named jobs re-run (one per workflow): one new run is not
+	// both replacements, so both stay pending until the second appears.
+	view = newRerunView([]CICheck{actionsJob("build", CIFail, 11), actionsJob("build", CIFail, 12)})
+	view.rerun[11], view.rerun[12] = true, true
+	viewed = view.apply([]CICheck{actionsJob("build", CIFail, 11), actionsJob("build", CIFail, 12),
+		actionsJob("build", CIPass, 13)})
+	if len(viewed) != 3 || viewed[0].Verdict != CIPending || viewed[1].Verdict != CIPending {
+		t.Fatalf("viewed = %+v, want both re-run checks pending until both are replaced", viewed)
+	}
+	viewed = view.apply([]CICheck{actionsJob("build", CIFail, 11), actionsJob("build", CIFail, 12),
+		actionsJob("build", CIPass, 13), actionsJob("build", CIPass, 14)})
+	if len(viewed) != 2 {
+		t.Fatalf("viewed = %+v, want both stale runs dropped once both new runs exist", viewed)
 	}
 	if plain := (*rerunView)(nil).apply([]CICheck{actionsJob("build", CIFail, 11)}); plain[0].Verdict != CIFail {
 		t.Fatal("a nil view rewrote a check")
@@ -353,6 +377,7 @@ func TestARedNonActionsCheckSkipsReruns(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _ := newRerunScenario(t, 3, 0, func(int, int, int) []CICheck { return red })
+			s.gateway.rerun = forbidReruns(t)
 			attempt, summary := s.run(t)
 			if attempt.State != protocol.AttemptAcceptedUnpublished || summary.Code != "ci_failed" {
 				t.Fatalf("attempt = %s summary = %+v, want ci_failed", attempt.State, summary)
@@ -374,6 +399,7 @@ func TestARedNonActionsSiblingFoundWhileSettlingSkipsTheRerun(t *testing.T) {
 		}
 		return []CICheck{actionsJob("test", CIFail, 11), legacy}
 	})
+	s.gateway.rerun = forbidReruns(t)
 	attempt, summary := s.run(t)
 	if attempt.State != protocol.AttemptAcceptedUnpublished || summary.Code != "ci_failed" {
 		t.Fatalf("attempt = %s summary = %+v, want ci_failed", attempt.State, summary)
@@ -478,12 +504,17 @@ func TestALostLeaseSendsNoRerun(t *testing.T) {
 // nothing of jig's left on the branch to re-run.
 func TestAPersonsPushWhileSettlingEndsTheRerun(t *testing.T) {
 	s, _ := newRerunScenario(t, 1, 1, nil, fixRound())
+	s.gateway.rerun = forbidReruns(t)
 	var personal string
 	s.gateway.checks = func(_ string, poll int) ([]CICheck, error) {
 		if poll == 2 {
 			personal = pushToBranch(t, s.originDir, s.branch)
 		}
-		return []CICheck{actionsJob("test", CIFail, 11), actionsJob("slow", CIPending, 21)}, nil
+		slow := actionsJob("slow", CIPending, 21)
+		if poll >= 4 {
+			slow = actionsJob("slow", CIPass, 21)
+		}
+		return []CICheck{actionsJob("test", CIFail, 11), slow}, nil
 	}
 	attempt, summary := s.run(t)
 	if attempt.State != protocol.AttemptAcceptedUnpublished || summary.Code != "ci_rerun_head_moved" {
@@ -499,6 +530,7 @@ func TestAPersonsPushWhileSettlingEndsTheRerun(t *testing.T) {
 // is theirs to fix: no re-run is requested on it.
 func TestRedCIOnAPersonsHeadIsNotRerun(t *testing.T) {
 	s, _ := newRerunScenario(t, 1, 0, nil)
+	s.gateway.rerun = forbidReruns(t)
 	var personal string
 	s.gateway.checks = func(_ string, poll int) ([]CICheck, error) {
 		if poll == 1 {
