@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -474,6 +475,53 @@ phases:
 	mustReject(t, base+"publish: {ci: {wait: true, timeout: soon}}\n", "publish: ci: timeout", "not a duration")
 	mustReject(t, base+"publish: {ci: {wait: true, timeout: 30s}}\n", "publish: ci: timeout", "outside")
 	mustReject(t, base+"publish: {ci: {wait: true, timeout: 7h}}\n", "publish: ci: timeout", "outside")
+}
+
+func TestPublishCIRepairIsBoundedAndJudgedByTheLaterChain(t *testing.T) {
+	const base = `
+name: ci-repair
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+  reviewer: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+  - {name: test, kind: code, owner: builder, command: "go test ./..."}
+  - {name: review, kind: agent, owner: reviewer}
+`
+	spec := mustParse(t, base+"publish: {ci: {wait: true, on_fail: {run: build, resume_from: test, budget: 2}}}\n")
+	repair := spec.Publish.CI.OnFail
+	if repair == nil || repair.Run != "build" || repair.ResumeFrom != "test" || repair.Budget != 2 {
+		t.Fatalf("on_fail = %+v, want run build, resume_from test, budget 2", repair)
+	}
+	mustParse(t, base+fmt.Sprintf(
+		"publish: {ci: {wait: true, on_fail: {run: build, resume_from: review, budget: %d}}}\n", MaxCIRepairRounds))
+	if spec := mustParse(t, base+"publish: {ci: {wait: true}}\n"); spec.Publish.CI.OnFail != nil {
+		t.Fatalf("on_fail = %+v, want nil when undeclared", spec.Publish.CI.OnFail)
+	}
+
+	for _, rejected := range []struct {
+		name, onFail string
+		want         []string
+	}{
+		{"no wait", "{run: build, resume_from: test, budget: 1}", []string{"wait: true"}},
+		{"undefined run", "{run: fix, resume_from: test, budget: 1}", []string{"run", `"fix"`}},
+		{"code run", "{run: test, resume_from: review, budget: 1}", []string{`"test"`, "agent phase"}},
+		{"undefined resume_from", "{run: build, resume_from: lint, budget: 1}", []string{"resume_from", `"lint"`}},
+		{"resume_from is run", "{run: build, resume_from: build, budget: 1}", []string{"must come after"}},
+		{"resume_from before run", "{run: review, resume_from: test, budget: 1}", []string{"must come after"}},
+		{"zero budget", "{run: build, resume_from: test}", []string{"budget 0", "outside"}},
+		{"budget over cap", fmt.Sprintf("{run: build, resume_from: test, budget: %d}", MaxCIRepairRounds+1),
+			[]string{"outside"}},
+	} {
+		t.Run(rejected.name, func(t *testing.T) {
+			wait := "true"
+			if rejected.name == "no wait" {
+				wait = "false"
+			}
+			mustReject(t, base+fmt.Sprintf("publish: {ci: {wait: %s, on_fail: %s}}\n", wait, rejected.onFail),
+				append([]string{"publish: ci: on_fail"}, rejected.want...)...)
+		})
+	}
 }
 
 func TestNegativeRoleBudgetIsRejected(t *testing.T) {
