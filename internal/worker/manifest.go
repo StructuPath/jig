@@ -72,13 +72,15 @@ type attemptManifest struct {
 	Branch        string `json:"branch"`
 
 	// ProcessGroups is the SET of agent process groups live in this attempt
-	// right now. A parallel reviewer group runs several agent subprocesses at
-	// once, each in its own group, and start-time reconciliation must stop
-	// every one a crashed worker left behind.
+	// right now, written only while more than one is live. A parallel
+	// reviewer group runs several agent subprocesses at once, each in its
+	// own group, and start-time reconciliation must stop every one a crashed
+	// worker left behind.
 	ProcessGroups []int64 `json:"process_groups,omitempty"`
 	// ProcessGroupID and ProcessActive are the single-group record older jig
-	// versions wrote. They are still read — reconciliation stops a group a
-	// crashed older worker recorded — but no longer written.
+	// versions read and wrote. They still name the lowest live group
+	// (writeProcessGroups), so a worker rolled back to an older binary stops
+	// at least that one.
 	ProcessGroupID int64 `json:"process_group_id,omitempty"`
 	ProcessActive  bool  `json:"process_active"`
 

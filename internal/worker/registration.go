@@ -188,8 +188,8 @@ func (w *Worker) RecordProcessGroup(attemptID string, processGroupID int64, acti
 		return fmt.Errorf("process group %d can never name a real group", processGroupID)
 	}
 	_, err := w.manifests.update(attemptID, func(manifest *attemptManifest) error {
-		groups := make([]int64, 0, len(manifest.ProcessGroups)+1)
-		for _, groupID := range manifest.ProcessGroups {
+		groups := make([]int64, 0, len(manifest.ProcessGroups)+2)
+		for _, groupID := range recordedProcessGroups(*manifest) {
 			if groupID != processGroupID {
 				groups = append(groups, groupID)
 			}
@@ -198,10 +198,30 @@ func (w *Worker) RecordProcessGroup(attemptID string, processGroupID int64, acti
 			groups = append(groups, processGroupID)
 		}
 		sort.Slice(groups, func(i, j int) bool { return groups[i] < groups[j] })
-		manifest.ProcessGroups = groups
+		writeProcessGroups(manifest, groups)
 		return nil
 	})
 	return err
+}
+
+// writeProcessGroups stores the live set so a downgraded worker still sees
+// what it can. The legacy single-group fields always name the lowest live
+// group, so an older jig's reconciliation stops at least that one; the full
+// set is written only when more than one group is live. One live group
+// therefore leaves a manifest an older binary reads exactly as before, and
+// only the rare crash mid-group leaves one it refuses to read — and an
+// older jig fails closed on an unreadable manifest, retaining the worktree
+// rather than guessing.
+func writeProcessGroups(manifest *attemptManifest, groups []int64) {
+	manifest.ProcessActive = len(groups) > 0
+	manifest.ProcessGroupID = 0
+	manifest.ProcessGroups = nil
+	if len(groups) > 0 {
+		manifest.ProcessGroupID = groups[0]
+	}
+	if len(groups) > 1 {
+		manifest.ProcessGroups = groups
+	}
 }
 
 // Config configures the single implicit worker.

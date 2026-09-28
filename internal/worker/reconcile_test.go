@@ -165,6 +165,90 @@ func TestReconcileStopsEveryLiveGroupOfAParallelGroup(t *testing.T) {
 	}
 }
 
+// preSetManifest is the manifest shape jig wrote before the process-group
+// set, decoded as that version did: strictly, unknown fields refused.
+type preSetManifest struct {
+	SchemaVersion   int       `json:"schema_version"`
+	WorkerID        string    `json:"worker_id"`
+	JobID           string    `json:"job_id"`
+	AttemptID       string    `json:"attempt_id"`
+	AttemptNumber   int       `json:"attempt_number"`
+	Repository      string    `json:"repository"`
+	RepositoryDir   string    `json:"repository_dir"`
+	BaseSHA         string    `json:"base_sha"`
+	WorktreePath    string    `json:"worktree_path"`
+	Branch          string    `json:"branch"`
+	ProcessGroupID  int64     `json:"process_group_id,omitempty"`
+	ProcessActive   bool      `json:"process_active"`
+	Lifecycle       string    `json:"lifecycle"`
+	TerminalState   string    `json:"terminal_state,omitempty"`
+	RetentionReason string    `json:"retention_reason,omitempty"`
+	CleanupIntent   string    `json:"cleanup_intent,omitempty"`
+	CleanupResult   string    `json:"cleanup_result,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+// A worker rolled back to a jig that predates the set still sees a live
+// group: the legacy fields always name the lowest live one. With one group
+// live the manifest is exactly the old shape; with several, the legacy
+// fields still name the lowest.
+func TestAnOlderReaderStillSeesALiveProcessGroup(t *testing.T) {
+	h := newHarness(t)
+	dataDir := filepath.Join(t.TempDir(), "worker")
+	w, attemptID := claimOneAttempt(t, h, dataDir)
+	path := filepath.Join(dataDir, "attempts", attemptID+".json")
+	readOld := func() (preSetManifest, error) {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var old preSetManifest
+		return old, decodeStrictJSON(body, &old)
+	}
+
+	if err := w.RecordProcessGroup(attemptID, 5100, true); err != nil {
+		t.Fatal(err)
+	}
+	old, err := readOld()
+	if err != nil {
+		t.Fatalf("an older reader cannot read a one-group manifest: %v", err)
+	}
+	if !old.ProcessActive || old.ProcessGroupID != 5100 {
+		t.Fatalf("older reader sees active=%v group=%d, want the live group 5100", old.ProcessActive, old.ProcessGroupID)
+	}
+
+	for _, groupID := range []int64{5300, 5200} {
+		if err := w.RecordProcessGroup(attemptID, groupID, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.RecordProcessGroup(attemptID, 5100, false); err != nil {
+		t.Fatal(err)
+	}
+	current, err := w.manifests.load(attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.ProcessActive || current.ProcessGroupID != 5200 {
+		t.Fatalf("legacy fields = active %v group %d, want the lowest live group 5200",
+			current.ProcessActive, current.ProcessGroupID)
+	}
+
+	if err := w.RecordProcessGroup(attemptID, 5200, false); err != nil {
+		t.Fatal(err)
+	}
+	if old, err = readOld(); err != nil || !old.ProcessActive || old.ProcessGroupID != 5300 {
+		t.Fatalf("older reader after the set shrank to one: %+v, %v; want active group 5300", old, err)
+	}
+	if err := w.RecordProcessGroup(attemptID, 5300, false); err != nil {
+		t.Fatal(err)
+	}
+	if old, err = readOld(); err != nil || old.ProcessActive {
+		t.Fatalf("older reader after every group ended: %+v, %v; want nothing live", old, err)
+	}
+}
+
 // Concurrent records — members starting at once — all land.
 func TestConcurrentProcessGroupRecordsAllLand(t *testing.T) {
 	h := newHarness(t)
