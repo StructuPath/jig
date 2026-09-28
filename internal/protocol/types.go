@@ -91,6 +91,9 @@ const (
 	AgentCancelled  = "cancelled"
 	AgentCeiling    = "ceiling"
 	AgentSendBudget = "send_budget"
+	// AgentStopped: a parallel group member stopped because a sibling ended
+	// the attempt.
+	AgentStopped = "stopped"
 )
 
 // Envelope statuses. Success must be earned: everything that constructs a

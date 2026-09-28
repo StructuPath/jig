@@ -29,6 +29,8 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/StructuPath/jig/internal/protocol"
@@ -207,7 +209,7 @@ func (r *Runner) Execute(ctx context.Context, attempt Attempt) worker.Outcome {
 		reportedBy:   make(map[string]string),
 		gateReports:  make(map[string]protocol.GateReport),
 		seededRoles:  make(map[string]bool),
-		phaseEntries: make(map[string]int),
+		counters:     &attemptCounters{phaseEntries: make(map[string]int)},
 		touchedPaths: make(map[string]bool),
 		sessionKey:   attempt.Claim.Attempt.ID,
 	}
@@ -239,7 +241,6 @@ type execution struct {
 	timeouts    timeoutConfig
 	deadline    time.Time
 	sessions    map[string]*runtime.Session
-	sessionSeq  int
 	transcripts map[string][]exchange
 	fieldView   map[string]any
 	// publishHeld is the hold reason once publishHold() fired, so the summary
@@ -254,17 +255,78 @@ type execution struct {
 	results      []protocol.PhaseResult
 	gateReports  map[string]protocol.GateReport
 	seededRoles  map[string]bool
-	phaseEntries map[string]int
 	touchedPaths map[string]bool
 	// sessionKey prefixes every runtime session key. It is the attempt id
 	// for the chain and gains a round suffix in each CI repair round, whose
 	// sessions start in a fresh HOME and must never collide with a key the
 	// runtime already saw.
 	sessionKey string
+	// counters are the attempt-wide numbers a parallel group's members share
+	// with the chain: sends, the session-key sequence, and phase entries.
+	counters *attemptCounters
+
+	// members are the parallel group's private member views, by phase name,
+	// kept across group runs within one chain or round (parallel.go). Nil
+	// until the group first runs; forgotten when the HOMEs are wiped.
+	members map[string]*execution
+	// grouped marks a member view: it runs inside a group, which owns the
+	// write boundary, so the view takes no snapshot, enforces nothing, and
+	// never rolls back — and defers its field merge to the join.
+	grouped bool
+	// stop is the group's stop signal, selected by every member send. Nil
+	// outside a group, where it never fires.
+	stop <-chan struct{}
+	// pendingFields are a member view's envelope merges, replayed into the
+	// chain's field view in declared order at the join.
+	pendingFields []fieldMerge
+	// handoffSeed fingerprints the pre-group notes copied into a member's
+	// private handoff directory, so the join publishes only what the member
+	// itself wrote or changed.
+	handoffSeed map[string]string
+}
+
+// fieldMerge is one deferred mergeAgentFields call.
+type fieldMerge struct {
+	phase, role string
+	fields      map[string]any
+}
+
+// attemptCounters are the attempt-wide counters. They are shared by pointer
+// between the chain and a parallel group's member views, so every access is
+// atomic or locked.
+type attemptCounters struct {
 	// sends counts every prompt send this attempt has issued, across phases,
-	// parse corrections, gate corrections, crash re-entries, and repair
-	// dispatches alike — the one number the whole ladder is bounded by.
-	sends int
+	// parse corrections, gate corrections, crash re-entries, repair
+	// dispatches, and group members alike — the one number the whole ladder
+	// is bounded by.
+	sends atomic.Int64
+	// sessionSeq numbers fresh session keys so no two are ever alike.
+	sessionSeq atomic.Int64
+
+	mutex        sync.Mutex
+	phaseEntries map[string]int
+}
+
+// acquireSend takes one send from the budget, or refuses when the budget is
+// spent. Check and increment are one atomic step: two members racing for
+// the last send cannot both win it.
+func (c *attemptCounters) acquireSend(limit int) bool {
+	for {
+		current := c.sends.Load()
+		if current >= int64(limit) {
+			return false
+		}
+		if c.sends.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (c *attemptCounters) nextEntry(phase string) int {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.phaseEntries[phase]++
+	return c.phaseEntries[phase]
 }
 
 // ---- attempt-level control -------------------------------------------------
@@ -319,7 +381,7 @@ func (e *execution) conclude(end chainEnd) worker.Outcome {
 		// Its own terminal cause, like the ceiling: the correction ladder ran
 		// out of budget, which is neither a phase that failed nor a clock.
 		e.emit.emit(protocol.EventError, "", "attempt_send_budget_exhausted",
-			map[string]any{"max_sends": e.runner.config.MaxAttemptSends, "sends": e.sends})
+			map[string]any{"max_sends": e.runner.config.MaxAttemptSends, "sends": e.counters.sends.Load()})
 		return worker.Outcome{State: protocol.AttemptFailed,
 			Error: end.diagnostic, Result: e.summaryJSON(nil)}
 	case endAborted, endFailed:
@@ -526,9 +588,19 @@ func (e *execution) freshenLease(ctx context.Context) {
 // to the first phase run. A fresh edgeUses per call means each CI repair
 // round gets fresh per-edge budgets; the attempt-wide sends and ceiling are
 // what bound the rounds together.
+//
+// A declared parallel group runs as ONE step: the whole group through the
+// group runner, then the chain resumes after its last member.
 func (e *execution) runChain(ctx context.Context, start int, previous *parsedEnvelope) chainEnd {
 	edgeUses := make(map[string]int)
-	for _, phase := range e.spec.Phases[start:] {
+	groupStart, groupEnd, grouped := e.spec.ParallelRange()
+	if grouped && start > groupStart && start < groupEnd {
+		// Validation keeps every chain entry point outside the group.
+		return chainEnd{endFailed, fmt.Sprintf(
+			"chain cannot start at phase %q, inside the parallel group", e.spec.Phases[start].Name)}
+	}
+	for index := start; index < len(e.spec.Phases); index++ {
+		phase := e.spec.Phases[index]
 		if e.cancelled() {
 			return chainEnd{endCancelled, "cancelled between phases"}
 		}
@@ -536,6 +608,17 @@ func (e *execution) runChain(ctx context.Context, start int, previous *parsedEnv
 			return chainEnd{endCeiling, ""}
 		}
 		e.freshenLease(ctx)
+		if grouped && index == groupStart {
+			end, envelope := e.runGroup(ctx, e.spec.Phases[groupStart:groupEnd], previous, edgeUses)
+			if end != nil {
+				return *end
+			}
+			if envelope != nil {
+				previous = envelope
+			}
+			index = groupEnd - 1
+			continue
+		}
 		if phase.If != "" && !guardHolds(phase.If, e.fieldView) {
 			e.recordResult(protocol.PhaseResult{
 				Phase: phase.Name, Kind: phase.Kind, Status: phaseStatusSkipped,
@@ -563,70 +646,93 @@ func (e *execution) runChain(ctx context.Context, start int, previous *parsedEnv
 func (e *execution) runPhaseWithEdge(
 	ctx context.Context, phase protocol.PhaseSpec, previous *parsedEnvelope, edgeUses map[string]int,
 ) (*chainEnd, *parsedEnvelope) {
-	edge := phase.OnFail
 	for {
 		run := e.runPhaseOnce(ctx, phase, previous)
 		if end := run.attemptEnd(); end != nil {
 			return end, nil
 		}
-
-		triggered := false
-		if edge != nil && run.hasEnvelope {
-			switch phase.Kind {
-			case protocol.PhaseKindCode:
-				triggered = run.outcome == phaseFailed
-			case protocol.PhaseKindAgent:
-				predicate, err := protocol.ParsePredicate(edge.When)
-				triggered = err == nil && predicateHolds(predicate, run.envelope.Fields)
-			}
-		}
-		if !triggered {
+		if !edgeTriggered(phase, run) {
 			if run.outcome == phaseFailed {
 				return &chainEnd{endFailed, run.failure}, nil
 			}
 			return nil, run.envelopeRef()
 		}
-
-		if edgeUses[phase.Name] >= edge.Budget {
-			policy := protocol.RepairExhaustedProceed
-			if edgeExhaustionFailsJob(edge) {
-				policy = protocol.RepairExhaustedFailJob
-			}
-			e.emit.emit(protocol.EventLog, phase.Name, "repair_exhausted", map[string]any{
-				"budget": edge.Budget, "policy": policy,
-			})
-			if edgeExhaustionFailsJob(edge) {
-				return &chainEnd{endFailed, fmt.Sprintf(
-					"phase %q: repair budget (%d) exhausted", phase.Name, edge.Budget)}, nil
-			}
-			return nil, run.envelopeRef()
-		}
-		edgeUses[phase.Name]++
-		e.emit.emit(protocol.EventLog, phase.Name, "repair_edge", map[string]any{
-			"run": edge.Run, "use": edgeUses[phase.Name], "budget": edge.Budget,
-		})
-
-		// Dispatch the repair target with the FAILING envelope as its
-		// previous — a failing test suite and a rejecting review enter the
-		// repair loop through the same door (R8). The target's own repair
-		// edge does not fire on a dispatched run: budgets bound one edge,
-		// not a chain of them.
-		repairPhase, found := e.phaseByName(edge.Run)
-		if !found {
-			return &chainEnd{endFailed, fmt.Sprintf(
-				"phase %q: repair target %q missing from frozen snapshot", phase.Name, edge.Run)}, nil
-		}
-		repairRun := e.runPhaseOnce(ctx, repairPhase, run.envelopeRef())
-		if end := repairRun.attemptEnd(); end != nil {
+		end, repaired, dispatched := e.followEdge(ctx, phase, run, edgeUses)
+		if end != nil {
 			return end, nil
 		}
-		if repairRun.outcome == phaseFailed {
-			return &chainEnd{endFailed, fmt.Sprintf(
-				"repair phase %q: %s", repairPhase.Name, repairRun.failure)}, nil
+		if !dispatched {
+			return nil, run.envelopeRef() // exhausted under proceed
 		}
-		previous = repairRun.envelopeRef()
+		previous = repaired
 		// then: rerun-self.
 	}
+}
+
+// edgeTriggered reports whether a finished run fires its phase's declared
+// repair edge: nonzero exit for code, the envelope predicate for agent.
+func edgeTriggered(phase protocol.PhaseSpec, run phaseRun) bool {
+	edge := phase.OnFail
+	if edge == nil || !run.hasEnvelope {
+		return false
+	}
+	switch phase.Kind {
+	case protocol.PhaseKindCode:
+		return run.outcome == phaseFailed
+	case protocol.PhaseKindAgent:
+		predicate, err := protocol.ParsePredicate(edge.When)
+		return err == nil && predicateHolds(predicate, run.envelope.Fields)
+	}
+	return false
+}
+
+// followEdge acts on a triggered edge. With budget spent it applies the
+// exhaustion policy: fail-job returns the attempt's end, proceed returns
+// dispatched=false. With budget left it charges ONE use to this phase's edge
+// and dispatches the repair target, returning the target's envelope — the
+// previous for the rerun that follows.
+func (e *execution) followEdge(
+	ctx context.Context, phase protocol.PhaseSpec, run phaseRun, edgeUses map[string]int,
+) (end *chainEnd, repaired *parsedEnvelope, dispatched bool) {
+	edge := phase.OnFail
+	if edgeUses[phase.Name] >= edge.Budget {
+		policy := protocol.RepairExhaustedProceed
+		if edgeExhaustionFailsJob(edge) {
+			policy = protocol.RepairExhaustedFailJob
+		}
+		e.emit.emit(protocol.EventLog, phase.Name, "repair_exhausted", map[string]any{
+			"budget": edge.Budget, "policy": policy,
+		})
+		if edgeExhaustionFailsJob(edge) {
+			return &chainEnd{endFailed, fmt.Sprintf(
+				"phase %q: repair budget (%d) exhausted", phase.Name, edge.Budget)}, nil, false
+		}
+		return nil, nil, false
+	}
+	edgeUses[phase.Name]++
+	e.emit.emit(protocol.EventLog, phase.Name, "repair_edge", map[string]any{
+		"run": edge.Run, "use": edgeUses[phase.Name], "budget": edge.Budget,
+	})
+
+	// Dispatch the repair target with the FAILING envelope as its
+	// previous — a failing test suite and a rejecting review enter the
+	// repair loop through the same door (R8). The target's own repair
+	// edge does not fire on a dispatched run: budgets bound one edge,
+	// not a chain of them.
+	repairPhase, found := e.phaseByName(edge.Run)
+	if !found {
+		return &chainEnd{endFailed, fmt.Sprintf(
+			"phase %q: repair target %q missing from frozen snapshot", phase.Name, edge.Run)}, nil, false
+	}
+	repairRun := e.runPhaseOnce(ctx, repairPhase, run.envelopeRef())
+	if end := repairRun.attemptEnd(); end != nil {
+		return end, nil, false
+	}
+	if repairRun.outcome == phaseFailed {
+		return &chainEnd{endFailed, fmt.Sprintf(
+			"repair phase %q: %s", repairPhase.Name, repairRun.failure)}, nil, false
+	}
+	return nil, repairRun.envelopeRef(), true
 }
 
 func (e *execution) phaseByName(name string) (protocol.PhaseSpec, bool) {
@@ -649,6 +755,9 @@ const (
 	phaseCancelled
 	phaseCeiling
 	phaseSendBudget // the attempt's send ladder hit its enforced bound
+	// phaseStopped: a group member stopped because a sibling ended the
+	// attempt. Only the group runner ever sees it, and it discards it.
+	phaseStopped
 )
 
 type phaseRun struct {
@@ -668,6 +777,9 @@ func (run phaseRun) attemptEnd() *chainEnd {
 		return &chainEnd{endCeiling, run.failure}
 	case phaseSendBudget:
 		return &chainEnd{endSendBudget, run.failure}
+	case phaseStopped:
+		// Unreachable outside a group; never let it read as a success.
+		return &chainEnd{endFailed, run.failure}
 	}
 	return nil
 }
@@ -684,6 +796,8 @@ func terminalSend(kind sendEnd, detail string) *phaseRun {
 		return &phaseRun{outcome: phaseCeiling}
 	case sendBudget:
 		return &phaseRun{outcome: phaseSendBudget, failure: detail}
+	case sendStopped:
+		return &phaseRun{outcome: phaseStopped, failure: detail}
 	}
 	return nil
 }
@@ -702,6 +816,8 @@ func (run phaseRun) agentOutcome() string {
 		return protocol.AgentCeiling
 	case phaseSendBudget:
 		return protocol.AgentSendBudget
+	case phaseStopped:
+		return protocol.AgentStopped
 	}
 	return protocol.AgentFailed
 }
@@ -714,10 +830,7 @@ func (run phaseRun) envelopeRef() *parsedEnvelope {
 	return &envelope
 }
 
-func (e *execution) nextEntry(phase string) int {
-	e.phaseEntries[phase]++
-	return e.phaseEntries[phase]
-}
+func (e *execution) nextEntry(phase string) int { return e.counters.nextEntry(phase) }
 
 func (e *execution) recordResult(result protocol.PhaseResult) {
 	now := time.Now().UTC()
@@ -818,7 +931,14 @@ func (e *execution) mergeFields(fields map[string]any) {
 // mergeAgentFields merges an agent envelope into the field view, except for
 // fields a reports_fields code phase already set: those keep the reported
 // value, and the attempted overwrite is traced.
+//
+// A group member's view defers the merge: its fields join the chain's view
+// at the join, in declared order, through this same function.
 func (e *execution) mergeAgentFields(phase, role string, fields map[string]any) {
+	if e.grouped {
+		e.pendingFields = append(e.pendingFields, fieldMerge{phase: phase, role: role, fields: fields})
+		return
+	}
 	for key, value := range fields {
 		if reporter, reported := e.reportedBy[key]; reported {
 			if !reflect.DeepEqual(e.fieldView[key], value) {
@@ -972,6 +1092,11 @@ func (e *execution) enforceWriteBoundary(
 // the nested parse/gate correction loops, boundary enforcement, envelope
 // persistence. died=true means the subprocess was killed or crashed and the
 // worktree has been rolled back to the pre-phase snapshot.
+//
+// In a group member's view (e.grouped) the group owns the worktree: one
+// snapshot before every member, one enforcement after, so this entry takes
+// no snapshot, enforces nothing, and rolls nothing back on death — a dead
+// member's leftover write is the group's breach to find.
 func (e *execution) runAgentPhaseAttempt(
 	ctx context.Context, phase protocol.PhaseSpec, previous *parsedEnvelope,
 ) (run phaseRun, died bool) {
@@ -982,9 +1107,12 @@ func (e *execution) runAgentPhaseAttempt(
 		"kind": phase.Kind, "phase_attempt": entry, "owner": phase.Owner,
 	})
 
-	before, err := snapshotTree(ctx, e.attempt.WorktreePath)
-	if err != nil {
-		return e.failInfra(phase.Name, err.Error()), false
+	var before treeSnapshot
+	if !e.grouped {
+		var err error
+		if before, err = snapshotTree(ctx, e.attempt.WorktreePath); err != nil {
+			return e.failInfra(phase.Name, err.Error()), false
+		}
 	}
 	if err := e.seedRole(phase.Owner, role); err != nil {
 		return e.failInfra(phase.Name, "seed ephemeral HOME: "+err.Error()), false
@@ -1041,9 +1169,11 @@ func (e *execution) runAgentPhaseAttempt(
 		e.emit.emit(protocol.EventPhaseDeath, phase.Name, phase.Owner, map[string]any{
 			"phase_attempt": entry, "error": detail,
 		})
-		if rollbackErr := restoreSnapshot(ctx, e.attempt.WorktreePath, before); rollbackErr != nil {
-			e.emit.emit(protocol.EventError, phase.Name, "rollback_failed",
-				map[string]string{"error": rollbackErr.Error()})
+		if !e.grouped {
+			if rollbackErr := restoreSnapshot(ctx, e.attempt.WorktreePath, before); rollbackErr != nil {
+				e.emit.emit(protocol.EventError, phase.Name, "rollback_failed",
+					map[string]string{"error": rollbackErr.Error()})
+			}
 		}
 		e.recordResult(protocol.PhaseResult{
 			Phase: phase.Name, Kind: phase.Kind, Status: protocol.EnvelopeFail,
@@ -1057,11 +1187,13 @@ func (e *execution) runAgentPhaseAttempt(
 	// retained worktree and the next phase — a failed phase is not a phase
 	// that wrote nothing (R10).
 	fail := func(detail string) (phaseRun, bool) {
-		if _, terminal := e.enforceWriteBoundary(
-			ctx, phase, entry, started, before, role.Writes); terminal != nil {
-			terminal.failure = detail + " — and " + terminal.failure
-			agentEnd(terminal.agentOutcome())
-			return *terminal, false
+		if !e.grouped {
+			if _, terminal := e.enforceWriteBoundary(
+				ctx, phase, entry, started, before, role.Writes); terminal != nil {
+				terminal.failure = detail + " — and " + terminal.failure
+				agentEnd(terminal.agentOutcome())
+				return *terminal, false
+			}
 		}
 		agentEnd(protocol.AgentFailed)
 		e.recordResult(protocol.PhaseResult{
@@ -1085,7 +1217,7 @@ func (e *execution) runAgentPhaseAttempt(
 	// authorized work the operator retained the worktree to look at, while
 	// discarding nothing that could carry forward.
 	terminalExit := func(run phaseRun, detail string) (phaseRun, bool) {
-		if sender.sendCount == 0 {
+		if sender.sendCount == 0 || e.grouped {
 			// The budget check refuses before the subprocess starts: no agent
 			// ran in this entry, so there is nothing of its to enforce.
 			agentEnd(run.agentOutcome())
@@ -1164,17 +1296,19 @@ func (e *execution) runAgentPhaseAttempt(
 	// Permission is checked after every send is done and before the envelope
 	// is accepted: an agent does not get to report success on a phase in
 	// which it wrote somewhere it was not allowed to (R10).
-	touched, terminal := e.enforceWriteBoundary(ctx, phase, entry, started, before, role.Writes)
-	if terminal != nil {
-		agentEnd(terminal.agentOutcome())
-		return *terminal, false
-	}
-	for _, path := range touched {
-		e.touchedPaths[path] = true
-	}
-	if len(touched) > 0 {
-		e.emit.emit(protocol.EventLog, phase.Name, "paths_touched",
-			map[string]any{"role": phase.Owner, "paths": touched})
+	if !e.grouped {
+		touched, terminal := e.enforceWriteBoundary(ctx, phase, entry, started, before, role.Writes)
+		if terminal != nil {
+			agentEnd(terminal.agentOutcome())
+			return *terminal, false
+		}
+		for _, path := range touched {
+			e.touchedPaths[path] = true
+		}
+		if len(touched) > 0 {
+			e.emit.emit(protocol.EventLog, phase.Name, "paths_touched",
+				map[string]any{"role": phase.Owner, "paths": touched})
+		}
 	}
 
 	e.mergeAgentFields(phase.Name, phase.Owner, envelope.Fields)
@@ -1259,6 +1393,9 @@ const (
 	// edge against a rate limit is a retry storm with the wrong diagnosis, so
 	// this ends the PHASE with no parse ladder at all.
 	sendRuntimeError
+	// sendStopped: the parallel group's stop signal fired — a sibling ended
+	// the attempt — so this send never started, or was killed.
+	sendStopped
 )
 
 // agentSender owns one phase attempt's sends: session continuity (or its
@@ -1279,14 +1416,21 @@ type agentSender struct {
 }
 
 func (s *agentSender) send(ctx context.Context, prompt string) (runtime.Result, sendEnd, string) {
+	// A member whose group has been told to stop starts nothing: the sibling
+	// that stopped it already ended the attempt.
+	select {
+	case <-s.stop:
+		return runtime.Result{}, sendStopped, "stopped: a parallel group sibling ended the attempt"
+	default:
+	}
 	// Checked BEFORE the subprocess starts: the send that would exceed the
-	// bound is the one that must not happen.
-	if s.execution.sends >= s.runner.config.MaxAttemptSends {
+	// bound is the one that must not happen. One atomic check-and-take, so
+	// group members racing for the last send cannot both have it.
+	if !s.counters.acquireSend(s.runner.config.MaxAttemptSends) {
 		return runtime.Result{}, sendBudget, fmt.Sprintf(
 			"attempt send budget (%d) exhausted in phase %q",
 			s.runner.config.MaxAttemptSends, s.phase)
 	}
-	s.execution.sends++
 
 	session := s.sessionFor(s.role)
 	if !s.capability.CanResume && session.Sends > 0 {
@@ -1338,6 +1482,10 @@ func (s *agentSender) send(ctx context.Context, prompt string) (runtime.Result, 
 		case <-s.attempt.Cancelled:
 			s.abandon(handle)
 			return runtime.Result{}, sendCancelled, "cancelled during phase " + s.phase
+		case <-s.stop:
+			s.abandon(handle)
+			return runtime.Result{}, sendStopped, "stopped during phase " + s.phase +
+				": a parallel group sibling ended the attempt"
 		}
 	}
 	result, err := handle.Result()
@@ -1422,15 +1570,20 @@ func (e *execution) sessionFor(role string) *runtime.Session {
 	if session := e.sessions[role]; session != nil {
 		return session
 	}
+	if e.grouped {
+		// A member's role may also run outside the group, in the chain's
+		// HOME under the plain key; the member's session lives in its own
+		// HOME and takes a sequenced key no other session can hold.
+		return e.freshSession(role)
+	}
 	session := &runtime.Session{Key: e.sessionKey + "-" + role}
 	e.sessions[role] = session
 	return session
 }
 
 func (e *execution) freshSession(role string) *runtime.Session {
-	e.sessionSeq++
 	session := &runtime.Session{
-		Key: fmt.Sprintf("%s-%s-r%d", e.sessionKey, role, e.sessionSeq),
+		Key: fmt.Sprintf("%s-%s-r%d", e.sessionKey, role, e.counters.sessionSeq.Add(1)),
 	}
 	e.sessions[role] = session
 	return session

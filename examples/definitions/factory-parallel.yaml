@@ -1,20 +1,32 @@
-# factory.yaml — the agentic software factory, as far as it reaches before a
-# person is needed. Plan, build, commit, test, then a panel of specialist
-# reviewers that each send the work back to the builder until they approve;
-# a deterministic risk classifier scores the result, and high-risk work is
-# held for human review instead of shipped.
+# factory-parallel.yaml — factory.yaml with its reviewer panel run in
+# parallel. Everything but the name and the `parallel:` line after `phases`
+# is the stock factory (a test holds the two in step), and the notes after
+# THE PARALLEL PANEL apply unchanged. The stock factory stays sequential
+# until this panel's semantics have been watched on real work (plan KTD7).
 #
-#   jig run --def examples/definitions/factory.yaml <repo> "add rate limiting to the API"
+#   jig run --def examples/definitions/factory-parallel.yaml <repo> "add rate limiting to the API"
 #
-# THE REVIEW LOOP. Three reviewers run in turn — correctness, security,
-# maintainability — and each carries its own repair edge: a rejection
-# (`approved == false`) dispatches the builder with THAT review's blocking
-# list, then re-runs the same reviewer. A reviewer approves the work as it
-# stands when it runs, so a revision demanded by the security reviewer is
-# seen by the maintainability reviewer but not re-judged by the correctness
-# reviewer — order the panel from the review most likely to demand changes to
-# the one least likely. `budget: 3` bounds each loop and `exhausted: fail-job`
-# means work a reviewer never accepts does not ship.
+# THE PARALLEL PANEL. `parallel: [review-correctness, review-security,
+# review-maintainability]` runs the three reviewers at once, each in its own
+# ephemeral HOME and session. A group may hold only consecutive agent phases
+# whose roles are read-only (`writes: []`) and distinct; any change to the
+# worktree while the panel runs aborts the attempt. What changes against the
+# sequential panel:
+#
+#   - Prompts. Every reviewer is handed the envelope from before the panel
+#     (the tests), never a sibling's review. The phase after the panel gets
+#     the last reviewer's envelope, as it would sequentially.
+#   - Rejections. Edges resolve after all three finish, in declared order:
+#     the FIRST reviewer that rejected with budget left sends its blocking
+#     list to the builder, and then the WHOLE panel runs again — so an
+#     earlier approval is re-judged against the revision, and a later
+#     reviewer's rejection waits for the next panel run (its budget is not
+#     charged until it is the one dispatching). A reviewer whose budget is
+#     spent applies its `exhausted` policy: fail-job ends the attempt,
+#     proceed moves on to the next reviewer.
+#   - Bounds. The panel runs at most 1 + the sum of its reviewers' budgets
+#     times (here 1 + 3 + 3 + 3 = 10). Every run spends one send per reviewer
+#     at least, from the same attempt-wide send budget.
 #
 # THE RISK GATE. `classify-risk` is a code phase with `reports_fields: true`:
 # its last output line is a JSON object, and jig merges those fields into the
@@ -61,7 +73,7 @@
 # the weakest boundary jig can enforce — narrow it, R10), and the risk
 # classifier's path pattern and line threshold, which should name what is
 # dangerous in YOUR repository.
-name: factory
+name: factory-parallel
 roster:
   planner:
     model: sonnet
@@ -386,6 +398,7 @@ phases:
     kind: agent
     owner: risk-reviewer
     if: "risk != low"
+parallel: [review-correctness, review-security, review-maintainability]
 acceptance: [all_phases_passed, verdict_consistent, diff_matches_claims]
 publish:
   hold_when: "risk != low"
