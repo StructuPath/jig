@@ -194,10 +194,14 @@ work with `publish: held` in its result. Read the risk reviewer's briefing in
 the trace, then the publish retry is your sign-off.
 
 `factory.yaml` also sets `publish.ci.wait`, so a published job is
-`accepted` only once CI on its pull request is green. Red CI lands it in
-`accepted_unpublished` with the failing checks in its result; push a fix to
-the `jig/<job-id>/<attempt>` branch and the publish retry re-checks CI on the
-new head.
+`accepted` only once CI on its pull request is green, and `publish.ci.on_fail`,
+so red CI is first given back to the builder: up to two repair rounds, each
+re-run through the tests, the reviewers, and the risk classifier before the
+fix is pushed to the same pull request. If CI is still red after that, or a
+round is held or fails, the job lands in `accepted_unpublished` with the
+failing checks and every round in its result; push a fix to the
+`jig/<job-id>/<attempt>` branch yourself and the publish retry re-checks CI on
+the new head (it never repairs).
 
 `Ctrl-C` stops the worker in order: no new claims, in-flight attempts
 cancelled, terminal states recorded, ephemeral scratch destroyed.

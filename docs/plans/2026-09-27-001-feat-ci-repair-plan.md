@@ -144,10 +144,31 @@ Round state lives in the worker's `PublishingRunner.Run` loop. The engine owns c
 
 ### U6. Docs and the stock factory
 
-- **Files:** `examples/definitions/factory.yaml`, `README.md`, `docs/quickstart.md`
-- **Approach:** opt `factory.yaml` in with `on_fail: {run: build, budget: 2}`. The round then runs `commit-build`, so the fix is committed by the definition's own commit phase and then tested, reviewed and classified. The README gets a short section saying what a round re-runs, what it never skips, and that retry never repairs.
+- **Files:** `examples/definitions/factory.yaml`, `README.md`, `docs/quickstart.md`, new `cmd/jig/factory_test.go`
+- **Approach (as built):** `factory.yaml` opts in with `on_fail: {run: build, budget: 2}`. The round then runs `commit-build`, so the fix is committed by the definition's own commit phase and then tested, reviewed and classified. The correctness reviewer's prompt makes a change that deletes or weakens tests, lint rules or CI configuration blocking unless the task asked for it. The risk classifier now scores as not low:
+  - any path under `.github/`, not only workflows;
+  - lint and test-runner configuration (`.golangci*`, `.eslintrc*`, `jest`/`vitest`/`playwright` configs, `pytest.ini`, `setup.cfg`, `tox.ini`, `.pre-commit-config.yaml` and similar);
+  - any test file that loses more lines than it gains.
+
+  This is deliberately narrower than "any edit to tests", which would hold nearly every change, since builders add tests. The test-file pattern reaches `awk` through the environment, because `awk -v` would turn `\.` into "any character" under gawk and mawk. `cmd/jig/factory_test.go` runs the classifier script exactly as written in `factory.yaml` against nine scratch-repo scenarios, and asserts that the factory's repair runs through `build` with the test, all three reviewers and the classifier after it. The README gains a CI-repair bullet; the quickstart describes the rounds.
 
 **Exit gate:** on a scratch GitHub repository whose CI runs a check the local `tests_pass` gate does not (for example `gofmt -l` failing on purpose), three real `factory.yaml` runs with Claude Code: one goes red and then green within budget, one exhausts the budget and ends `accepted_unpublished` naming both heads, and one has a person push during the CI wait and runs no round. All three have trace timelines that name every round.
+
+**Exit gate: run 2026-09-28, passed.** It used a private scratch repository, `StructuPath/jig-ci-repair-scratch`, whose CI runs *hidden* conventions: the rules are a base64 repo secret decoded at CI time, and the active rule list is a secret too, so logs show `***`. The rules apply only to new exported functions, so `main` passes and offers no example to copy, and CI reports only the first failing rule. The runs used the stock `factory.yaml`, real Claude Code 2.1.283 and a live `jig serve` + `jig worker` built from the U6 branch.
+
+| Run | Hidden rules | Result | Rounds | Cost |
+|---|---|---|---|---|
+| 1 | `changes` | red → round 1 added CHANGES.md → green, `accepted` (PR #1) | 1 | $3.03 |
+| 2 | `changes,example,bench` | red → round 1 → red → round 2 → red, `accepted_unpublished` / `ci_repair_exhausted`, PR #3 at round 2's head, ledger chain 7a04ddd2 → 3f4eac56 → 5b36e239, no `ci` record | 2 | $5.03 |
+| 3 | `changes` + a person's push while CI ran | `ci_repair_head_moved`: red on 485bd14a, a head jig did not push; no round, no ledger row | 0 | $1.89 |
+
+Every round received the failed job's real log tail (10–10.05 KB) and re-ran every phase after `build`, all three reviewers and the classifier included. No scratch survived the runs.
+
+**Not a clean first pass. Three things surfaced, all fixed:**
+- **Two jig bugs the fakes could not see.** `gh` refuses to print Actions job logs (they contain escape codes) without `--allow-escape-sequences`, so every repair would have lost its log. On macOS, jig seeded Claude's login from a stale `~/.claude/.credentials.json` before the keychain, and the first attempt at run 1 died on "OAuth session expired" before any work.
+- **One leak in the gate's own design.** An earlier run 2 passed the rule list through a repo *variable*, which GitHub prints in the log's `env:` block. The round's builder read `CI_RULES=changes,example,bench` from the log tail and satisfied all three rules in one round, so it was accepted rather than exhausted: correct agent behaviour, wrong test. With the list moved into a secret, run 2 exhausted as designed.
+
+Spend: $9.95 for the three gate runs; $13.08 including the leaked run 2 ($3.13). The failed-auth attempt spent nothing.
 
 ---
 

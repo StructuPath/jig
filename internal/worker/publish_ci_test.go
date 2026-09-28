@@ -636,3 +636,31 @@ func TestFailedCheckLogsReadsOnlyFailuresAndCapsAttempts(t *testing.T) {
 		t.Fatalf("check past the read cap = %+v, want a note", last)
 	}
 }
+
+// Actions job logs carry escape codes and gh refuses to print them unless
+// allowed; a gh too old to know the flag is asked again without it.
+func TestJobLogsAreReadWithEscapeSequencesAllowed(t *testing.T) {
+	var calls [][]string
+	gateway := &GitHubCLIGateway{
+		LookPath: func(string) (string, error) { return "/usr/bin/gh", nil },
+		RunTail: func(_ context.Context, _ int, _ string, arguments ...string) ([]byte, []byte, error) {
+			calls = append(calls, arguments)
+			if slices.Contains(arguments, "--allow-escape-sequences") && len(calls) == 1 && len(arguments) > 0 &&
+				strings.Contains(strings.Join(arguments, " "), "/jobs/2/") {
+				return nil, []byte("unknown flag: --allow-escape-sequences"), errors.New("exit status 1")
+			}
+			return []byte("\x1b[31m--- FAIL: TestX\x1b[0m\n"), nil, nil
+		},
+	}
+	current := gateway.FailedCheckLogs(context.Background(), "github.com/example/repo",
+		[]CICheck{{Name: "a", Verdict: CIFail, App: "github-actions", CheckRunID: 1}})
+	if !slices.Contains(calls[0], "--allow-escape-sequences") || current[0].LogTail != "--- FAIL: TestX\n" {
+		t.Fatalf("calls = %v tail = %q, want escape sequences allowed and then stripped", calls, current[0].LogTail)
+	}
+	calls = nil
+	old := gateway.FailedCheckLogs(context.Background(), "github.com/example/repo",
+		[]CICheck{{Name: "b", Verdict: CIFail, App: "github-actions", CheckRunID: 2}})
+	if len(calls) != 2 || slices.Contains(calls[1], "--allow-escape-sequences") || old[0].LogTail == "" {
+		t.Fatalf("calls = %v tail = %q, want one retry without the flag for an old gh", calls, old[0].LogTail)
+	}
+}

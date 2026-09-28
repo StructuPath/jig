@@ -235,6 +235,27 @@ Rules worth knowing before you write one:
   whatever its head is by then. Neutral and skipped checks count as green.
   The wait holds a worker slot, and a cancel during it ends the job the same
   way. Omit `ci` and publish does not wait, exactly as before.
+- **Red CI can be repaired inside the attempt.** `publish: {ci: {wait: true,
+  on_fail: {run: build, budget: 2}}}` gives red CI back to the `run` agent
+  phase instead of ending the job. A round hands it the failing checks and
+  the last 16 KiB of each failed GitHub Actions job's log (at most four logs),
+  framed as data, never instructions; then **every phase after `run`** runs
+  again, gates and repair edges included, and acceptance and `hold_when` are
+  judged anew. Only a fix that passes all of that, is not held, and actually
+  changed something is pushed, non-force, to the same pull request, and CI is
+  awaited again. There is no way to skip phases: `run` must be an agent phase
+  and not the last one. Rounds share the attempt's send budget and wall-clock
+  ceiling, run in a freshly wiped ephemeral HOME, and are fenced by the lease
+  again right before each push. jig never builds on someone else's commit: if
+  CI is red on a head it did not push, no round runs. When the budget runs
+  out, or a round fails, is held, is cancelled, or changes nothing, the job
+  ends `accepted_unpublished` exactly as red CI did before, with every round's
+  heads, changed paths, and outcome in the result. The publish-only retry
+  judges CI but never repairs — a continuation lives only in the process that
+  ran the chain. Budget is 1–3. A fix that weakens a check instead of the
+  code is the risk to design for: `factory.yaml` scores edits to CI or lint
+  configuration, and test files that lose more lines than they gain, as not
+  low, so such a "fix" is held for a person.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 
@@ -318,7 +339,7 @@ seeds each one's auth material into that HOME:
 
 | Runtime | Seeded from | Into the ephemeral HOME |
 |---|---|---|
-| Claude Code | `~/.claude/.credentials.json`, or the macOS keychain item `Claude Code-credentials`; plus `~/.claude.json` onboarding state | `~/.claude/.credentials.json`, `~/.claude.json` |
+| Claude Code | on macOS the keychain item `Claude Code-credentials` (where the CLI keeps its live login), falling back to `~/.claude/.credentials.json`; elsewhere that file; plus `~/.claude.json` onboarding state | `~/.claude/.credentials.json`, `~/.claude.json` |
 | Codex | `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`), plus `config.toml` when present | `$HOME/.codex/auth.json`, `$HOME/.codex/sessions/` |
 
 Two consequences:
