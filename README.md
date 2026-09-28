@@ -259,6 +259,23 @@ Rules worth knowing before you write one:
   code is the risk to design for: `factory.yaml` scores edits to CI or lint
   configuration, and test files that lose more lines than they gain, as not
   low, so such a "fix" is held for a person.
+- **A read-only review panel can run in parallel.** `parallel:
+  [review-correctness, review-security, review-maintainability]` runs those
+  phases at once, as one step of the chain. It is opt-in and narrow: one
+  group per definition, two or more consecutive agent phases, each with its
+  own role, every role `writes: []`, and no member's `if:` guard reading a
+  field a sibling reports. Each member runs in its own ephemeral HOME and
+  session and is handed the envelope from BEFORE the group, never a
+  sibling's; results merge in declared order, and the next phase gets the
+  last member's envelope. Any worktree change while the group runs —
+  including one a crashed member left — rolls back and aborts the attempt.
+  Rejections resolve after every member finishes: the first member in
+  declared order that rejected with budget left dispatches its repair target
+  and charges only its own budget, and then the whole group runs again, so
+  earlier approvals are re-judged. The group runs at most 1 + the sum of its
+  members' budgets times. `examples/definitions/factory-parallel.yaml` is the
+  stock factory with its panel grouped; `factory.yaml` itself stays
+  sequential until the parallel panel has been watched on real work.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 

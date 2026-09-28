@@ -39,8 +39,16 @@ func (e *execution) repairable(outcome worker.Outcome) bool {
 // (an agent can make one fail, with a read-only directory) is an error the
 // caller must act on: a HOME that may still hold what an agent left there
 // is never handed to another round.
+//
+// Every parallel group member's HOME goes too, and with it the member views
+// whose sessions lived there: the next group run starts them afresh.
 func (e *execution) wipeHome() error {
 	e.seededRoles = make(map[string]bool)
+	e.members = nil
+	if err := os.RemoveAll(e.scratch.members); err != nil {
+		e.runner.config.Logger.Warn("attempt_member_homes_wipe_failed", "error", err)
+		return fmt.Errorf("wipe the parallel group members' ephemeral HOMEs: %w", err)
+	}
 	if err := os.RemoveAll(e.scratch.home); err != nil {
 		e.runner.config.Logger.Warn("attempt_home_wipe_failed", "error", err)
 		return fmt.Errorf("wipe the ephemeral HOME: %w", err)

@@ -544,3 +544,97 @@ phases:
   - {name: build, kind: agent, owner: builder}
 `, `"builder"`, "budget_usd must not be negative")
 }
+
+// parallelPanel is a builder, three read-only reviewers, and a code check;
+// the tests below splice roster entries, phases, and group lines into it.
+func parallelPanel(extraRoster, phases, tail string) string {
+	return `
+name: panel
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u, writes: ["src/"]}
+  a: {model: opus, system_prompt: s, user_prompt: u, writes: []}
+  b: {model: opus, system_prompt: s, user_prompt: u, writes: []}
+  c: {model: opus, system_prompt: s, user_prompt: u, writes: []}
+` + extraRoster + `
+phases:
+` + phases + tail
+}
+
+const panelPhases = `
+  - {name: build, kind: agent, owner: builder}
+  - {name: review-a, kind: agent, owner: a, on_fail: {when: "approved == false", run: build, then: rerun-self, budget: 1}}
+  - {name: review-b, kind: agent, owner: b}
+  - {name: review-c, kind: agent, owner: c}
+  - {name: check, kind: code, command: "true"}
+`
+
+func TestAParallelGroupOfConsecutiveReadOnlyReviewersValidates(t *testing.T) {
+	spec := mustParse(t, parallelPanel("", panelPhases, "parallel: [review-a, review-b, review-c]\n"))
+	start, end, ok := spec.ParallelRange()
+	if !ok || start != 1 || end != 4 {
+		t.Fatalf("ParallelRange = %d, %d, %v, want 1, 4, true", start, end, ok)
+	}
+	if _, _, ok := mustParse(t, parallelPanel("", panelPhases, "")).ParallelRange(); ok {
+		t.Fatal("a definition without a group reports one")
+	}
+}
+
+// R8: every rule that keeps a group's members concurrent-safe is enforced at
+// save time, naming what broke it.
+func TestAParallelGroupIsRejectedUnlessItsMembersAreConcurrentSafe(t *testing.T) {
+	unrestricted := "  d: {model: opus, system_prompt: s, user_prompt: u}\n"
+	cases := []struct {
+		name   string
+		source string
+		want   []string
+	}{
+		{"a writing member", parallelPanel("", panelPhases, "parallel: [build, review-a]\n"),
+			[]string{`"build"`, `"builder"`, "writes: []"}},
+		{"a member whose role omits writes, which is unrestricted", parallelPanel(unrestricted,
+			panelPhases+"  - {name: review-d, kind: agent, owner: d}\n  - {name: review-e, kind: agent, owner: a}\n",
+			"parallel: [review-d, review-e]\n"),
+			[]string{`"review-d"`, `"d"`, "writes: []"}},
+		{"a code-phase member", parallelPanel("", panelPhases, "parallel: [review-c, check]\n"),
+			[]string{`"check"`, "code phase"}},
+		{"two members sharing a role", parallelPanel("",
+			panelPhases+"  - {name: review-a2, kind: agent, owner: a}\n  - {name: review-a3, kind: agent, owner: a}\n",
+			"parallel: [review-a2, review-a3]\n"),
+			[]string{`"review-a2"`, `"review-a3"`, `"a"`, "own role"}},
+		{"non-consecutive members", parallelPanel("", panelPhases, "parallel: [review-a, review-c]\n"),
+			[]string{"consecutive", `"review-c"`, `"review-a"`}},
+		{"members out of chain order", parallelPanel("", panelPhases, "parallel: [review-b, review-a]\n"),
+			[]string{"consecutive"}},
+		{"a member guarded on a sibling's repair field", parallelPanel("",
+			strings.Replace(panelPhases, "owner: b}", `owner: b, if: "approved == true"}`, 1),
+			"parallel: [review-a, review-b]\n"),
+			[]string{`"review-b"`, `"approved"`, `"review-a"`}},
+		{"a member guarded on a sibling's base envelope field", parallelPanel("",
+			strings.Replace(panelPhases, "owner: c}", "owner: c, if: summary}", 1),
+			"parallel: [review-b, review-c]\n"),
+			[]string{`"review-c"`, `"summary"`}},
+		{"a second group", parallelPanel("", panelPhases, "parallel: [[review-a, review-b], [review-c]]\n"),
+			[]string{"only one parallel group"}},
+		{"a second group key", parallelPanel("", panelPhases,
+			"parallel: [review-a, review-b]\nparallel: [review-c]\n"),
+			[]string{"parallel"}},
+		{"a group of one", parallelPanel("", panelPhases, "parallel: [review-a]\n"),
+			[]string{"two or more"}},
+		{"an undefined member", parallelPanel("", panelPhases, "parallel: [review-a, review-z]\n"),
+			[]string{`"review-z"`}},
+		{"a member listed twice", parallelPanel("", panelPhases, "parallel: [review-a, review-a]\n"),
+			[]string{"twice"}},
+		{"CI repair starting inside the group", parallelPanel("", panelPhases,
+			"parallel: [review-a, review-b]\npublish: {ci: {wait: true, on_fail: {run: review-a, budget: 1}}}\n"),
+			[]string{"on_fail", `"review-a"`, "parallel group member"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mustReject(t, tc.source, tc.want...)
+		})
+	}
+	// A guard on a field no sibling declares is fine: it is judged against
+	// the view that preceded the group, exactly as the definition says.
+	mustParse(t, parallelPanel("",
+		strings.Replace(panelPhases, "owner: c}", `owner: c, if: "risk != low"}`, 1),
+		"parallel: [review-a, review-b, review-c]\n"))
+}
