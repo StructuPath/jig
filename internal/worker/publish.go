@@ -1510,9 +1510,7 @@ func (g *GitHubCLIGateway) FailedCheckLogs(ctx context.Context, repository strin
 			// Read twice the kept size: cleaning (timestamps, ANSI codes)
 			// shrinks it, and the cut lands on a line boundary.
 			read := 2 * protocol.MaxCIRepairLogBytesPerCheck
-			tail, stderr, err := g.runTail()(ctx, read, "gh",
-				"api", "-H", "Accept: application/vnd.github+json",
-				fmt.Sprintf("repos/%s/actions/jobs/%d/logs", project, check.CheckRunID))
+			tail, stderr, err := g.readJobLog(ctx, read, project, check.CheckRunID)
 			if err != nil {
 				check.LogNote = boundedText("log unavailable: "+ghDiagnostic("gh api job logs", err, stderr,
 					false, false).Error(), protocol.MaxCIRepairCheckNameBytes)
@@ -1558,6 +1556,20 @@ func dropFirstLine(text string) string {
 		return text[newline+1:]
 	}
 	return ""
+}
+
+// readJobLog reads one Actions job log through gh. Job logs carry terminal
+// escape codes, and gh refuses to print those unless told it may; cleanLogTail
+// strips them afterwards. A gh too old to know the flag says so, and is asked
+// again without it (it printed escape codes unconditionally).
+func (g *GitHubCLIGateway) readJobLog(ctx context.Context, read int, project string, jobID int64) ([]byte, []byte, error) {
+	path := fmt.Sprintf("repos/%s/actions/jobs/%d/logs", project, jobID)
+	tail, stderr, err := g.runTail()(ctx, read, "gh",
+		"api", "--allow-escape-sequences", "-H", "Accept: application/vnd.github+json", path)
+	if err != nil && bytes.Contains(stderr, []byte("unknown flag: --allow-escape-sequences")) {
+		return g.runTail()(ctx, read, "gh", "api", "-H", "Accept: application/vnd.github+json", path)
+	}
+	return tail, stderr, err
 }
 
 func (g *GitHubCLIGateway) runTail() func(context.Context, int, string, ...string) ([]byte, []byte, error) {
