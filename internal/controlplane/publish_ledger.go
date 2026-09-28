@@ -445,6 +445,7 @@ func (a *API) registerPublishRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/attempts/{attempt_id}/publish", a.attemptPublishRecords)
 	mux.HandleFunc("GET /api/jobs/{job_id}/publish", a.jobPublishRecords)
 	mux.HandleFunc("POST /api/jobs/{job_id}/publish-retry", a.retryPublish)
+	a.registerCIRepairRoutes(mux)
 }
 
 func (a *API) authorizePublishStep(w http.ResponseWriter, r *http.Request) {

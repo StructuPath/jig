@@ -192,3 +192,64 @@ type PublishRetry struct {
 	// the same publish policy (a CI wait, say) the original attempt ran under.
 	Snapshot string `json:"snapshot"`
 }
+
+// MaxCIRepairFailedChecks caps how many failed check names one CI repair
+// round records, and MaxCIRepairCheckNameBytes caps each name. The round
+// record is evidence of what was red, not the log itself.
+const (
+	MaxCIRepairFailedChecks   = 20
+	MaxCIRepairCheckNameBytes = 200
+)
+
+// CIRepairRecord is one recorded CI repair round (publish.ci.on_fail): CI
+// was red on HeadBefore, a repair ran the chain again, and HeadAfter is the
+// fix it pushed to the same branch. Rounds chain: round 1's HeadBefore is
+// the proof step's remote_ref, and every later round's HeadBefore is the
+// previous round's HeadAfter. It is a record of its own rather than another
+// publish step because a second push is a new fact, not a replay of the
+// first.
+type CIRepairRecord struct {
+	AttemptID     string    `json:"attempt_id"`
+	JobID         string    `json:"job_id"`
+	AttemptNumber int       `json:"attempt_number"`
+	Round         int       `json:"round"`
+	Branch        string    `json:"branch"`
+	HeadBefore    string    `json:"head_before"`
+	HeadAfter     string    `json:"head_after"`
+	FailedChecks  []string  `json:"failed_checks"`
+	CompletedAt   time.Time `json:"completed_at"`
+}
+
+// CIRepairAuthorizationRequest asks whether this lease may push repair
+// round Round over HeadBefore right now. Like a publish step, it is asked
+// BEFORE the push, so a zombie or an over-budget round is refused before
+// it touches the remote.
+type CIRepairAuthorizationRequest struct {
+	LeaseToken string `json:"lease_token"`
+	Round      int    `json:"round"`
+	Branch     string `json:"branch"`
+	HeadBefore string `json:"head_before"`
+}
+
+// CIRepairAuthorization is a granted round. Budget is the frozen
+// definition's on_fail budget. Completed is non-nil when the round is
+// already recorded, and the worker must then skip the push.
+type CIRepairAuthorization struct {
+	AttemptID string          `json:"attempt_id"`
+	Round     int             `json:"round"`
+	Budget    int             `json:"budget"`
+	Branch    string          `json:"branch"`
+	Completed *CIRepairRecord `json:"completed,omitempty"`
+}
+
+// CIRepairRecordRequest records one pushed repair round under the lease
+// token. Replaying identical values returns the stored record; different
+// values for a recorded round are a conflict.
+type CIRepairRecordRequest struct {
+	LeaseToken   string   `json:"lease_token"`
+	Round        int      `json:"round"`
+	Branch       string   `json:"branch"`
+	HeadBefore   string   `json:"head_before"`
+	HeadAfter    string   `json:"head_after"`
+	FailedChecks []string `json:"failed_checks"`
+}
