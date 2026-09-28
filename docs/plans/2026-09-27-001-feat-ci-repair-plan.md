@@ -144,8 +144,13 @@ Round state lives in the worker's `PublishingRunner.Run` loop. The engine owns c
 
 ### U6. Docs and the stock factory
 
-- **Files:** `examples/definitions/factory.yaml`, `README.md`, `docs/quickstart.md`
-- **Approach:** opt `factory.yaml` in with `on_fail: {run: build, budget: 2}`. The round then runs `commit-build`, so the fix is committed by the definition's own commit phase and then tested, reviewed and classified. The README gets a short section saying what a round re-runs, what it never skips, and that retry never repairs.
+- **Files:** `examples/definitions/factory.yaml`, `README.md`, `docs/quickstart.md`, new `cmd/jig/factory_test.go`
+- **Approach (as built):** `factory.yaml` opts in with `on_fail: {run: build, budget: 2}`. The round then runs `commit-build`, so the fix is committed by the definition's own commit phase and then tested, reviewed and classified. The correctness reviewer's prompt makes a change that deletes or weakens tests, lint rules or CI configuration blocking unless the task asked for it. The risk classifier now scores as not low:
+  - any path under `.github/`, not only workflows;
+  - lint and test-runner configuration (`.golangci*`, `.eslintrc*`, `jest`/`vitest`/`playwright` configs, `pytest.ini`, `setup.cfg`, `tox.ini`, `.pre-commit-config.yaml` and similar);
+  - any test file that loses more lines than it gains.
+
+  This is deliberately narrower than "any edit to tests", which would hold nearly every change, since builders add tests. The test-file pattern reaches `awk` through the environment, because `awk -v` would turn `\.` into "any character" under gawk and mawk. `cmd/jig/factory_test.go` runs the classifier script exactly as written in `factory.yaml` against nine scratch-repo scenarios, and asserts that the factory's repair runs through `build` with the test, all three reviewers and the classifier after it. The README gains a CI-repair bullet; the quickstart describes the rounds.
 
 **Exit gate:** on a scratch GitHub repository whose CI runs a check the local `tests_pass` gate does not (for example `gofmt -l` failing on purpose), three real `factory.yaml` runs with Claude Code: one goes red and then green within budget, one exhausts the budget and ends `accepted_unpublished` naming both heads, and one has a person push during the CI wait and runs no round. All three have trace timelines that name every round.
 
