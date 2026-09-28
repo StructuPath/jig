@@ -548,3 +548,32 @@ func TestReRegistrationShrinksTheAdvertisedEnvNameSetWhenAVariableIsRemoved(t *t
 		t.Fatalf("advertised names %v still contain the removed BRAVO", reregistered.EnvNames)
 	}
 }
+
+// recordingContinuation counts Release calls.
+type recordingContinuation struct{ released int }
+
+func (c *recordingContinuation) RepairCI(context.Context, CIFailure) Outcome {
+	return Outcome{State: protocol.AttemptFailed, Error: "not used"}
+}
+func (c *recordingContinuation) Release() { c.released++ }
+
+// A continuation the runner hands back unused is released by the attempt
+// loop, so an engine kept alive for CI repair never pins its scratch past
+// the attempt.
+func TestTheAttemptLoopReleasesAnUnusedContinuation(t *testing.T) {
+	h := newHarness(t)
+	_, head, identity := newOriginRepo(t)
+	h.seedRun("run-1", protocol.RunTarget{Repository: identity, BaseSHA: head})
+	h.enqueue("run-1", identity)
+	continuation := &recordingContinuation{}
+	runner := RunnerFunc(func(context.Context, *PreparedAttempt) Outcome {
+		return Outcome{State: protocol.AttemptFailed, Error: "done", Continuation: continuation}
+	})
+	w := newTestWorker(t, h, filepath.Join(t.TempDir(), "worker"), 1, runner)
+	if attempt, err := w.ClaimOnce(context.Background()); err != nil || attempt == nil {
+		t.Fatalf("claim once: attempt=%v err=%v", attempt, err)
+	}
+	if continuation.released != 1 {
+		t.Fatalf("continuation released %d times, want exactly once", continuation.released)
+	}
+}

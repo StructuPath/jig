@@ -182,14 +182,6 @@ func (r *Runner) Execute(ctx context.Context, attempt Attempt) worker.Outcome {
 	if err != nil {
 		return worker.Outcome{State: protocol.AttemptFailed, Error: err.Error()}
 	}
-	// The whole scratch family — ephemeral HOME included — dies with the
-	// attempt (KTD11). Anything an agent wrote "to its home" goes with it.
-	defer func() {
-		if err := scratch.destroy(); err != nil {
-			r.config.Logger.Warn("attempt_scratch_destroy_failed", "error", err)
-		}
-	}()
-
 	e := &execution{
 		runner:       r,
 		attempt:      attempt,
@@ -206,8 +198,22 @@ func (r *Runner) Execute(ctx context.Context, attempt Attempt) worker.Outcome {
 		seededRoles:  make(map[string]bool),
 		phaseEntries: make(map[string]int),
 		touchedPaths: make(map[string]bool),
+		sessionKey:   attempt.Claim.Attempt.ID,
 	}
-	return e.run(ctx)
+	outcome := e.run(ctx)
+	if e.repairable(outcome) {
+		// The chain stays alive for CI repair: the continuation now owns the
+		// scratch family. The HOME is wiped at once regardless, so nothing an
+		// agent left "at home" (credentials included) outlives this chain
+		// (KTD11); only the handoff notes carry into a round.
+		e.wipeHome()
+		outcome.Continuation = &ciContinuation{e: e}
+		return outcome
+	}
+	// The whole scratch family — ephemeral HOME included — dies with the
+	// attempt (KTD11). Anything an agent wrote "to its home" goes with it.
+	e.destroyScratch()
+	return outcome
 }
 
 // exchange is one prompt/response pair kept for transcript digests (R7).
@@ -244,6 +250,11 @@ type execution struct {
 	seededRoles  map[string]bool
 	phaseEntries map[string]int
 	touchedPaths map[string]bool
+	// sessionKey prefixes every runtime session key. It is the attempt id
+	// for the chain and gains a round suffix in each CI repair round, whose
+	// sessions start in a fresh HOME and must never collide with a key the
+	// runtime already saw.
+	sessionKey string
 	// sends counts every prompt send this attempt has issued, across phases,
 	// parse corrections, gate corrections, crash re-entries, and repair
 	// dispatches alike — the one number the whole ladder is bounded by.
@@ -280,7 +291,13 @@ func (e *execution) run(ctx context.Context) worker.Outcome {
 		"can_resume":      e.capability.CanResume,
 	})
 
-	end := e.runChain(ctx)
+	return e.conclude(e.runChain(ctx, 0, nil))
+}
+
+// conclude maps how the chain ended onto the attempt's outcome: the terminal
+// causes first, then acceptance, then the publish hold. A CI repair round
+// ends through the same door, so a round is judged exactly as the chain was.
+func (e *execution) conclude(end chainEnd) worker.Outcome {
 	switch end.kind {
 	case endCancelled:
 		e.emit.emit(protocol.EventLog, "", "attempt_cancelled", nil)
@@ -499,10 +516,13 @@ func (e *execution) freshenLease(ctx context.Context) {
 
 // ---- the chain -------------------------------------------------------------
 
-func (e *execution) runChain(ctx context.Context) chainEnd {
-	var previous *parsedEnvelope
+// runChain runs the chain from phases[start] to the end, handing previous
+// to the first phase run. A fresh edgeUses per call means each CI repair
+// round gets fresh per-edge budgets; the attempt-wide sends and ceiling are
+// what bound the rounds together.
+func (e *execution) runChain(ctx context.Context, start int, previous *parsedEnvelope) chainEnd {
 	edgeUses := make(map[string]int)
-	for _, phase := range e.spec.Phases {
+	for _, phase := range e.spec.Phases[start:] {
 		if e.cancelled() {
 			return chainEnd{endCancelled, "cancelled between phases"}
 		}
@@ -1347,7 +1367,7 @@ func (e *execution) sessionFor(role string) *runtime.Session {
 	if session := e.sessions[role]; session != nil {
 		return session
 	}
-	session := &runtime.Session{Key: e.attempt.Claim.Attempt.ID + "-" + role}
+	session := &runtime.Session{Key: e.sessionKey + "-" + role}
 	e.sessions[role] = session
 	return session
 }
@@ -1355,7 +1375,7 @@ func (e *execution) sessionFor(role string) *runtime.Session {
 func (e *execution) freshSession(role string) *runtime.Session {
 	e.sessionSeq++
 	session := &runtime.Session{
-		Key: fmt.Sprintf("%s-%s-r%d", e.attempt.Claim.Attempt.ID, role, e.sessionSeq),
+		Key: fmt.Sprintf("%s-%s-r%d", e.sessionKey, role, e.sessionSeq),
 	}
 	e.sessions[role] = session
 	return session

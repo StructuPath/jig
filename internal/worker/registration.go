@@ -94,6 +94,40 @@ type Outcome struct {
 	// attempt ends accepted_unpublished with the hold recorded, and the
 	// publish-only retry is how a person releases it.
 	PublishHold string
+	// Continuation, when non-nil, lets a red CI run be repaired inside this
+	// attempt (publish.ci.on_fail). Whoever ends up holding the outcome must
+	// call Release; Release is idempotent.
+	Continuation Continuation
+}
+
+// Continuation is an accepted attempt's chain kept alive for CI repair. It
+// exists only in the process that ran the chain, which is why the
+// publish-only retry never repairs.
+type Continuation interface {
+	// RepairCI runs one repair round: the definition's on_fail phase gets
+	// the failure as its input envelope, every phase after it runs again,
+	// and acceptance and the publish hold are judged anew. The outcome is
+	// accepted_unpublished (no hold) only when the round's work may be
+	// pushed; its result lists the paths this round changed. A round that
+	// ends any other way spends the continuation.
+	RepairCI(ctx context.Context, failure CIFailure) Outcome
+	// Release frees what the continuation holds. Idempotent.
+	Release()
+}
+
+// CIFailure is the red CI run a repair round is asked to fix.
+type CIFailure struct {
+	// Head is the commit CI was red on.
+	Head   string
+	Checks []CICheck
+}
+
+// releaseContinuation frees an outcome's continuation when nothing downstream
+// will use it.
+func releaseContinuation(outcome Outcome) {
+	if outcome.Continuation != nil {
+		outcome.Continuation.Release()
+	}
 }
 
 // AttemptRunner executes one prepared attempt. U4's phase engine implements
