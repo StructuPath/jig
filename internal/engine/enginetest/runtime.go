@@ -6,6 +6,11 @@
 // session identity, options) so tests can assert that corrections re-enter
 // the SAME live session, that fresh sessions appear after deaths, and that
 // a can-resume=false engine replays transcript digests into new sessions.
+//
+// The fake is safe for concurrent StartOrContinue calls, which a parallel
+// group makes. Concurrent calls arrive in no fixed order, so steps can be
+// routed: Route gives calls matching a predicate (a role's system prompt,
+// say) their own queue, and Started/WaitFor let two calls rendezvous.
 package enginetest
 
 import (
@@ -44,6 +49,17 @@ type Step struct {
 	ExitCode int
 	// Usage is the send's reported accounting.
 	Usage runtime.Usage
+	// Started, when set, is closed as the call starts, so another step can
+	// wait for this one to be running.
+	Started chan struct{}
+	// WaitFor, when set, holds the send (no events, no result) until it is
+	// closed or the send is killed.
+	WaitFor <-chan struct{}
+	// Delay holds the result this long after WaitFor released, or until the
+	// send is killed.
+	Delay time.Duration
+	// ProcessGroup is the process group the handle reports.
+	ProcessGroup int64
 }
 
 // Call records one StartOrContinue invocation for assertions.
@@ -61,10 +77,25 @@ type Runtime struct {
 	// the transcript-digest degraded path.
 	CanResume bool
 
-	mutex sync.Mutex
+	mutex  sync.Mutex
+	steps  []Step
+	next   int
+	routes []*route
+	calls  []Call
+	kills  int
+}
+
+// route is a queue of steps reserved for the calls its predicate matches.
+type route struct {
+	match func(Call) bool
 	steps []Step
 	next  int
-	calls []Call
+}
+
+// ForSystemPrompt matches the calls made under one system prompt — in
+// practice, one role's calls.
+func ForSystemPrompt(prompt string) func(Call) bool {
+	return func(call Call) bool { return call.Options.SystemPrompt == prompt }
 }
 
 // New builds a resume-capable scripted runtime.
@@ -79,6 +110,22 @@ func (r *Runtime) Append(steps ...Step) {
 	r.steps = append(r.steps, steps...)
 }
 
+// Route reserves steps for the calls match accepts. A matching call takes
+// the next unconsumed step of the first matching route that has one, and
+// never falls through to the unrouted queue.
+func (r *Runtime) Route(match func(Call) bool, steps ...Step) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.routes = append(r.routes, &route{match: match, steps: steps})
+}
+
+// Kills reports how many sends were killed.
+func (r *Runtime) Kills() int {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	return r.kills
+}
+
 // Calls returns a copy of every recorded call.
 func (r *Runtime) Calls() []Call {
 	r.mutex.Lock()
@@ -90,7 +137,11 @@ func (r *Runtime) Calls() []Call {
 func (r *Runtime) Remaining() int {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
-	return len(r.steps) - r.next
+	remaining := len(r.steps) - r.next
+	for _, route := range r.routes {
+		remaining += len(route.steps) - route.next
+	}
+	return remaining
 }
 
 // Probe reports the scripted capability record.
@@ -106,12 +157,11 @@ func (r *Runtime) StartOrContinue(
 	_ context.Context, session *runtime.Session, prompt string, opts runtime.Options,
 ) (runtime.Handle, error) {
 	r.mutex.Lock()
-	if r.next >= len(r.steps) {
+	step, found := r.nextStep(Call{Prompt: prompt, SessionKey: session.Key, Options: opts})
+	if !found {
 		r.mutex.Unlock()
-		return nil, fmt.Errorf("scripted runtime: no step for call %d (prompt %.80q)", r.next+1, prompt)
+		return nil, fmt.Errorf("scripted runtime: no step for call %d (prompt %.80q)", len(r.calls)+1, prompt)
 	}
-	step := r.steps[r.next]
-	r.next++
 	if session.NativeID == "" {
 		session.NativeID = "fake-" + session.Key
 	}
@@ -138,13 +188,38 @@ func (r *Runtime) StartOrContinue(
 		}
 	}
 
+	if step.Started != nil {
+		close(step.Started)
+	}
 	handle := &handle{
-		step:   step,
-		events: make(chan runtime.Event, len(step.Events)+1),
-		killed: make(chan struct{}),
+		runtime: r,
+		step:    step,
+		events:  make(chan runtime.Event, len(step.Events)+1),
+		killed:  make(chan struct{}),
 	}
 	go handle.run()
 	return handle, nil
+}
+
+// nextStep takes the next step for a call: its route's, when one matches,
+// else the unrouted queue's. Callers hold the mutex.
+func (r *Runtime) nextStep(call Call) (Step, bool) {
+	routed := false
+	for _, route := range r.routes {
+		if !route.match(call) {
+			continue
+		}
+		routed = true
+		if route.next < len(route.steps) {
+			route.next++
+			return route.steps[route.next-1], true
+		}
+	}
+	if routed || r.next >= len(r.steps) {
+		return Step{}, false
+	}
+	r.next++
+	return r.steps[r.next-1], true
 }
 
 func resolvePath(path string, opts runtime.Options) (string, error) {
@@ -163,6 +238,7 @@ func resolvePath(path string, opts runtime.Options) (string, error) {
 }
 
 type handle struct {
+	runtime  *Runtime
 	step     Step
 	events   chan runtime.Event
 	killed   chan struct{}
@@ -170,6 +246,22 @@ type handle struct {
 }
 
 func (h *handle) run() {
+	if h.step.WaitFor != nil {
+		select {
+		case <-h.step.WaitFor:
+		case <-h.killed:
+			close(h.events)
+			return
+		}
+	}
+	if h.step.Delay > 0 {
+		select {
+		case <-time.After(h.step.Delay):
+		case <-h.killed:
+			close(h.events)
+			return
+		}
+	}
 	if h.step.Hang {
 		// Emit nothing; the channel closes only when the group is "killed".
 		<-h.killed
@@ -191,10 +283,15 @@ func (h *handle) run() {
 }
 
 func (h *handle) Events() <-chan runtime.Event { return h.events }
-func (h *handle) ProcessGroupID() int64        { return 0 }
+func (h *handle) ProcessGroupID() int64        { return h.step.ProcessGroup }
 
 func (h *handle) Kill() error {
-	h.killOnce.Do(func() { close(h.killed) })
+	h.killOnce.Do(func() {
+		h.runtime.mutex.Lock()
+		h.runtime.kills++
+		h.runtime.mutex.Unlock()
+		close(h.killed)
+	})
 	return nil
 }
 

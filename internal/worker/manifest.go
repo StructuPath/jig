@@ -71,8 +71,14 @@ type attemptManifest struct {
 	WorktreePath  string `json:"worktree_path"`
 	Branch        string `json:"branch"`
 
-	// ProcessGroupID and ProcessActive are recorded by U4's supervisor;
-	// U3 keeps them zero.
+	// ProcessGroups is the SET of agent process groups live in this attempt
+	// right now. A parallel reviewer group runs several agent subprocesses at
+	// once, each in its own group, and start-time reconciliation must stop
+	// every one a crashed worker left behind.
+	ProcessGroups []int64 `json:"process_groups,omitempty"`
+	// ProcessGroupID and ProcessActive are the single-group record older jig
+	// versions wrote. They are still read — reconciliation stops a group a
+	// crashed older worker recorded — but no longer written.
 	ProcessGroupID int64 `json:"process_group_id,omitempty"`
 	ProcessActive  bool  `json:"process_active"`
 
@@ -451,6 +457,16 @@ func (store *manifestStore) validate(manifest attemptManifest) error {
 	}
 	if manifest.ProcessActive && !signallableProcessGroup(manifest.ProcessGroupID) {
 		return errors.New("attempt manifest advertises a live process without a signallable group id")
+	}
+	seenGroups := make(map[int64]bool, len(manifest.ProcessGroups))
+	for _, groupID := range manifest.ProcessGroups {
+		if !signallableProcessGroup(groupID) {
+			return fmt.Errorf("attempt manifest process group %d can never name a real group", groupID)
+		}
+		if seenGroups[groupID] {
+			return fmt.Errorf("attempt manifest lists process group %d twice", groupID)
+		}
+		seenGroups[groupID] = true
 	}
 	if !manifestLifecycles[manifest.Lifecycle] {
 		return fmt.Errorf("attempt manifest lifecycle %q is invalid", manifest.Lifecycle)

@@ -32,6 +32,10 @@ type attemptScratch struct {
 	root    string
 	home    string
 	handoff string
+	// members holds one ephemeral HOME per parallel group member, beside
+	// the chain's HOME rather than inside it, created when a member first
+	// runs (parallel.go).
+	members string
 }
 
 // createScratch materializes the attempt's scratch family under root, 0700.
@@ -41,6 +45,7 @@ func createScratch(root, attemptID string) (*attemptScratch, error) {
 		root:    base,
 		home:    filepath.Join(base, "home"),
 		handoff: filepath.Join(base, "handoff"),
+		members: filepath.Join(base, "members"),
 	}
 	for _, dir := range []string{scratch.home, scratch.handoff} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

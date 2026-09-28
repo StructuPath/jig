@@ -179,13 +179,26 @@ func (noEngineRunner) Run(context.Context, *PreparedAttempt) Outcome {
 
 // RecordProcessGroup records an attempt's live subprocess group into its
 // manifest (U4). The phase engine reports each agent process group as it
-// starts and stops — the manifest's ProcessGroupID/ProcessActive fields are
-// what start-time reconciliation uses to stop orphaned groups a crashed
-// worker left behind.
+// starts and stops; the manifest keeps the SET of groups live at once — a
+// parallel reviewer group runs several — and start-time reconciliation stops
+// every one a crashed worker left behind. Calls may arrive concurrently; the
+// manifest store serializes them.
 func (w *Worker) RecordProcessGroup(attemptID string, processGroupID int64, active bool) error {
+	if active && !signallableProcessGroup(processGroupID) {
+		return fmt.Errorf("process group %d can never name a real group", processGroupID)
+	}
 	_, err := w.manifests.update(attemptID, func(manifest *attemptManifest) error {
-		manifest.ProcessGroupID = processGroupID
-		manifest.ProcessActive = active
+		groups := make([]int64, 0, len(manifest.ProcessGroups)+1)
+		for _, groupID := range manifest.ProcessGroups {
+			if groupID != processGroupID {
+				groups = append(groups, groupID)
+			}
+		}
+		if active {
+			groups = append(groups, processGroupID)
+		}
+		sort.Slice(groups, func(i, j int) bool { return groups[i] < groups[j] })
+		manifest.ProcessGroups = groups
 		return nil
 	})
 	return err

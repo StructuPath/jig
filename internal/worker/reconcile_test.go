@@ -105,8 +105,87 @@ func TestReconcileStopsTheProcessGroupsACrashedWorkerLeftRunning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.ProcessActive {
+	if manifest.ProcessActive || len(manifest.ProcessGroups) != 0 {
 		t.Fatal("the manifest still advertises a live process group after it was stopped")
+	}
+}
+
+// A parallel reviewer group runs several agents at once. The manifest keeps
+// the SET of live groups — recording one never overwrites another, and
+// clearing one leaves the rest — and reconciliation stops every group a
+// crashed worker left in it.
+func TestReconcileStopsEveryLiveGroupOfAParallelGroup(t *testing.T) {
+	h := newHarness(t)
+	dataDir := filepath.Join(t.TempDir(), "worker")
+	w, attemptID := claimOneAttempt(t, h, dataDir)
+
+	first, second, finished := startGroupLeader(t), startGroupLeader(t), startGroupLeader(t)
+	for _, groupID := range []int{first, finished, second} {
+		if err := w.RecordProcessGroup(attemptID, int64(groupID), true); err != nil {
+			t.Fatalf("record process group %d: %v", groupID, err)
+		}
+	}
+	if err := w.RecordProcessGroup(attemptID, int64(finished), false); err != nil {
+		t.Fatalf("clear process group: %v", err)
+	}
+	manifest, err := w.manifests.load(attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{int64(first), int64(second)}
+	if want[0] > want[1] {
+		want[0], want[1] = want[1], want[0]
+	}
+	if len(manifest.ProcessGroups) != 2 || manifest.ProcessGroups[0] != want[0] || manifest.ProcessGroups[1] != want[1] {
+		t.Fatalf("recorded groups = %v, want exactly the two still live %v", manifest.ProcessGroups, want)
+	}
+
+	restarted := newTestWorker(t, h, dataDir, 1, RunnerFunc(
+		func(context.Context, *PreparedAttempt) Outcome {
+			return Outcome{State: protocol.AttemptFailed, Error: "unused"}
+		}))
+	report, err := restarted.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(report.StoppedProcessGroups) != 2 {
+		t.Fatalf("reconcile stopped %v, want both live members' groups %v", report.StoppedProcessGroups, want)
+	}
+	waitForProcessExit(t, first, 15*time.Second)
+	waitForProcessExit(t, second, 15*time.Second)
+	if err := syscall.Kill(-finished, 0); err != nil {
+		t.Fatalf("reconcile stopped a group the manifest had already cleared: %v", err)
+	}
+	after, err := restarted.manifests.load(attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.ProcessGroups) != 0 {
+		t.Fatalf("the manifest still records %v after reconciliation", after.ProcessGroups)
+	}
+}
+
+// Concurrent records — members starting at once — all land.
+func TestConcurrentProcessGroupRecordsAllLand(t *testing.T) {
+	h := newHarness(t)
+	dataDir := filepath.Join(t.TempDir(), "worker")
+	w, attemptID := claimOneAttempt(t, h, dataDir)
+	const members = 8
+	errs := make(chan error, members)
+	for i := 0; i < members; i++ {
+		go func(groupID int64) { errs <- w.RecordProcessGroup(attemptID, groupID, true) }(int64(1000 + i))
+	}
+	for i := 0; i < members; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+	manifest, err := w.manifests.load(attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.ProcessGroups) != members {
+		t.Fatalf("recorded %v, want all %d concurrent records", manifest.ProcessGroups, members)
 	}
 }
 
@@ -174,7 +253,7 @@ func TestAProcessGroupIdAtOrBelowOneIsNeverSignalled(t *testing.T) {
 				"stopProcessGroup would negate it into a machine-wide kill", groupID)
 		}
 		manifest := attemptManifest{ProcessGroupID: groupID, ProcessActive: true}
-		ours, reason := processGroupIsOurs(context.Background(), manifest)
+		ours, reason := processGroupIsOurs(context.Background(), manifest, groupID)
 		if ours {
 			t.Errorf("process group %d was claimed as ours", groupID)
 		}
@@ -263,6 +342,19 @@ func TestAManifestCannotCarryAnUnsignallableProcessGroup(t *testing.T) {
 	live.ProcessActive = true
 	if err := store.validate(live); err != nil {
 		t.Errorf("a real live process group must stay valid: %v", err)
+	}
+	// The set is held to the same bar, and never lists a group twice.
+	for _, groups := range [][]int64{{4242, 1}, {0}, {-1}, {4242, 4242}} {
+		manifest := base
+		manifest.ProcessGroups = groups
+		if err := store.validate(manifest); err == nil {
+			t.Errorf("a manifest recording process groups %v validated", groups)
+		}
+	}
+	set := base
+	set.ProcessGroups = []int64{4242, 4343}
+	if err := store.validate(set); err != nil {
+		t.Errorf("a set of real live process groups must stay valid: %v", err)
 	}
 }
 
