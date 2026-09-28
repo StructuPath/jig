@@ -3,6 +3,7 @@ package protocol
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // simpleSDLC is the plan's canonical shape (KTD2): an agent-phase repair
@@ -439,7 +440,40 @@ roster:
 phases:
   - {name: build, kind: agent, owner: builder}
 publish: {}
-`, "hold_when is required")
+`, "declare hold_when, ci, or both")
+}
+
+func TestPublishCIWaitIsOptInWithABoundedTimeout(t *testing.T) {
+	const base = `
+name: ci
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if spec := mustParse(t, base); spec.WaitsForCI() {
+		t.Fatal("a definition with no publish block waits for CI; CI wait is opt-in")
+	}
+	if spec := mustParse(t, base+"publish: {hold_when: \"risk == high\"}\n"); spec.WaitsForCI() {
+		t.Fatal("a definition with only hold_when waits for CI")
+	}
+	if spec := mustParse(t, base+"publish: {ci: {wait: false}}\n"); spec.WaitsForCI() {
+		t.Fatal("ci.wait: false waits for CI")
+	}
+
+	spec := mustParse(t, base+"publish: {ci: {wait: true}}\n")
+	if !spec.WaitsForCI() || spec.CITimeout() != DefaultCITimeout {
+		t.Fatalf("waits=%v timeout=%s, want a wait with the default %s",
+			spec.WaitsForCI(), spec.CITimeout(), DefaultCITimeout)
+	}
+	spec = mustParse(t, base+"publish: {hold_when: \"risk != low\", ci: {wait: true, timeout: 45m}}\n")
+	if !spec.WaitsForCI() || spec.CITimeout() != 45*time.Minute || spec.Publish.HoldWhen != "risk != low" {
+		t.Fatalf("publish = %+v timeout=%s, want hold_when and a 45m CI wait", spec.Publish, spec.CITimeout())
+	}
+
+	mustReject(t, base+"publish: {ci: {wait: true, timeout: soon}}\n", "publish: ci: timeout", "not a duration")
+	mustReject(t, base+"publish: {ci: {wait: true, timeout: 30s}}\n", "publish: ci: timeout", "outside")
+	mustReject(t, base+"publish: {ci: {wait: true, timeout: 7h}}\n", "publish: ci: timeout", "outside")
 }
 
 func TestNegativeRoleBudgetIsRejected(t *testing.T) {

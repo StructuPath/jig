@@ -34,6 +34,11 @@ type fakeGateway struct {
 	failCreate error
 	byHead     map[string]PullRequest
 	requests   []PullRequestRequest
+	// checks scripts CI: it is called once per poll with the commit being
+	// judged and the 1-based poll count. Nil reports no checks at all.
+	checks     func(sha string, poll int) ([]CICheck, error)
+	checkPolls int
+	checkedSHA []string
 }
 
 func newFakeGateway() *fakeGateway {
@@ -59,6 +64,17 @@ func (g *fakeGateway) FindOrCreatePullRequest(_ context.Context, request PullReq
 	}
 	g.byHead[request.Head] = pullRequest
 	return pullRequest, nil
+}
+
+func (g *fakeGateway) CommitChecks(_ context.Context, _ string, sha string) ([]CICheck, error) {
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+	g.checkPolls++
+	g.checkedSHA = append(g.checkedSHA, sha)
+	if g.checks == nil {
+		return nil, nil
+	}
+	return g.checks(sha, g.checkPolls)
 }
 
 func (g *fakeGateway) counts() (created, adopted int) {
@@ -614,7 +630,7 @@ func TestRepublishingAProvenPushCreatesNoDuplicateBranchOrPullRequest(t *testing
 		baseSHA:       head,
 		lease:         newAttemptLease(w.client, attempt.ID, "unused-token-for-a-ledger-that-answers-first"),
 	}
-	summary := w.publish(context.Background(), gateway, PublishOptions{}, target, []string{"work.txt"})
+	summary := w.publish(context.Background(), gateway, PublishOptions{}, target, []string{"work.txt"}, ciPolicy{})
 	if !summary.Published() {
 		t.Fatalf("re-publish summary = %+v, want published from the ledger alone", summary)
 	}

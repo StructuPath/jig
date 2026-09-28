@@ -61,7 +61,7 @@ func loadPublishContext(ctx context.Context, tx *sql.Tx, attemptID string) (publ
 func validatePublishStep(step, branch, expectedBranch string) error {
 	if !protocol.ValidPublishStep(step) {
 		return invalid("invalid_publish_step",
-			"step must be one of push, pull_request, proof")
+			"step must be one of push, pull_request, proof, ci")
 	}
 	if len(branch) > protocol.MaxPublishBranchBytes {
 		return invalid("invalid_publish_branch", "branch exceeds its storage limit")
@@ -193,10 +193,10 @@ func (s *Store) RecordPublishStep(
 		return record, invalid("invalid_publish_ref", "remote_ref exceeds its storage limit")
 	}
 	switch input.Step {
-	case protocol.PublishStepPush, protocol.PublishStepProof:
+	case protocol.PublishStepPush, protocol.PublishStepProof, protocol.PublishStepCI:
 		if !publishRefPattern.MatchString(input.RemoteRef) {
 			return record, invalid("invalid_publish_ref",
-				"push and proof records must carry the pushed commit SHA as remote_ref")
+				"push, proof, and ci records must carry a commit SHA as remote_ref")
 		}
 	case protocol.PublishStepPullRequest:
 		if !strings.HasPrefix(input.PullRequestURL, "https://") {
@@ -423,6 +423,10 @@ func (s *Store) RetryPublish(
 	records, err := s.AttemptPublishRecords(ctx, attemptID)
 	if err != nil {
 		return retry, err
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT snapshot FROM runs WHERE id = ?`, job.RunID).Scan(&retry.Snapshot); err != nil {
+		return retry, unavailable(err)
 	}
 	retry.Attempt = attempt
 	retry.Job = job

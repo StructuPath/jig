@@ -8,7 +8,7 @@
 // on a context that cannot be cancelled and never consults the attempt's
 // cancellation signal: cancel is a no-op inside publish.
 //
-// Three idempotent steps, each authorized before its side effect and recorded
+// Three idempotent steps (four with CI), each authorized before its side effect and recorded
 // after it, both under the lease token (R6):
 //
 //	push          the attempt-scoped branch jig/<job-id>/<attempt-n>, staging
@@ -20,6 +20,12 @@
 //	proof         the REMOTE ref is read back and must equal the pushed
 //	              commit; a local ref or reflog entry proves nothing, and it is
 //	              this proof that later unblocks worktree cleanup (R16)
+//	ci            only when the definition sets publish.ci.wait: the branch's
+//	              current remote head must go green before the job may be
+//	              `accepted`. This step has no side effect, so it is the one
+//	              place publish honours cancellation — a cancel while waiting
+//	              ends it as ci_wait_cancelled, with the branch and pull
+//	              request left in place
 //
 // A push that succeeds and a pull request that fails leaves the job
 // `accepted_unpublished` with every proven step recorded, and the publish-only
@@ -47,10 +53,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/StructuPath/jig/internal/protocol"
 )
@@ -107,14 +115,18 @@ const (
 // says it reused push and performed pull_request is a retry that provably did
 // not push twice.
 type PublishSummary struct {
-	State          string   `json:"state"`
-	Code           string   `json:"code,omitempty"`
-	Detail         string   `json:"detail,omitempty"`
-	Branch         string   `json:"branch,omitempty"`
-	RemoteRef      string   `json:"remote_ref,omitempty"`
-	PullRequestURL string   `json:"pr_url,omitempty"`
-	Performed      []string `json:"performed_steps,omitempty"`
-	Reused         []string `json:"reused_steps,omitempty"`
+	State          string `json:"state"`
+	Code           string `json:"code,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+	Branch         string `json:"branch,omitempty"`
+	RemoteRef      string `json:"remote_ref,omitempty"`
+	PullRequestURL string `json:"pr_url,omitempty"`
+	// CIRef is the head commit CI was judged on; CIFailures names the checks
+	// that were red (or still pending at the timeout), bounded.
+	CIRef      string    `json:"ci_ref,omitempty"`
+	CIFailures []CICheck `json:"ci_failures,omitempty"`
+	Performed  []string  `json:"performed_steps,omitempty"`
+	Reused     []string  `json:"reused_steps,omitempty"`
 }
 
 // Published reports whether the pipeline completed with remote proof — the
@@ -149,6 +161,28 @@ type PullRequestRequest struct {
 // request. Tests substitute a fake; no unit test reaches GitHub.
 type PullRequestGateway interface {
 	FindOrCreatePullRequest(ctx context.Context, request PullRequestRequest) (PullRequest, error)
+	// CommitChecks reports every CI signal attached to one commit: check runs
+	// and legacy commit statuses alike, each normalized to pending, pass, or
+	// fail.
+	CommitChecks(ctx context.Context, repository, sha string) ([]CICheck, error)
+}
+
+// CI check verdicts, normalized across check runs and commit statuses.
+const (
+	CIPending = "pending"
+	CIPass    = "pass"
+	CIFail    = "fail"
+)
+
+// CICheck is one CI signal on a commit.
+type CICheck struct {
+	Name string `json:"name"`
+	// Verdict is CIPending, CIPass, or CIFail.
+	Verdict string `json:"verdict"`
+	// Conclusion is GitHub's own word (failure, timed_out, error, …), kept
+	// for the diagnostic.
+	Conclusion string `json:"conclusion,omitempty"`
+	URL        string `json:"url,omitempty"`
 }
 
 // ---- publish options -------------------------------------------------------
@@ -164,6 +198,43 @@ type PublishOptions struct {
 	// BaseBranch is the pull request's target branch; empty resolves the
 	// repository's default branch through the gateway.
 	BaseBranch string
+	// CIPollInterval and CIRegistrationGrace override the protocol defaults;
+	// zero means the default. Tests shrink them; operators need not.
+	CIPollInterval      time.Duration
+	CIRegistrationGrace time.Duration
+}
+
+func (o PublishOptions) ciPollInterval() time.Duration {
+	if o.CIPollInterval > 0 {
+		return o.CIPollInterval
+	}
+	return protocol.CIPollInterval
+}
+
+func (o PublishOptions) ciRegistrationGrace() time.Duration {
+	if o.CIRegistrationGrace > 0 {
+		return o.CIRegistrationGrace
+	}
+	return protocol.CIRegistrationGrace
+}
+
+// ciPolicy is what the frozen definition says about CI: whether publish
+// waits for it, and for how long.
+type ciPolicy struct {
+	wait    bool
+	timeout time.Duration
+}
+
+// ciPolicyFor reads the policy out of a run snapshot. A snapshot that does
+// not parse could not have run; publish does not wait on it, and the control
+// plane — which parses the same snapshot — refuses to accept the attempt, so
+// a parse failure can never turn into an unchecked `accepted`.
+func ciPolicyFor(snapshot string) ciPolicy {
+	spec, err := protocol.ParseDefinition([]byte(snapshot))
+	if err != nil {
+		return ciPolicy{}
+	}
+	return ciPolicy{wait: spec.WaitsForCI(), timeout: spec.CITimeout()}
 }
 
 func (o PublishOptions) authorName() string {
@@ -264,7 +335,7 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 	// cancellation signal deliberately unread. Every command inside still
 	// carries its own timeout, so "uncancellable" is not "unbounded".
 	summary := worker.publish(context.WithoutCancel(ctx), r.gateway, r.options,
-		target, changedPathsFromResult(outcome.Result))
+		target, changedPathsFromResult(outcome.Result), ciPolicyFor(prepared.Claim.Snapshot))
 	return publishedOutcome(outcome, summary)
 }
 
@@ -312,6 +383,7 @@ func (w *Worker) publish(
 	options PublishOptions,
 	target publishTarget,
 	changedPaths []string,
+	ci ciPolicy,
 ) PublishSummary {
 	summary := PublishSummary{State: PublishStateFailed, Branch: target.branch}
 	if target.branch != protocol.PublishBranch(target.jobID, target.attemptNumber) {
@@ -378,6 +450,23 @@ func (w *Worker) publish(
 				Branch: authorization.Branch, RemoteRef: pushed.RemoteRef}, nil
 		}); err != nil {
 		return summary
+	}
+	if ci.wait {
+		green, err := w.publishStep(ctx, target, protocol.PublishStepCI, proven, &summary,
+			func(authorization protocol.PublishAuthorization) (protocol.PublishStepRequest, error) {
+				head, failures, err := w.awaitCI(ctx, gateway, options, target, authorization.Branch, ci.timeout)
+				summary.CIRef = head
+				summary.CIFailures = failures
+				if err != nil {
+					return protocol.PublishStepRequest{}, err
+				}
+				return protocol.PublishStepRequest{Step: protocol.PublishStepCI,
+					Branch: authorization.Branch, RemoteRef: head}, nil
+			})
+		if err != nil {
+			return summary
+		}
+		summary.CIRef = green.RemoteRef
 	}
 	summary.State = PublishStatePublished
 	summary.Code = ""
@@ -551,25 +640,9 @@ func (w *Worker) commitChangedPaths(
 // ref this worker wrote itself all prove nothing — only the origin's answer
 // does, and it is this answer that later lets cleanup delete the worktree.
 func (w *Worker) verifyRemoteRef(ctx context.Context, target publishTarget, branch, expected string) error {
-	entry, err := w.cache.entry(ctx, target.repository)
+	observed, err := w.remoteHead(ctx, target, branch)
 	if err != nil {
-		return publishFailure("publish_repository_unavailable",
-			"repository cache entry unavailable: %s", err)
-	}
-	entry.mutex.Lock()
-	defer entry.mutex.Unlock()
-	stdout, err := runGit(ctx, entry.dir, "ls-remote", "origin", "refs/heads/"+branch)
-	if err != nil {
-		return publishFailure("publish_proof_unavailable", "%s", err.Error())
-	}
-	observed := ""
-	for _, line := range strings.Split(stdout, "\n") {
-		sha, ref, found := strings.Cut(strings.TrimSpace(line), "\t")
-		if !found || strings.TrimSpace(ref) != "refs/heads/"+branch {
-			continue
-		}
-		observed = strings.TrimSpace(sha)
-		break
+		return err
 	}
 	if observed == "" {
 		return publishFailure("publish_proof_missing",
@@ -580,6 +653,160 @@ func (w *Worker) verifyRemoteRef(ctx context.Context, target publishTarget, bran
 			"the remote's refs/heads/%s is %s, not the pushed commit %s", branch, observed, expected)
 	}
 	return nil
+}
+
+// remoteHead reads the branch's current commit on the remote itself (never a
+// local ref), or "" when the remote has no such branch.
+func (w *Worker) remoteHead(ctx context.Context, target publishTarget, branch string) (string, error) {
+	entry, err := w.cache.entry(ctx, target.repository)
+	if err != nil {
+		return "", publishFailure("publish_repository_unavailable",
+			"repository cache entry unavailable: %s", err)
+	}
+	entry.mutex.Lock()
+	defer entry.mutex.Unlock()
+	stdout, err := runGit(ctx, entry.dir, "ls-remote", "origin", "refs/heads/"+branch)
+	if err != nil {
+		return "", publishFailure("publish_proof_unavailable", "%s", err.Error())
+	}
+	for _, line := range strings.Split(stdout, "\n") {
+		sha, ref, found := strings.Cut(strings.TrimSpace(line), "\t")
+		if found && strings.TrimSpace(ref) == "refs/heads/"+branch {
+			return strings.TrimSpace(sha), nil
+		}
+	}
+	return "", nil
+}
+
+// ---- CI wait ---------------------------------------------------------------
+
+// awaitCI waits for CI on the branch's CURRENT remote head — not only the
+// commit jig pushed, so a fix a person pushed before a publish retry is the
+// one judged. It returns the head CI passed on, or a diagnostic:
+//
+//   - ci_failed: a check concluded red. It fails fast on the first red check
+//     rather than waiting for the rest — red is red.
+//   - ci_timeout: checks were still pending when the definition's timeout ran
+//     out.
+//   - ci_wait_cancelled: the operator cancelled the job while it waited.
+//   - ci_unavailable: check state could not be read MaxCITransientFailures
+//     times in a row.
+//
+// A head with no checks at all passes once CIRegistrationGrace has elapsed:
+// that repository runs no CI on this branch, and waiting the full timeout
+// would only park a worker slot. A head that moves mid-wait restarts the
+// grace clock but not the timeout.
+func (w *Worker) awaitCI(
+	ctx context.Context, gateway PullRequestGateway, options PublishOptions,
+	target publishTarget, branch string, timeout time.Duration,
+) (string, []CICheck, error) {
+	start := time.Now()
+	deadline := start.Add(timeout)
+	head, headSeen := "", start
+	transient := 0
+	var lastErr error
+	var pending []CICheck
+	for {
+		current, err := w.remoteHead(ctx, target, branch)
+		if err == nil && current == "" {
+			err = publishFailure("publish_proof_missing",
+				"the remote has no ref refs/heads/%s to run CI on", branch)
+		}
+		var checks []CICheck
+		if err == nil {
+			if current != head {
+				head, headSeen = current, time.Now()
+			}
+			checks, err = gateway.CommitChecks(ctx, target.repository, head)
+		}
+		if err != nil {
+			transient++
+			lastErr = err
+			if transient >= protocol.MaxCITransientFailures {
+				return head, nil, publishFailure("ci_unavailable",
+					"CI state could not be read %d times in a row: %s",
+					transient, boundedText(lastErr.Error(), protocol.MaxPublishDiagnosticBytes))
+			}
+		} else {
+			transient = 0
+			var failed []CICheck
+			pending = pending[:0]
+			for _, check := range checks {
+				switch check.Verdict {
+				case CIFail:
+					failed = append(failed, check)
+				case CIPending:
+					pending = append(pending, check)
+				}
+			}
+			if len(failed) > 0 {
+				return head, boundedChecks(failed), publishFailure("ci_failed",
+					"%d CI check(s) failed on %s: %s", len(failed), shortSHA(head), describeChecks(failed))
+			}
+			if len(checks) > 0 && len(pending) == 0 {
+				return head, nil, nil
+			}
+			if len(checks) == 0 && time.Since(headSeen) >= options.ciRegistrationGrace() {
+				return head, nil, nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			waiting := "no checks had registered"
+			if len(pending) > 0 {
+				waiting = "still pending: " + describeChecks(pending)
+			}
+			return head, boundedChecks(pending), publishFailure("ci_timeout",
+				"CI did not finish on %s within %s; %s", shortSHA(head), timeout, waiting)
+		}
+		wait := options.ciPollInterval()
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-target.lease.cancelled:
+			timer.Stop()
+			return head, nil, publishFailure("ci_wait_cancelled",
+				"the job was cancelled while waiting for CI on %s", shortSHA(head))
+		case <-ctx.Done():
+			timer.Stop()
+			return head, nil, publishFailure("ci_wait_cancelled", "the CI wait was interrupted: %s", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// maxReportedCIChecks bounds how many checks a summary names.
+const maxReportedCIChecks = 20
+
+func boundedChecks(checks []CICheck) []CICheck {
+	if len(checks) > maxReportedCIChecks {
+		checks = checks[:maxReportedCIChecks]
+	}
+	return append([]CICheck(nil), checks...)
+}
+
+func describeChecks(checks []CICheck) string {
+	parts := make([]string, 0, len(checks))
+	for i, check := range checks {
+		if i == maxReportedCIChecks {
+			parts = append(parts, fmt.Sprintf("and %d more", len(checks)-i))
+			break
+		}
+		label := check.Name
+		if check.Conclusion != "" && check.Verdict == CIFail {
+			label += " (" + check.Conclusion + ")"
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 // disabledHooksPath is an empty directory jig points git at for its own
@@ -807,7 +1034,7 @@ func (w *Worker) RetryPublish(
 	// The critical section again: a retry that has just pushed must not be
 	// abandoned before its pull request exists.
 	summary := w.publish(context.WithoutCancel(ctx), gateway, options, target,
-		changedPathsFromResult(retry.Attempt.Result))
+		changedPathsFromResult(retry.Attempt.Result), ciPolicyFor(retry.Snapshot))
 	outcome := publishedOutcome(Outcome{
 		State: protocol.AttemptAcceptedUnpublished, Result: retry.Attempt.Result,
 	}, summary)
@@ -1158,6 +1385,98 @@ func (g *GitHubCLIGateway) findPullRequest(ctx context.Context, project, head st
 			State: strings.ToLower(value.State)}, true, nil
 	}
 	return PullRequest{}, false, nil
+}
+
+// ciSHAPattern is a full commit SHA; nothing else goes into an API path.
+var ciSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+
+// CommitChecks reads both GitHub CI surfaces for one commit: check runs
+// (Actions and most apps) and the combined commit status (older integrations).
+// Each is read with --jq down to one compact JSON object per line, so the
+// parse never depends on how gh concatenates paginated pages.
+func (g *GitHubCLIGateway) CommitChecks(ctx context.Context, repository, sha string) ([]CICheck, error) {
+	project, err := githubProject(repository)
+	if err != nil {
+		return nil, err
+	}
+	if !ciSHAPattern.MatchString(sha) {
+		return nil, publishFailure("ci_invalid_ref", "%q is not a commit SHA", sha)
+	}
+	if _, err := g.lookPath()("gh"); err != nil {
+		return nil, publishFailure("gh_not_found",
+			"the GitHub CLI (gh) was not found on PATH. Install gh, then run `gh auth login`.")
+	}
+	runs, err := g.apiLines(ctx, "gh api check-runs",
+		"repos/"+project+"/commits/"+sha+"/check-runs?per_page=100",
+		`.check_runs[] | {name: .name, status: .status, conclusion: (.conclusion // ""), url: (.html_url // "")}`)
+	if err != nil {
+		return nil, err
+	}
+	statuses, err := g.apiLines(ctx, "gh api status",
+		"repos/"+project+"/commits/"+sha+"/status?per_page=100",
+		`.statuses[] | {name: .context, state: .state, url: (.target_url // "")}`)
+	if err != nil {
+		return nil, err
+	}
+	checks := make([]CICheck, 0, len(runs)+len(statuses))
+	for _, line := range runs {
+		var run struct{ Name, Status, Conclusion, URL string }
+		if err := json.Unmarshal(line, &run); err != nil {
+			return nil, publishFailure("gh_malformed_output", "gh api check-runs returned unreadable JSON")
+		}
+		checks = append(checks, CICheck{Name: run.Name, Verdict: checkRunVerdict(run.Status, run.Conclusion),
+			Conclusion: run.Conclusion, URL: run.URL})
+	}
+	for _, line := range statuses {
+		var status struct{ Name, State, URL string }
+		if err := json.Unmarshal(line, &status); err != nil {
+			return nil, publishFailure("gh_malformed_output", "gh api status returned unreadable JSON")
+		}
+		checks = append(checks, CICheck{Name: status.Name, Verdict: commitStatusVerdict(status.State),
+			Conclusion: status.State, URL: status.URL})
+	}
+	return checks, nil
+}
+
+func (g *GitHubCLIGateway) apiLines(ctx context.Context, label, path, filter string) ([][]byte, error) {
+	stdout, stderr, stdoutTooLarge, stderrTooLarge, err := g.run()(ctx, "gh",
+		"api", "--paginate", "-H", "Accept: application/vnd.github+json", path, "--jq", filter)
+	if err != nil {
+		return nil, ghDiagnostic(label, err, stderr, stdoutTooLarge, stderrTooLarge)
+	}
+	var lines [][]byte
+	for _, line := range bytes.Split(stdout, []byte("\n")) {
+		if line = bytes.TrimSpace(line); len(line) > 0 {
+			lines = append(lines, line)
+		}
+	}
+	return lines, nil
+}
+
+// checkRunVerdict maps a GitHub check run. Neutral and skipped conclusions
+// are not failures; anything else that completed without success is.
+func checkRunVerdict(status, conclusion string) string {
+	if status != "completed" {
+		return CIPending
+	}
+	switch conclusion {
+	case "success", "neutral", "skipped":
+		return CIPass
+	case "":
+		return CIPending
+	}
+	return CIFail
+}
+
+// commitStatusVerdict maps a legacy commit status state.
+func commitStatusVerdict(state string) string {
+	switch state {
+	case "success":
+		return CIPass
+	case "failure", "error":
+		return CIFail
+	}
+	return CIPending
 }
 
 func (g *GitHubCLIGateway) defaultBranch(ctx context.Context, project string) (string, error) {

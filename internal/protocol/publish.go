@@ -19,10 +19,15 @@ const (
 	PublishStepPush        = "push"
 	PublishStepPullRequest = "pull_request"
 	PublishStepProof       = "proof"
+	// PublishStepCI records a green CI run on the pull request's head. It
+	// runs only for definitions whose publish.ci waits, and its remote_ref is
+	// the head CI passed on — which may be a later commit than proof's when a
+	// person pushed a fix before the publish retry.
+	PublishStepCI = "ci"
 )
 
 // PublishSteps is the pipeline in execution order.
-var PublishSteps = []string{PublishStepPush, PublishStepPullRequest, PublishStepProof}
+var PublishSteps = []string{PublishStepPush, PublishStepPullRequest, PublishStepProof, PublishStepCI}
 
 // PublishStepPrerequisites names the steps that must already be recorded
 // before a step may be authorized or recorded. It is enforced
@@ -32,6 +37,7 @@ var PublishStepPrerequisites = map[string][]string{
 	PublishStepPush:        nil,
 	PublishStepPullRequest: {PublishStepPush},
 	PublishStepProof:       {PublishStepPush, PublishStepPullRequest},
+	PublishStepCI:          {PublishStepPush, PublishStepPullRequest, PublishStepProof},
 }
 
 // ValidPublishStep reports whether value names a publish step.
@@ -72,6 +78,19 @@ const (
 	// truncated parse.
 	MaxPublishStdoutBytes = 4 << 20
 	MaxPublishStderrBytes = 64 << 10
+
+	// CIPollInterval is how often the ci step re-reads check state while it
+	// waits. GitHub's own UI refreshes on a similar cadence.
+	CIPollInterval = 30 * time.Second
+
+	// CIRegistrationGrace is how long a head with no checks at all counts as
+	// "CI has not registered yet" before it counts as "this repository runs
+	// no CI". Workflows usually attach within seconds of a push.
+	CIRegistrationGrace = 2 * time.Minute
+
+	// MaxCITransientFailures is how many consecutive failed check reads the
+	// ci step tolerates before it gives up with a diagnostic.
+	MaxCITransientFailures = 3
 
 	// MaxPublishDiagnosticBytes caps the diagnostic text carried out of a
 	// failed publish step into the attempt result.
@@ -169,4 +188,7 @@ type PublishRetry struct {
 	Attempt Attempt         `json:"attempt"`
 	Job     Job             `json:"job"`
 	Records []PublishRecord `json:"records"`
+	// Snapshot is the run's frozen definition, so the retrying worker applies
+	// the same publish policy (a CI wait, say) the original attempt ran under.
+	Snapshot string `json:"snapshot"`
 }

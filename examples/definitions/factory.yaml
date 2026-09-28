@@ -28,6 +28,12 @@
 # `risk == high` so they fail closed: work the classifier never scored — a
 # missing or unexpected `risk` — is held, not shipped.
 #
+# THE CI GATE. `publish.ci.wait` makes green CI part of `accepted`: after the
+# pull request exists, the worker polls its head's checks for up to 30
+# minutes. Red or timed-out CI ends the job accepted_unpublished with the
+# failing checks named; push a fix to the branch and the publish retry
+# re-judges CI on the new head.
+#
 # THE ROSTER. Builders and reviewers are `opus`; the planner and the extra
 # high-risk reviewer are `sonnet`. `effort` is medium for building to a plan
 # and high for reviewers hunting what the build missed. `budget_usd` caps what
@@ -352,3 +358,6 @@ phases:
 acceptance: [all_phases_passed, verdict_consistent, diff_matches_claims]
 publish:
   hold_when: "risk != low"
+  ci:
+    wait: true
+    timeout: 30m
