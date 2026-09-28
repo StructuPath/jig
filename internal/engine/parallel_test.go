@@ -712,6 +712,26 @@ func TestAnUntriggeredFailingMemberEndsTheAttempt(t *testing.T) {
 	}
 }
 
+// A member that fails on a runtime error takes the fail exit, which inside a
+// group must not run a boundary check of its own: the member never took a
+// snapshot, so it would read the builder's authorized work as the member's
+// breach and roll it back. The group's one enforcement is the only check.
+func TestAMemberRuntimeErrorFailsWithoutItsOwnBoundaryCheck(t *testing.T) {
+	f := newRepairFixture(t, panelSnapshot(nil, twoMemberGroup), nil)
+	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+	f.fake.Route(correctnessRole, approve("correct", nil))
+	f.fake.Route(securityRole, enginetest.Step{IsError: true, ExitCode: 1, Text: "rate limit exceeded"})
+
+	outcome := executeWithin(t, f, 20*time.Second)
+	if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "rate limit exceeded") ||
+		strings.Contains(outcome.Error, "allowlist") {
+		t.Fatalf("outcome = %s (%s), want failed on the runtime error alone", outcome.State, outcome.Error)
+	}
+	if body, err := os.ReadFile(filepath.Join(f.repo, "src", "app.txt")); err != nil || string(body) != "app" {
+		t.Fatalf("the builder's authorized work was rolled back: %q, %v", body, err)
+	}
+}
+
 // A member's role may also own a phase outside the group. The two run in
 // different HOMEs, so they must never share a session key — a runtime would
 // try to resume a conversation that lives in the other HOME.
