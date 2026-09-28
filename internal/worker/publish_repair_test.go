@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/StructuPath/jig/internal/protocol"
 )
@@ -38,6 +39,7 @@ type roundScript struct {
 type scriptedContinuation struct {
 	t        *testing.T
 	worktree string
+	lease    *attemptLease
 	rounds   []roundScript
 	failures []CIFailure
 	released int
@@ -73,6 +75,7 @@ func (c *scriptedContinuation) Release() { c.released++ }
 func repairRunner(t *testing.T, continuation *scriptedContinuation) AttemptRunner {
 	return RunnerFunc(func(_ context.Context, attempt *PreparedAttempt) Outcome {
 		continuation.worktree = attempt.WorktreePath
+		continuation.lease = attempt.lease
 		if err := os.WriteFile(filepath.Join(attempt.WorktreePath, "work.txt"), []byte("work\n"), 0o644); err != nil {
 			t.Errorf("write work: %v", err)
 		}
@@ -381,5 +384,116 @@ func TestARoundCommittingUndeclaredPathsIsNotPushed(t *testing.T) {
 	}
 	if remoteBranches(t, s.originDir)[s.branch] != s.ci.judged[0] || len(s.rounds(t, attempt.ID)) != 0 {
 		t.Fatal("a round with an undeclared committed path was pushed or recorded")
+	}
+}
+
+// ---- R12: a round's fence after a gap (machine sleep) ----------------------
+
+// sleptRound is what a machine sleep does to a round: while the round runs,
+// the lease expires server-side (unswept), and the lease's clock is set so
+// its last renewal is either more than one HeartbeatInterval old (stale:
+// freshen must heartbeat) or pinned to it (fresh: freshen skips the
+// heartbeat). supersede also sweeps the attempt and retries the job, so a
+// successor attempt exists. The fence the round then meets is the pre-push
+// authorization. The publishing runner's outcome is captured because a
+// lease that stays lost also refuses the attempt's completion.
+func sleptRound(t *testing.T, stale, supersede bool) (*repairScenario, Outcome, *protocol.Attempt, error) {
+	t.Helper()
+	s := newRepairScenario(t, 2, 1)
+	s.continuation.rounds = []roundScript{{files: map[string]string{"fix.txt": "fixed\n"}, before: func() {
+		lease := s.continuation.lease
+		expireLease(t, s.h, lease.attemptID)
+		if supersede {
+			now := time.Now().UnixMilli()
+			if _, err := s.h.db.Exec(`UPDATE attempts SET state = 'lost', completed_at = ? WHERE id = ?`,
+				now, lease.attemptID); err != nil {
+				t.Errorf("sweep attempt: %v", err)
+			}
+			if _, err := s.h.db.Exec(`UPDATE jobs SET state = 'failed', updated_at = ? WHERE id = ?`,
+				now, s.job.ID); err != nil {
+				t.Errorf("fail job: %v", err)
+			}
+			if _, err := s.h.store.RetryJob(context.Background(), s.job.ID); err != nil {
+				t.Errorf("retry job: %v", err)
+			}
+		}
+		lease.mutex.Lock()
+		if stale {
+			lease.now = func() time.Time { return time.Now().Add(protocol.HeartbeatInterval) }
+		} else {
+			pinned := lease.lastRenewal
+			lease.now = func() time.Time { return pinned }
+		}
+		lease.mutex.Unlock()
+	}}}
+	var outcome Outcome
+	publisher := s.w.config.Runner
+	s.w.config.Runner = RunnerFunc(func(ctx context.Context, attempt *PreparedAttempt) Outcome {
+		outcome = publisher.Run(ctx, attempt)
+		return outcome
+	})
+	attempt, err := s.w.ClaimOnce(context.Background())
+	return s, outcome, attempt, err
+}
+
+// After a gap longer than HeartbeatInterval, the round's pre-push fence
+// heartbeats first, which revives the expired-but-unswept lease, and the
+// round is authorized, pushed, recorded, and judged green (R12).
+func TestAStaleClockRevivesAnExpiredLeaseBeforeTheRoundIsAuthorized(t *testing.T) {
+	s, _, attempt, err := sleptRound(t, true, false)
+	if err != nil || attempt == nil {
+		t.Fatalf("claim: attempt=%v err=%v, want the revived lease to carry the attempt through", attempt, err)
+	}
+	summary := publishSummaryOf(t, attempt.Result)
+	if attempt.State != protocol.AttemptAccepted || !summary.Published() {
+		t.Fatalf("attempt = %s summary = %+v, want the round authorized and the attempt accepted", attempt.State, summary)
+	}
+	rounds := s.rounds(t, attempt.ID)
+	if len(rounds) != 1 || rounds[0].HeadAfter != remoteBranches(t, s.originDir)[s.branch] {
+		t.Fatalf("rounds = %+v, want the one round recorded at the pushed fix", rounds)
+	}
+}
+
+// The control: the same expired lease, but a clock that says the last
+// renewal is recent. freshen skips the heartbeat, so the authorization meets
+// the expired lease and the round stops on lease_not_owner without pushing.
+// This is what proves the heartbeat, not the authorization, did the reviving.
+func TestAFreshClockSkipsTheHeartbeatAndTheExpiredLeaseIsRefused(t *testing.T) {
+	s, outcome, attempt, err := sleptRound(t, false, false)
+	if err == nil {
+		t.Fatalf("attempt = %+v, want the completion refused on the still-expired lease", attempt)
+	}
+	summary := publishSummaryOf(t, outcome.Result)
+	if summary.Code != "lease_not_owner" || len(summary.CIRepairs) != 1 ||
+		summary.CIRepairs[0].Outcome != "lease_not_owner" {
+		t.Fatalf("summary = %+v, want the round refused on lease_not_owner", summary)
+	}
+	if head := remoteBranches(t, s.originDir)[s.branch]; head != s.ci.judged[0] {
+		t.Fatalf("remote head = %s, want the red head %s: an unauthorized round pushed", head, s.ci.judged[0])
+	}
+}
+
+// A heartbeat never revives a lease whose job has a successor attempt: the
+// stale clock heartbeats, the control plane answers lease_superseded, and
+// the round neither pushes nor records.
+func TestAStaleClockDoesNotReviveASupersededLease(t *testing.T) {
+	s, outcome, attempt, err := sleptRound(t, true, true)
+	if err == nil {
+		t.Fatalf("attempt = %+v, a superseded attempt completed", attempt)
+	}
+	summary := publishSummaryOf(t, outcome.Result)
+	if summary.Code != "lease_superseded" || len(summary.CIRepairs) != 1 ||
+		summary.CIRepairs[0].Outcome != "lease_superseded" {
+		t.Fatalf("summary = %+v, want the round stopped on lease_superseded", summary)
+	}
+	if head := remoteBranches(t, s.originDir)[s.branch]; head != s.ci.judged[0] {
+		t.Fatalf("remote head = %s, want the red head %s: a superseded round pushed", head, s.ci.judged[0])
+	}
+	var rounds int
+	if err := s.h.db.QueryRow(`SELECT COUNT(*) FROM publish_ci_repairs`).Scan(&rounds); err != nil {
+		t.Fatal(err)
+	}
+	if rounds != 0 {
+		t.Fatalf("%d round(s) recorded, want none from a superseded lease", rounds)
 	}
 }
