@@ -279,6 +279,10 @@ type execution struct {
 	// pendingFields are a member view's envelope merges, replayed into the
 	// chain's field view in declared order at the join.
 	pendingFields []fieldMerge
+	// handoffSeed fingerprints the pre-group notes copied into a member's
+	// private handoff directory, so the join publishes only what the member
+	// itself wrote or changed.
+	handoffSeed map[string]string
 }
 
 // fieldMerge is one deferred mergeAgentFields call.

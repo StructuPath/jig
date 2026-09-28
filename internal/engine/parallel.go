@@ -28,6 +28,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -171,7 +173,7 @@ func (e *execution) runGroupOnce(
 			if err != nil {
 				return nil, e.groupInfra(names, err.Error())
 			}
-			if err := view.beginGroupRun(); err != nil {
+			if err := view.beginGroupRun(e.scratch.handoff); err != nil {
 				return nil, e.groupInfra(names, err.Error())
 			}
 			// Whatever a member left in its private handoff directory is
@@ -207,7 +209,8 @@ func (e *execution) runGroupOnce(
 		// A member's handoff notes join the chain's handoff directory only
 		// now, in declared order, each under its own folder: no sibling
 		// could read them mid-run, and none can overwrite another's.
-		if err := publishMemberHandoff(view.scratch.handoff, e.scratch.handoff, i, member.Name); err != nil {
+		if err := publishMemberHandoff(
+			view.scratch.handoff, e.scratch.handoff, i, member.Name, view.handoffSeed); err != nil {
 			e.emit.emit(protocol.EventError, member.Name, "handoff_merge_failed",
 				map[string]string{"error": err.Error()})
 		}
@@ -440,9 +443,14 @@ func (e *execution) memberView(index int, member protocol.PhaseSpec) (*execution
 }
 
 // beginGroupRun clears what one group run's merge reads, keeping what the
-// member carries across runs: its session, transcript, and seeded HOME. Its
-// private handoff directory starts empty every run.
-func (e *execution) beginGroupRun() error {
+// member carries across runs: its session, transcript, and seeded HOME.
+//
+// Its private handoff directory is rebuilt every run from the chain's
+// handoff directory — the notes every phase before the group left, which a
+// sequential reviewer could read too — minus handoff/parallel, where members'
+// own merged notes live: no member reads a sibling's notes. What was seeded
+// is fingerprinted, so the join publishes only what this member wrote.
+func (e *execution) beginGroupRun(shared string) error {
 	e.results = nil
 	e.pendingFields = nil
 	e.gateReports = make(map[string]protocol.GateReport)
@@ -453,8 +461,23 @@ func (e *execution) beginGroupRun() error {
 	if err := os.MkdirAll(e.scratch.handoff, 0o700); err != nil {
 		return fmt.Errorf("create member handoff directory: %w", err)
 	}
+	e.handoffSeed = make(map[string]string)
+	err := copyNotes(shared, e.scratch.handoff, func(relative string, digest string) bool {
+		if relative == memberNotesRoot || strings.HasPrefix(relative, memberNotesRoot+string(filepath.Separator)) {
+			return false
+		}
+		e.handoffSeed[relative] = digest
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("seed member handoff directory: %w", err)
+	}
 	return nil
 }
+
+// memberNotesRoot is where members' merged notes live inside the chain's
+// handoff directory.
+const memberNotesRoot = "parallel"
 
 // memberHandoffFolder is where a member's notes land inside the chain's
 // handoff directory: handoff/parallel/<phase>, or the member's index when
@@ -464,48 +487,56 @@ func memberHandoffFolder(shared string, index int, phase string) string {
 	if !filepath.IsLocal(name) || strings.ContainsAny(name, `/\`) {
 		name = "member-" + strconv.Itoa(index)
 	}
-	return filepath.Join(shared, "parallel", name)
+	return filepath.Join(shared, memberNotesRoot, name)
 }
 
-// publishMemberHandoff copies a member's private notes into the chain's
-// handoff directory, replacing what an earlier run of the same member put
-// there. Only regular files and directories are copied: a symlink is how an
-// agent would point the next phase at something outside the scratch family.
-func publishMemberHandoff(private, shared string, index int, phase string) error {
-	entries, err := os.ReadDir(private)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
+// publishMemberHandoff copies the notes a member wrote or changed — not the
+// pre-group notes it was seeded with — into the chain's handoff directory,
+// replacing what an earlier run of the same member put there.
+func publishMemberHandoff(private, shared string, index int, phase string, seed map[string]string) error {
 	target := memberHandoffFolder(shared, index, phase)
 	if err := os.RemoveAll(target); err != nil {
 		return err
 	}
-	if len(entries) == 0 {
+	return copyNotes(private, target, func(relative string, digest string) bool {
+		seeded, found := seed[relative]
+		return !found || seeded != digest
+	})
+}
+
+// copyNotes copies the regular files under source into destination,
+// creating directories as files need them, for every file keep accepts
+// (given its path relative to source and a digest of its content). Nothing
+// but regular files is copied: a symlink is how an agent would point the
+// next phase at something outside the scratch family. A missing source
+// copies nothing.
+func copyNotes(source, destination string, keep func(relative, digest string) bool) error {
+	if _, err := os.Lstat(source); os.IsNotExist(err) {
 		return nil
 	}
-	return filepath.WalkDir(private, func(path string, entry fs.DirEntry, walkErr error) error {
+	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		relative, err := filepath.Rel(private, path)
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		relative, err := filepath.Rel(source, path)
 		if err != nil {
 			return err
 		}
-		destination := filepath.Join(target, relative)
-		switch {
-		case entry.IsDir():
-			return os.MkdirAll(destination, 0o700)
-		case entry.Type().IsRegular():
-			body, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			return os.WriteFile(destination, body, 0o600)
-		default:
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(body)
+		if !keep(relative, hex.EncodeToString(sum[:])) {
 			return nil
 		}
+		target := filepath.Join(destination, relative)
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(target, body, 0o600)
 	})
 }

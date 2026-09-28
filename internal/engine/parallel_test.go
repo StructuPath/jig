@@ -575,11 +575,36 @@ func handoffDir(t *testing.T, prompt string) string {
 // the chain's handoff directory in declared order under per-member folders.
 func TestMembersKeepPrivateHandoffNotesThatMergeAtTheJoin(t *testing.T) {
 	f := newRepairFixture(t, panelSnapshot(nil, twoMemberGroup), nil)
+	built := writes(map[string]string{"src/app.txt": "app"}, "built the app")
+	built.Do = func(call enginetest.Call) {
+		// Notes a phase before the group left, and a stand-in for a
+		// sibling's notes merged on an earlier group run.
+		dir := handoffDir(t, call.Prompt)
+		for name, body := range map[string]string{
+			"plan.md": "the plan", filepath.Join("parallel", "review-security", "notes.md"): "sibling's",
+		} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o700); err != nil {
+				t.Errorf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+				t.Errorf("write %s: %v", name, err)
+			}
+		}
+	}
+	seesPreGroupNotesOnly := func(dir string) {
+		if body, err := os.ReadFile(filepath.Join(dir, "plan.md")); err != nil || string(body) != "the plan" {
+			t.Errorf("a member cannot read the notes earlier phases left: %q, %v", body, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "parallel")); !os.IsNotExist(err) {
+			t.Errorf("a member was seeded with members' merged notes: %v", err)
+		}
+	}
 	wrote := make(chan struct{})
 	correctness := approve("correct", nil)
 	correctness.Do = func(call enginetest.Call) {
 		defer close(wrote)
 		dir := handoffDir(t, call.Prompt)
+		seesPreGroupNotesOnly(dir)
 		if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("from correctness"), 0o600); err != nil {
 			t.Errorf("write correctness notes: %v", err)
 		}
@@ -588,6 +613,7 @@ func TestMembersKeepPrivateHandoffNotesThatMergeAtTheJoin(t *testing.T) {
 	security.Do = func(call enginetest.Call) {
 		<-wrote
 		dir := handoffDir(t, call.Prompt)
+		seesPreGroupNotesOnly(dir)
 		if _, err := os.Stat(filepath.Join(dir, "notes.md")); !os.IsNotExist(err) {
 			t.Errorf("security can see a sibling's notes mid-run in %s: %v", dir, err)
 		}
@@ -595,7 +621,7 @@ func TestMembersKeepPrivateHandoffNotesThatMergeAtTheJoin(t *testing.T) {
 			t.Errorf("write security notes: %v", err)
 		}
 	}
-	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+	f.fake.Route(buildRole, built)
 	f.fake.Route(correctnessRole, correctness)
 	f.fake.Route(securityRole, security)
 	f.fake.Route(maintainabilityRole, approve("maintainable", nil))
@@ -613,6 +639,13 @@ func TestMembersKeepPrivateHandoffNotesThatMergeAtTheJoin(t *testing.T) {
 		if err != nil || string(body) != want {
 			t.Fatalf("%s's merged notes = %q, %v; want %q", member, body, err, want)
 		}
+		// Only what the member wrote is published, not what it was seeded with.
+		if _, err := os.Stat(filepath.Join(shared, "parallel", member, "plan.md")); !os.IsNotExist(err) {
+			t.Fatalf("%s republished the pre-group notes it was seeded with: %v", member, err)
+		}
+	}
+	if body, err := os.ReadFile(filepath.Join(shared, "plan.md")); err != nil || string(body) != "the plan" {
+		t.Fatalf("the pre-group notes changed: %q, %v", body, err)
 	}
 	if got := handoffDir(t, callsFor(f.fake, closerRole)[0].Prompt); got != shared {
 		t.Fatalf("the phase after the group was pointed at %s, want the chain's handoff %s", got, shared)
