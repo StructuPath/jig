@@ -21,11 +21,13 @@ The report is only as good as the ledger underneath it. Run the trial on a
 | `jig report` and `GET /api/report` (PR #24) | there is no report. `jig report --help` must print its usage. |
 | Spend on every agent phase exit (PR #25) | spend omits every phase that did not pass. It also overcounts every resumed session, because Claude Code's `total_cost_usd` is a running total per session. |
 | Publish history across retries (PR #22) | a publish-only retry erases the stop code it replaces, so the *retried, still red* rate reads zero. |
-| Flaky-check re-runs (`publish.ci.rerun`, U4 of the plan) | optional. Without it, the *Re-runs* section is all zeros and section 3's masking threshold does not apply. |
+| Flaky-check re-runs (`publish.ci.rerun`, PR #28) | optional. Without it, the *Re-runs* section is all zeros and section 3's masking threshold does not apply. |
 
-This runbook describes re-runs as the plan specifies them (R5–R7, KTD5). The
-PR that implements them had not landed when this was written, so check the
-README's `publish.ci` bullets for the syntax as it shipped.
+This runbook describes re-runs as they shipped (R5–R7). One change from the
+plan's KTD5: jig re-runs the failed jobs of each workflow run with one
+`rerun-failed-jobs` request per run, not one request per job, because
+re-running one job puts its run in progress and GitHub then refuses its
+siblings. The README's `publish.ci` bullets have the full behaviour.
 
 Build once in your jig clone, run every command below from that clone, and
 use the same binary for `serve`, `worker`, and `report`:
@@ -94,15 +96,22 @@ JOB=$(gh run view "$RUN" --repo "$REPO" --json jobs --jq '.jobs[0].databaseId')
 gh api --allow-escape-sequences -H "Accept: application/vnd.github+json" \
     "repos/$REPO/actions/jobs/$JOB/logs" | tail -c 2000
 
-# The per-job re-run (KTD5). It really re-runs that job: CI minutes are
-# spent and the job's secrets are exercised, which is exactly what jig will do.
+# The job-to-run lookup jig makes before a re-run. It must print $RUN.
+gh api -H "Accept: application/vnd.github+json" "repos/$REPO/actions/jobs/$JOB" --jq .run_id
+
+# A re-run, which needs the same Actions write permission as the
+# rerun-failed-jobs request jig sends per workflow run. It really re-runs
+# the job: CI minutes are spent and its secrets are exercised, which is
+# exactly what jig will do. (rerun-failed-jobs itself needs a run with a
+# failed job, which a green main does not have.)
 gh api -X POST "repos/$REPO/actions/jobs/$JOB/rerun"
 ```
 
-The first call must print log text, not an error. The second must exit 0.
-If it fails with HTTP 403, the token cannot re-run jobs: fix it before
-declaring any `rerun` policy. Both calls matter because the two CI repair
-gate bugs showed up only against real `gh`. The fakes never saw them.
+The first call must print log text, not an error. The second must print the
+run id. The third must exit 0. If it fails with HTTP 403, the token cannot
+re-run Actions jobs: fix it before declaring any `rerun` policy. These calls
+matter because the two CI repair gate bugs showed up only against real
+`gh`. The fakes never saw them.
 
 ### 1.3 CI is green on `main`
 
@@ -169,17 +178,17 @@ Copy `factory.yaml` and edit what its header says to edit (the test
 command, the builder's `writes` allowlist, and the risk classifier's
 paths), then save it:
 
-To re-run failed Actions jobs before a repair round is spent (requires U4),
-the copy's `publish` block gains one line, a re-run budget of 1 to 3. A pass
-after a re-run publishes, and the report counts it as flaky, never as a
-clean first pass:
+The stock `factory.yaml` re-runs failed Actions jobs once before a repair
+round is spent: its `publish` block declares a re-run budget (1 to 3). A
+pass after a re-run publishes, and the report counts it as flaky, never as a
+clean first pass. Delete the `rerun` line to trial without re-runs:
 
 ```yaml
 publish:
   hold_when: "risk != low"
   ci:
     wait: true
-    rerun: {budget: 1}                  # the added line
+    rerun: {budget: 1}                  # delete to disable re-runs
     on_fail: {run: build, budget: 2}
     timeout: 30m
 ```
@@ -250,8 +259,8 @@ The worst case is roughly:
 |---|---|---|
 | `T_chain` | plan → build → test → reviewers → risk, until the PR is opened. Measure it on your first jobs (the UI lane's timeline). A round re-runs everything from `build` on, so it costs about as much. | measure |
 | `K` | `publish.ci.on_fail.budget`, the repair rounds | 2 |
-| `R` | `publish.ci.rerun.budget`, the re-runs per attempt (0 without U4) | 1 once U4 lands |
-| `T_ci` | `publish.ci.timeout`. A re-run first waits for every pending check on the head, so a slow sibling job counts against it too. | 30m |
+| `R` | `publish.ci.rerun.budget`, the re-runs per attempt (0 without a `rerun` line) | 1 |
+| `T_ci` | `publish.ci.timeout`. One re-run (waiting for every pending check on the head, the requests, and the judgement) fits in one `T_ci`, so a slow sibling job counts against it too. | 30m |
 
 With the stock values (K=2, R=1, T_ci=30m), the CI waits alone can take 2
 hours, which leaves about 40 minutes for each of the three chain runs. If

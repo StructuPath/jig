@@ -93,9 +93,6 @@ func (g *e2eGateway) RerunFailedJobs(context.Context, string, int64) error {
 	return fmt.Errorf("unexpected re-run request")
 }
 
-func TestACIRepairRoundRunsThroughTheRealWorkerWiring(t *testing.T) {
-	repo := initRepo(t)
-	serverData, workerData := t.TempDir(), t.TempDir()
 // scriptCIRepairRuntime scripts the chain's build and the repair round's.
 func scriptCIRepairRuntime(t *testing.T) {
 	t.Helper()
