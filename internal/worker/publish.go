@@ -125,8 +125,10 @@ type PublishSummary struct {
 	// that were red (or still pending at the timeout), bounded.
 	CIRef      string    `json:"ci_ref,omitempty"`
 	CIFailures []CICheck `json:"ci_failures,omitempty"`
-	Performed  []string  `json:"performed_steps,omitempty"`
-	Reused     []string  `json:"reused_steps,omitempty"`
+	// CIRepairs lists the CI repair rounds this publish ran, in order.
+	CIRepairs []CIRepairSummary `json:"ci_repairs,omitempty"`
+	Performed []string          `json:"performed_steps,omitempty"`
+	Reused    []string          `json:"reused_steps,omitempty"`
 }
 
 // Published reports whether the pipeline completed with remote proof — the
@@ -235,6 +237,9 @@ func (o PublishOptions) ciRegistrationGrace() time.Duration {
 type ciPolicy struct {
 	wait    bool
 	timeout time.Duration
+	// repairBudget is publish.ci.on_fail's budget; zero means red CI ends
+	// the attempt, as it always has.
+	repairBudget int
 }
 
 // ciPolicyFor reads the policy out of a run snapshot. A snapshot that does
@@ -246,7 +251,11 @@ func ciPolicyFor(snapshot string) ciPolicy {
 	if err != nil {
 		return ciPolicy{}
 	}
-	return ciPolicy{wait: spec.WaitsForCI(), timeout: spec.CITimeout()}
+	policy := ciPolicy{wait: spec.WaitsForCI(), timeout: spec.CITimeout()}
+	if policy.wait && spec.Publish.CI.OnFail != nil {
+		policy.repairBudget = spec.Publish.CI.OnFail.Budget
+	}
+	return policy
 }
 
 func (o PublishOptions) authorName() string {
@@ -349,8 +358,16 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 	// The critical section: an uncancellable context, and the attempt's
 	// cancellation signal deliberately unread. Every command inside still
 	// carries its own timeout, so "uncancellable" is not "unbounded".
+	ci := ciPolicyFor(prepared.Claim.Snapshot)
 	summary := worker.publish(context.WithoutCancel(ctx), r.gateway, r.options,
-		target, changedPathsFromResult(outcome.Result), ciPolicyFor(prepared.Claim.Snapshot))
+		target, changedPathsFromResult(outcome.Result), ci)
+	if summary.Code == "ci_failed" && outcome.Continuation != nil && ci.repairBudget > 0 {
+		// Rounds run on the same uncancelled context: cancellation reaches
+		// the engine through the attempt's cancel channel and the CI wait
+		// through the lease, while git and the ledger always finish.
+		summary = worker.repairCI(context.WithoutCancel(ctx), r.gateway, r.options,
+			target, outcome.Continuation, summary, ci)
+	}
 	return publishedOutcome(outcome, summary)
 }
 
