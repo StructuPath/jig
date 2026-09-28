@@ -1162,6 +1162,11 @@ phases:
 	if fake.Remaining() != 0 {
 		t.Fatalf("unconsumed scripted steps: %d", fake.Remaining())
 	}
+	// The breach turns the failure into an abort, and the entry's sends are
+	// still recorded.
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentAborted, Sends: protocol.ParseBudgetPerEmission + 1,
+	})
 }
 
 // ---- scenario: the send ladder is really bounded ---------------------------
@@ -1345,6 +1350,9 @@ phases:
 	if _, err := os.Stat(filepath.Join(repo, "src", "ok.txt")); err != nil {
 		t.Fatalf("the allowed write was discarded on the way out: %v", err)
 	}
+	requireAgentEnds(t, sink, agentEndPayload{
+		Outcome: protocol.AgentAborted, Sends: 1, UnmeteredSends: 1,
+	})
 }
 
 func TestACancelledAttemptStillEnforcesTheWriteBoundary(t *testing.T) {
