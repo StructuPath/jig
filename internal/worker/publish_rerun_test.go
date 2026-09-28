@@ -694,6 +694,12 @@ func TestFailedJobsOfOneWorkflowRunAreRerunTogether(t *testing.T) {
 			return []CICheck{actionsJob("test (1)", CIFail, 11), actionsJob("test (2)", CIFail, 12),
 				actionsJob("lint", CIFail, 31)}
 		}
+		if poll <= lastRequestAt+4 {
+			// The run's new jobs appear one at a time: test (2) still
+			// shows its old red run, which is pending, not red.
+			return []CICheck{actionsJob("test (1)", CIPass, 13), actionsJob("test (2)", CIFail, 12),
+				actionsJob("lint", CIPass, 32)}
+		}
 		return []CICheck{actionsJob("test (1)", CIPass, 13), actionsJob("test (2)", CIPass, 14),
 			actionsJob("lint", CIPass, 32)}
 	})
