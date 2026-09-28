@@ -488,10 +488,10 @@ phases:
   - {name: test, kind: code, owner: builder, command: "go test ./..."}
   - {name: review, kind: agent, owner: reviewer}
 `
-	spec := mustParse(t, base+"publish: {ci: {wait: true, on_fail: {run: build, resume_from: test, budget: 2}}}\n")
+	spec := mustParse(t, base+"publish: {ci: {wait: true, on_fail: {run: build, resume_from: test, budget: 1}}}\n")
 	repair := spec.Publish.CI.OnFail
-	if repair == nil || repair.Run != "build" || repair.ResumeFrom != "test" || repair.Budget != 2 {
-		t.Fatalf("on_fail = %+v, want run build, resume_from test, budget 2", repair)
+	if repair == nil || repair.Run != "build" || repair.ResumeFrom != "test" || repair.Budget != 1 {
+		t.Fatalf("on_fail = %+v, want run build, resume_from test, budget 1", repair)
 	}
 	mustParse(t, base+fmt.Sprintf(
 		"publish: {ci: {wait: true, on_fail: {run: build, resume_from: review, budget: %d}}}\n", MaxCIRepairRounds))
@@ -504,9 +504,9 @@ phases:
 		want         []string
 	}{
 		{"no wait", "{run: build, resume_from: test, budget: 1}", []string{"wait: true"}},
-		{"undefined run", "{run: fix, resume_from: test, budget: 1}", []string{"run", `"fix"`}},
+		{"undefined run", "{run: fix, resume_from: test, budget: 1}", []string{"run targets undefined phase", `"fix"`}},
 		{"code run", "{run: test, resume_from: review, budget: 1}", []string{`"test"`, "agent phase"}},
-		{"undefined resume_from", "{run: build, resume_from: lint, budget: 1}", []string{"resume_from", `"lint"`}},
+		{"undefined resume_from", "{run: build, resume_from: lint, budget: 1}", []string{"resume_from targets undefined phase", `"lint"`}},
 		{"resume_from is run", "{run: build, resume_from: build, budget: 1}", []string{"must come after"}},
 		{"resume_from before run", "{run: review, resume_from: test, budget: 1}", []string{"must come after"}},
 		{"zero budget", "{run: build, resume_from: test}", []string{"budget 0", "outside"}},
