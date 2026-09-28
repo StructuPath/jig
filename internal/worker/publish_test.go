@@ -39,21 +39,33 @@ type fakeGateway struct {
 	checks     func(sha string, poll int) ([]CICheck, error)
 	checkPolls int
 	checkedSHA []string
-	// rerun scripts re-run requests: it is called with the job id and the
-	// 1-based request count. Nil accepts every request. reruns lists the
-	// job ids of every request made, accepted or refused.
-	rerun  func(jobID int64, call int) error
+	// runOf maps an Actions job to its workflow run; nil puts every job in a
+	// run of its own whose id is the job id.
+	runOf func(jobID int64) int64
+	// rerun scripts re-run requests: it is called with the workflow run id
+	// and the 1-based request count. Nil accepts every request. reruns
+	// lists the run ids of every request made, accepted or refused.
+	rerun  func(runID int64, call int) error
 	reruns []int64
 }
 
-func (g *fakeGateway) RerunActionsJob(_ context.Context, _ string, jobID int64) error {
+func (g *fakeGateway) ActionsJobRun(_ context.Context, _ string, jobID int64) (int64, error) {
 	g.mutex.Lock()
 	defer g.mutex.Unlock()
-	g.reruns = append(g.reruns, jobID)
+	if g.runOf == nil {
+		return jobID, nil
+	}
+	return g.runOf(jobID), nil
+}
+
+func (g *fakeGateway) RerunFailedJobs(_ context.Context, _ string, runID int64) error {
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+	g.reruns = append(g.reruns, runID)
 	if g.rerun == nil {
 		return nil
 	}
-	return g.rerun(jobID, len(g.reruns))
+	return g.rerun(runID, len(g.reruns))
 }
 
 func (g *fakeGateway) rerunRequests() []int64 {

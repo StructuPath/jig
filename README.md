@@ -260,14 +260,21 @@ Rules worth knowing before you write one:
   `publish: {ci: {wait: true, rerun: {budget: 1}}}` re-runs the failed
   GitHub Actions jobs on the same head when CI is red on a head jig pushed,
   before any repair round (or before the job ends red, with no `on_fail`).
-  It first waits, within the CI timeout, until nothing on the head is still
-  running, since GitHub will not re-run a job in a running workflow; then it
-  re-runs each failed job with `gh api -X POST
-  repos/{owner}/{repo}/actions/jobs/{id}/rerun`, freshening the lease before
-  every request, and awaits CI again, reading each re-run job as pending
-  until its new run replaces the old red one. GitHub refusing because a
+  It first waits until nothing on the head is still running, since GitHub
+  will not re-run a job in a running workflow; then, for each workflow run
+  the failed jobs belong to, it makes one `gh api -X POST
+  repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs` request (per run,
+  not per job: re-running one job would put the run in progress and GitHub
+  would refuse its siblings), checking the lease and cancellation right
+  before each. It then judges that same head again, reading each re-run job
+  as pending until its new run replaces the old red one; if the branch moves
+  meanwhile, the re-run ends `ci_rerun_head_moved`, so a person's fix is
+  never reported as jig's flaky pass. The whole re-run — waiting, requests,
+  and judgement — fits in one CI timeout. GitHub refusing because a
   workflow run is in progress is waited out and does not spend the budget;
-  any other refusal is recorded and falls through to repair or the end. If
+  any other refusal is recorded and falls through to repair or the end. A
+  re-run GitHub accepted that never finishes, or whose CI cannot be read, is
+  recorded and leaves CI red as it was, so repair still runs. If
   any red check is not an Actions job (a commit status, another app), no
   re-run happens. Re-runs never move the branch. The budget, 1–3, is per
   attempt: a repair round's new head gets only what is left. Every re-run is

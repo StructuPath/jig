@@ -567,9 +567,195 @@ func TestThePublishRetryNeverReruns(t *testing.T) {
 	}
 }
 
+// ---- review fixes --------------------------------------------------------------
+
+// A person pushing after jig's re-run request is theirs to judge: the
+// judgement stays pinned to the re-run head and ends ci_rerun_head_moved,
+// never recording the person's green head as jig's flaky pass.
+func TestAPersonsPushAfterTheRerunIsNotAFlakyPass(t *testing.T) {
+	s, _ := newRerunScenario(t, 1, 0, func(head, reruns, _ int) []CICheck {
+		if head == 0 && reruns == 0 {
+			return []CICheck{actionsJob("test", CIFail, 11)}
+		}
+		if head == 0 {
+			return []CICheck{actionsJob("test", CIPending, 12)}
+		}
+		return []CICheck{actionsJob("test", CIPass, 21)}
+	})
+	var personal string
+	s.gateway.rerun = func(int64, int) error {
+		personal = pushToBranch(t, s.originDir, s.branch)
+		return nil
+	}
+	attempt, summary := s.run(t)
+	if attempt.State != protocol.AttemptAcceptedUnpublished || summary.Code != "ci_rerun_head_moved" ||
+		summary.CIFlaky || summary.Published() {
+		t.Fatalf("attempt = %s summary = %+v, want ci_rerun_head_moved and not flaky", attempt.State, summary)
+	}
+	if len(summary.CIReruns) != 1 || summary.CIReruns[0].Outcome != "ci_rerun_head_moved" ||
+		summary.CIReruns[0].Head == personal || summary.CIRef == personal {
+		t.Fatalf("summary = %+v, want the re-run recorded on jig's head %s, not the person's", summary, personal)
+	}
+	if steps := recordedSteps(t, s.w, attempt.ID); slices.Contains(steps, protocol.PublishStepCI) {
+		t.Fatalf("ledger steps = %v: CI was recorded green on a head jig did not re-run", steps)
+	}
+}
+
+// A re-run whose CI cannot be read afterwards is no verdict on the code: CI
+// stays red as it was, and the declared repair round still runs.
+func TestAnUnreadableJudgementAfterARerunStillReachesRepair(t *testing.T) {
+	s, _ := newRerunScenario(t, 1, 1, nil, fixRound())
+	ci := &flakyCI{}
+	s.gateway.checks = func(sha string, _ int) ([]CICheck, error) {
+		index := slices.Index(ci.heads, sha)
+		if index < 0 {
+			ci.heads = append(ci.heads, sha)
+			index = len(ci.heads) - 1
+		}
+		switch {
+		case index > 0:
+			return []CICheck{actionsJob("test", CIPass, 111)}, nil
+		case len(s.gateway.reruns) == 0:
+			return []CICheck{actionsJob("test", CIFail, 11)}, nil
+		}
+		return nil, errors.New("connection reset")
+	}
+	attempt, summary := s.run(t)
+	if attempt.State != protocol.AttemptAccepted || summary.CIFlaky {
+		t.Fatalf("attempt = %s summary = %+v, want accepted by the repair round", attempt.State, summary)
+	}
+	assertReruns(t, summary, CIRerunSummary{Attempt: 1, Head: ci.heads[0], Outcome: "ci_unavailable"})
+	if len(summary.CIRepairs) != 1 || len(s.continuation.failures) != 1 ||
+		s.continuation.failures[0].Checks[0].CheckRunID != 11 {
+		t.Fatalf("repairs = %+v handed = %+v, want one round handed the original red check",
+			summary.CIRepairs, s.continuation.failures)
+	}
+}
+
+// One re-run — settle, request, and judgement — fits in one CI timeout, and
+// a re-run GitHub accepted but never started leaves CI red as it was.
+func TestARerunThatNeverFinishesIsBoundedAndLeavesCIRed(t *testing.T) {
+	w, gateway, target, pushed := publishedWorker(t)
+	start := time.Now()
+	const timeout = 400 * time.Millisecond
+	gateway.checks = func(string, int) ([]CICheck, error) {
+		slow := actionsJob("slow", CIPending, 21)
+		if time.Since(start) > timeout*3/4 {
+			slow = actionsJob("slow", CIPass, 21)
+		}
+		// The re-run is accepted, but its new run never appears.
+		return []CICheck{actionsJob("test", CIFail, 11), slow}, nil
+	}
+	red := []CICheck{actionsJob("test", CIFail, 11)}
+	summary := PublishSummary{State: PublishStateFailed, Code: "ci_failed", Detail: "1 CI check(s) failed",
+		RemoteRef: pushed, CIRef: pushed, CIFailures: red}
+	summary = w.rerunFlakyCI(context.Background(), gateway, fastCIOptions(), target, summary,
+		ciPolicy{wait: true, timeout: timeout, rerunBudget: 3})
+	elapsed := time.Since(start)
+	if elapsed > timeout+timeout/2 {
+		t.Fatalf("the re-run took %s, more than one CI timeout of %s", elapsed, timeout)
+	}
+	if summary.Code != "ci_failed" || summary.CIRef != pushed || len(summary.CIFailures) != 1 ||
+		summary.CIFailures[0].CheckRunID != 11 || summary.Detail != "1 CI check(s) failed" {
+		t.Fatalf("summary = %+v, want CI left red exactly as it was", summary)
+	}
+	assertReruns(t, summary, CIRerunSummary{Attempt: 1, Head: pushed, Outcome: "ci_timeout"})
+	if requests := gateway.rerunRequests(); !slices.Equal(requests, []int64{11}) {
+		t.Fatalf("re-run requests = %v, want one, and no second re-run of a run still going", requests)
+	}
+}
+
+// Failed jobs of one workflow run are re-run with one request for the run,
+// not one per job (whose siblings GitHub would refuse while it runs).
+func TestFailedJobsOfOneWorkflowRunAreRerunTogether(t *testing.T) {
+	s, _ := newRerunScenario(t, 1, 0, func(_, reruns, _ int) []CICheck {
+		if reruns == 0 {
+			return []CICheck{actionsJob("test (1)", CIFail, 11), actionsJob("test (2)", CIFail, 12),
+				actionsJob("lint", CIFail, 31)}
+		}
+		return []CICheck{actionsJob("test (1)", CIPass, 13), actionsJob("test (2)", CIPass, 14),
+			actionsJob("lint", CIPass, 32)}
+	})
+	s.gateway.runOf = func(job int64) int64 {
+		if job == 31 {
+			return 3000
+		}
+		return 1000
+	}
+	s.gateway.rerun = func(run int64, _ int) error {
+		if run != 1000 && run != 3000 {
+			t.Errorf("re-run of run %d, want a workflow run id", run)
+		}
+		return nil
+	}
+	attempt, summary := s.run(t)
+	if attempt.State != protocol.AttemptAccepted || !summary.CIFlaky {
+		t.Fatalf("attempt = %s summary = %+v, want accepted and flaky", attempt.State, summary)
+	}
+	if requests := s.gateway.rerunRequests(); !slices.Equal(requests, []int64{1000, 3000}) {
+		t.Fatalf("re-run requests = %v, want one per workflow run", requests)
+	}
+	assertReruns(t, summary, CIRerunSummary{Attempt: 1, Outcome: "passed",
+		Jobs: []string{"test (1)", "test (2)", "lint"}})
+}
+
+// A job cancelled, or a lease the control plane already declared lost, sends
+// no re-run even while the lease is fresh and freshen does not heartbeat.
+func TestACancelledJobOrALostVerdictSendsNoRerunOnAFreshLease(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*attemptLease)
+		code  string
+	}{
+		{"cancelled", func(l *attemptLease) { l.cancelOnce.Do(func() { close(l.cancelled) }) }, ciRerunCancelled},
+		{"lost", func(l *attemptLease) { l.lost = errors.New("lease_not_owner") }, "publish_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, gateway, target, pushed := publishedWorker(t)
+			gateway.checks = func(string, int) ([]CICheck, error) {
+				return []CICheck{actionsJob("test", CIFail, 11)}, nil
+			}
+			tc.setup(target.lease)
+			summary := PublishSummary{State: PublishStateFailed, Code: "ci_failed", RemoteRef: pushed, CIRef: pushed,
+				CIFailures: []CICheck{actionsJob("test", CIFail, 11)}}
+			summary = w.rerunFlakyCI(context.Background(), gateway, fastCIOptions(), target, summary,
+				ciPolicy{wait: true, timeout: time.Minute, rerunBudget: 1})
+			if requests := gateway.rerunRequests(); len(requests) != 0 {
+				t.Fatalf("re-run requests = %v, want none", requests)
+			}
+			if summary.Code != tc.code || len(summary.CIReruns) != 1 || summary.CIReruns[0].Outcome != tc.code {
+				t.Fatalf("summary = %+v, want it ended on %s, recorded", summary, tc.code)
+			}
+		})
+	}
+}
+
+// Past the deadline an "in progress" refusal is not asked again: no burst of
+// back-to-back requests.
+func TestNoInProgressRetryPastTheDeadline(t *testing.T) {
+	w, gateway, target, pushed := publishedWorker(t)
+	gateway.checks = func(string, int) ([]CICheck, error) {
+		return []CICheck{actionsJob("test", CIFail, 11)}, nil
+	}
+	gateway.rerun = func(int64, int) error {
+		return publishFailure(ciRerunInProgress, "This workflow is already running")
+	}
+	failed := []CICheck{actionsJob("test", CIFail, 11)}
+	err := w.requestReruns(context.Background(), gateway, fastCIOptions(), target, pushed,
+		time.Now().Add(-time.Second), failed, newRerunView(failed))
+	if publishCode(err) != ciRerunRefused || !strings.Contains(err.Error(), "CI timeout") {
+		t.Fatalf("err = %v, want a refusal at the CI timeout", err)
+	}
+	if requests := gateway.rerunRequests(); len(requests) != 1 {
+		t.Fatalf("re-run requests = %v, want exactly one past the deadline", requests)
+	}
+}
+
 // ---- the gh gateway ----------------------------------------------------------
 
-func TestGitHubGatewayRerunsOneActionsJob(t *testing.T) {
+// The real gateway finds a job's workflow run, then re-runs the run's failed
+// jobs in one request, and tells an "in progress" refusal from the rest.
+func TestGitHubGatewayRerunsAWorkflowRunsFailedJobs(t *testing.T) {
 	var calls [][]string
 	var stdout, stderr []byte
 	var runErr error
@@ -580,11 +766,29 @@ func TestGitHubGatewayRerunsOneActionsJob(t *testing.T) {
 			return stdout, stderr, false, false, runErr
 		},
 	}
-	if err := gateway.RerunActionsJob(context.Background(), "github.com/acme/widgets", 4242); err != nil {
+	stdout = []byte("987654\n")
+	run, err := gateway.ActionsJobRun(context.Background(), "github.com/acme/widgets", 4242)
+	if err != nil || run != 987654 {
+		t.Fatalf("run = %d err = %v, want 987654", run, err)
+	}
+	want := []string{"gh", "api", "-H", "Accept: application/vnd.github+json",
+		"repos/acme/widgets/actions/jobs/4242", "--jq", ".run_id"}
+	if len(calls) != 1 || !slices.Equal(calls[0], want) {
+		t.Fatalf("gh calls = %v, want %v", calls, want)
+	}
+	for _, malformed := range []string{"", "null", "0", "abc"} {
+		stdout = []byte(malformed)
+		if _, err := gateway.ActionsJobRun(context.Background(), "github.com/acme/widgets", 4242); publishCode(err) != "gh_malformed_output" {
+			t.Fatalf("run id %q: err = %v, want gh_malformed_output", malformed, err)
+		}
+	}
+
+	stdout, calls = nil, nil
+	if err := gateway.RerunFailedJobs(context.Background(), "github.com/acme/widgets", 987654); err != nil {
 		t.Fatalf("rerun: %v", err)
 	}
-	want := []string{"gh", "api", "-X", "POST", "-H", "Accept: application/vnd.github+json",
-		"repos/acme/widgets/actions/jobs/4242/rerun"}
+	want = []string{"gh", "api", "-X", "POST", "-H", "Accept: application/vnd.github+json",
+		"repos/acme/widgets/actions/runs/987654/rerun-failed-jobs"}
 	if len(calls) != 1 || !slices.Equal(calls[0], want) {
 		t.Fatalf("gh calls = %v, want %v", calls, want)
 	}
@@ -595,7 +799,7 @@ func TestGitHubGatewayRerunsOneActionsJob(t *testing.T) {
 		code           string
 	}{
 		{"in progress on stderr", "", "gh: This workflow is already running (HTTP 403)", ciRerunInProgress},
-		{"in progress in the body", `{"message":"Cannot rerun a job while the run is in progress"}`,
+		{"in progress in the body", `{"message":"Cannot rerun a workflow run that is in progress"}`,
 			"gh: HTTP 403", ciRerunInProgress},
 		{"forbidden", `{"message":"Resource not accessible by integration"}`,
 			"gh: Resource not accessible by integration (HTTP 403)", "gh_failed"},
@@ -603,7 +807,7 @@ func TestGitHubGatewayRerunsOneActionsJob(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stdout, stderr, runErr = []byte(tc.stdout), []byte(tc.stderr), errors.New("exit status 1")
-			err := gateway.RerunActionsJob(context.Background(), "github.com/acme/widgets", 4242)
+			err := gateway.RerunFailedJobs(context.Background(), "github.com/acme/widgets", 987654)
 			if publishCode(err) != tc.code {
 				t.Fatalf("err = %v (code %s), want %s", err, publishCode(err), tc.code)
 			}
@@ -612,10 +816,13 @@ func TestGitHubGatewayRerunsOneActionsJob(t *testing.T) {
 
 	stdout, stderr, runErr = nil, nil, nil
 	calls = nil
-	if err := gateway.RerunActionsJob(context.Background(), "github.com/acme/widgets", 0); publishCode(err) != "ci_rerun_invalid_job" {
-		t.Fatalf("err = %v, want ci_rerun_invalid_job", err)
+	if err := gateway.RerunFailedJobs(context.Background(), "github.com/acme/widgets", 0); publishCode(err) != "ci_rerun_invalid_id" {
+		t.Fatalf("err = %v, want ci_rerun_invalid_id", err)
 	}
-	if err := gateway.RerunActionsJob(context.Background(), "gitlab.com/acme/widgets", 1); publishCode(err) != "publish_unsupported_remote" {
+	if _, err := gateway.ActionsJobRun(context.Background(), "github.com/acme/widgets", -1); publishCode(err) != "ci_rerun_invalid_id" {
+		t.Fatalf("err = %v, want ci_rerun_invalid_id", err)
+	}
+	if err := gateway.RerunFailedJobs(context.Background(), "gitlab.com/acme/widgets", 1); publishCode(err) != "publish_unsupported_remote" {
 		t.Fatalf("err = %v, want publish_unsupported_remote", err)
 	}
 	if len(calls) != 0 {
@@ -625,10 +832,12 @@ func TestGitHubGatewayRerunsOneActionsJob(t *testing.T) {
 
 // ---- the gated real-gh test --------------------------------------------------
 
-// rerunGateWorkflow fails its flaky job on a workflow run's first attempt
-// and passes on any re-run; its slow sibling keeps the run in progress well
-// after the flaky job goes red, which is the case the fakes could not see:
-// GitHub refuses to re-run a job while its workflow run is still going.
+// rerunGateWorkflow fails both shards of its flaky matrix job on a workflow
+// run's first attempt and passes on any re-run; its slow sibling keeps the
+// run in progress well after the shards go red, which is the case the fakes
+// could not see: GitHub refuses to re-run a job while its workflow run is
+// still going. Two shards in one run prove the re-run is one request per
+// run: per job, the second shard would be refused while the first re-ran.
 const rerunGateWorkflow = `name: jig-rerun-gate
 on:
   push:
@@ -636,6 +845,10 @@ on:
 jobs:
   flaky:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - run: test "${{ github.run_attempt }}" != "1"
   slow:
@@ -644,8 +857,8 @@ jobs:
       - run: sleep 90
 `
 
-// TestCIRerunGate re-runs a real Actions job through real gh after its slow
-// sibling finishes. It is skipped unless JIG_RERUN_GATE names a scratch
+// TestCIRerunGate re-runs a real workflow run's failed jobs through real gh
+// after its slow sibling finishes. It is skipped unless JIG_RERUN_GATE names a scratch
 // repository (owner/repo) whose other workflows, if any, pass on a jig/**
 // branch. The attempt's change is the gate workflow itself, so gh needs the
 // workflow scope; the test opens a pull request and leaves it for the
@@ -691,8 +904,12 @@ func TestCIRerunGate(t *testing.T) {
 	if attempt.State != protocol.AttemptAccepted || !summary.CIFlaky {
 		t.Fatalf("attempt = %s summary = %+v, want accepted and flagged flaky", attempt.State, summary)
 	}
+	jobs := []string(nil)
+	if len(summary.CIReruns) == 1 {
+		jobs = slices.Sorted(slices.Values(summary.CIReruns[0].Jobs))
+	}
 	if len(summary.CIReruns) != 1 || summary.CIReruns[0].Outcome != "passed" ||
-		!slices.Equal(summary.CIReruns[0].Jobs, []string{"flaky"}) {
-		t.Fatalf("ci_reruns = %+v, want the flaky job re-run once and passed", summary.CIReruns)
+		!slices.Equal(jobs, []string{"flaky (1)", "flaky (2)"}) {
+		t.Fatalf("ci_reruns = %+v, want both flaky shards re-run once and passed", summary.CIReruns)
 	}
 }

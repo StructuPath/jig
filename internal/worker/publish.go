@@ -175,11 +175,13 @@ type PullRequestGateway interface {
 	// job's log attached, within the CI repair log bounds. It never fails:
 	// a log that cannot be read leaves a LogNote saying why.
 	FailedCheckLogs(ctx context.Context, repository string, checks []CICheck) []CICheck
-	// RerunActionsJob asks GitHub to re-run one failed Actions job on the
-	// same commit. A refusal because the job's workflow run is still in
-	// progress carries the code ci_rerun_in_progress, so it can be waited
-	// out rather than counted.
-	RerunActionsJob(ctx context.Context, repository string, jobID int64) error
+	// ActionsJobRun reports the workflow run one Actions job belongs to.
+	ActionsJobRun(ctx context.Context, repository string, jobID int64) (int64, error)
+	// RerunFailedJobs asks GitHub to re-run every failed job of one
+	// workflow run on the same commit. A refusal because the run is still
+	// in progress carries the code ci_rerun_in_progress, so it can be
+	// waited out rather than counted.
+	RerunFailedJobs(ctx context.Context, repository string, runID int64) error
 }
 
 // CI check verdicts, normalized across check runs and commit statuses.
@@ -1562,34 +1564,66 @@ func (g *GitHubCLIGateway) FailedCheckLogs(ctx context.Context, repository strin
 	return annotated
 }
 
-// RerunActionsJob re-runs one failed Actions job with
-// `gh api -X POST repos/{project}/actions/jobs/{id}/rerun`: per job, on the
-// same commit, never moving the branch (KTD5). GitHub refuses while the
-// job's workflow run is still going; that refusal is ci_rerun_in_progress.
-func (g *GitHubCLIGateway) RerunActionsJob(ctx context.Context, repository string, jobID int64) error {
-	project, err := githubProject(repository)
+// ActionsJobRun reads the workflow run an Actions job belongs to with
+// `gh api repos/{project}/actions/jobs/{id} --jq .run_id`.
+func (g *GitHubCLIGateway) ActionsJobRun(ctx context.Context, repository string, jobID int64) (int64, error) {
+	project, err := g.rerunPreflight(repository, jobID)
+	if err != nil {
+		return 0, err
+	}
+	stdout, stderr, stdoutTooLarge, stderrTooLarge, err := g.run()(ctx, "gh",
+		"api", "-H", "Accept: application/vnd.github+json",
+		fmt.Sprintf("repos/%s/actions/jobs/%d", project, jobID), "--jq", ".run_id")
+	if err != nil {
+		return 0, ghDiagnostic("gh api actions job", err, stderr, stdoutTooLarge, stderrTooLarge)
+	}
+	run, err := strconv.ParseInt(strings.TrimSpace(string(stdout)), 10, 64)
+	if err != nil || run <= 0 {
+		return 0, publishFailure("gh_malformed_output", "gh api actions job %d reported no workflow run id", jobID)
+	}
+	return run, nil
+}
+
+// RerunFailedJobs re-runs every failed job of one workflow run with
+// `gh api -X POST repos/{project}/actions/runs/{id}/rerun-failed-jobs`: on
+// the same commit, never moving the branch. It is per run rather than per
+// job (the plan's KTD5) because re-running one job puts its run in
+// progress, and GitHub then refuses every sibling in it. GitHub refuses
+// while the run is still going; that refusal is ci_rerun_in_progress.
+func (g *GitHubCLIGateway) RerunFailedJobs(ctx context.Context, repository string, runID int64) error {
+	project, err := g.rerunPreflight(repository, runID)
 	if err != nil {
 		return err
 	}
-	if jobID <= 0 {
-		return publishFailure("ci_rerun_invalid_job", "%d is not an Actions job id", jobID)
-	}
-	if _, err := g.lookPath()("gh"); err != nil {
-		return publishFailure("gh_not_found",
-			"the GitHub CLI (gh) was not found on PATH. Install gh, then run `gh auth login`.")
-	}
 	stdout, stderr, stdoutTooLarge, stderrTooLarge, err := g.run()(ctx, "gh",
 		"api", "-X", "POST", "-H", "Accept: application/vnd.github+json",
-		fmt.Sprintf("repos/%s/actions/jobs/%d/rerun", project, jobID))
+		fmt.Sprintf("repos/%s/actions/runs/%d/rerun-failed-jobs", project, runID))
 	if err == nil {
 		return nil
 	}
 	if rerunInProgress(stdout) || rerunInProgress(stderr) {
 		return publishFailure(ciRerunInProgress,
-			"GitHub will not re-run job %d while its workflow run is in progress: %s", jobID,
+			"GitHub will not re-run workflow run %d while it is in progress: %s", runID,
 			boundedText(strings.TrimSpace(string(stderr)), protocol.MaxPublishDiagnosticBytes))
 	}
-	return ghDiagnostic("gh api job rerun", err, stderr, stdoutTooLarge, stderrTooLarge)
+	return ghDiagnostic("gh api rerun-failed-jobs", err, stderr, stdoutTooLarge, stderrTooLarge)
+}
+
+// rerunPreflight resolves the project and refuses an id that is not one,
+// before gh is run.
+func (g *GitHubCLIGateway) rerunPreflight(repository string, id int64) (string, error) {
+	project, err := githubProject(repository)
+	if err != nil {
+		return "", err
+	}
+	if id <= 0 {
+		return "", publishFailure("ci_rerun_invalid_id", "%d is not an Actions job or run id", id)
+	}
+	if _, err := g.lookPath()("gh"); err != nil {
+		return "", publishFailure("gh_not_found",
+			"the GitHub CLI (gh) was not found on PATH. Install gh, then run `gh auth login`.")
+	}
+	return project, nil
 }
 
 // rerunInProgress recognizes GitHub's refusal to re-run a job whose

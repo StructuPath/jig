@@ -6,15 +6,25 @@
 //	red CI → every red check an Actions job, budget left?
 //	      → wait until nothing on the head is pending (GitHub refuses to
 //	        re-run a job whose workflow run is still going)
-//	      → freshen the lease, re-run each failed job (an "in progress"
+//	      → group the failed jobs by workflow run; per run, fence on the
+//	        lease and ask GitHub to re-run its failed jobs (an "in progress"
 //	        refusal waits and asks again; it spends nothing)
-//	      → a fresh ci step on the same head, the re-run check runs pending
-//	        until newer runs of the same name replace them
+//	      → judge the SAME head again, the re-run check runs pending until
+//	        newer runs of the same name replace them
 //	      → green publishes, flagged flaky; red loops while budget remains
 //
-// A re-run never moves the branch, so it is fenced by the lease rather than
-// the ledger, and every one is recorded in the summary's ci_reruns. The
-// budget is per attempt: a repair round's new head gets only what is left.
+// One re-run — settle, requests, and judgement — fits inside one CI
+// timeout. A re-run never moves the branch, so it is fenced by the lease
+// rather than the ledger, and every one is recorded in the summary's
+// ci_reruns. It never turns a red CI that a repair round could take into a
+// terminal stop: a re-run that GitHub accepted but that never finished is
+// recorded, and CI is left red as it was. The budget is per attempt: a
+// repair round's new head gets only what is left.
+//
+// Re-runs are per workflow run (`rerun-failed-jobs`), not per job as the
+// plan's KTD5 first said: re-running one job puts its run in progress, so
+// GitHub refuses every sibling in the same run until it finishes, and N
+// failed matrix shards would cost N workflow durations.
 package worker
 
 import (
@@ -50,10 +60,12 @@ const (
 	// re-run; there is nothing of jig's left to re-run.
 	ciRerunHeadMoved = "ci_rerun_head_moved"
 	// ciRerunInProgress is the gateway's code for GitHub refusing a re-run
-	// because the job's workflow run has not finished. It is waited out,
-	// never recorded as a spent re-run.
+	// because the workflow run has not finished. It is waited out, never
+	// recorded as a spent re-run.
 	ciRerunInProgress = "ci_rerun_in_progress"
-	// maxCIRerunInProgressRetries bounds how often one job's re-run is asked
+	// ciRerunCancelled: the job was cancelled before a re-run request.
+	ciRerunCancelled = "ci_rerun_cancelled"
+	// maxCIRerunInProgressRetries bounds how often one run's re-run is asked
 	// for again after an "in progress" refusal; the CI timeout bounds how
 	// long.
 	maxCIRerunInProgressRetries = 5
@@ -132,8 +144,10 @@ func (v *rerunView) apply(checks []CICheck) []CICheck {
 // every red check is an Actions job, and budget remains. summary is a
 // publish summary that ended on ci_failed; the returned one is either
 // published (flaky), still ci_failed (for a repair round or the end), or
-// ended on the code a re-run stopped on. Every pass through the loop records
-// one ci_reruns entry or returns, so it runs at most the budget's times.
+// ended on the code a re-run stopped on (a moved head, a lost lease, a
+// cancellation). Every pass through the loop records one ci_reruns entry or
+// returns, so it runs at most the budget's times, and each pass is bounded
+// by one CI timeout.
 func (w *Worker) rerunFlakyCI(
 	ctx context.Context,
 	gateway PullRequestGateway,
@@ -151,6 +165,7 @@ func (w *Worker) rerunFlakyCI(
 		}
 		entry := CIRerunSummary{Attempt: len(summary.CIReruns) + 1, Head: head,
 			Jobs: checkNames(summary.CIFailures)}
+		// One deadline for the whole re-run: settle, requests, judgement.
 		deadline := time.Now().Add(ci.timeout)
 
 		// The CI wait stopped at the first red check; its siblings may still
@@ -162,8 +177,13 @@ func (w *Worker) rerunFlakyCI(
 		failed := failedChecks(checks)
 		if len(failed) == 0 {
 			// Nothing is red any more (someone re-ran it). Judge the head
-			// afresh; with no re-run of jig's, a pass here is not flaky.
-			return w.judgeAfterRerun(ctx, gateway, options, target, summary, ci, nil)
+			// afresh; with no re-run of jig's, a pass here is not flaky, and
+			// a judgement that cannot finish leaves CI red as it was.
+			judged := w.judgeAfterRerun(ctx, gateway, options, target, summary, head, deadline, nil)
+			if unjudged(judged.Code) {
+				return summary
+			}
+			return judged
 		}
 		summary.CIFailures = boundedChecks(failed)
 		entry.Jobs = checkNames(failed)
@@ -176,24 +196,40 @@ func (w *Worker) rerunFlakyCI(
 		if err := w.requestReruns(ctx, gateway, options, target, head, deadline, summary.CIFailures, view); err != nil {
 			return rerunStopped(summary, entry, err)
 		}
-		summary = w.judgeAfterRerun(ctx, gateway, options, target, summary, ci, view)
+		judged := w.judgeAfterRerun(ctx, gateway, options, target, summary, head, deadline, view)
 		switch {
-		case summary.Published():
-			summary.CIFlaky = true
+		case judged.Published():
+			judged.CIFlaky = true
 			entry.Outcome = ciRerunPassed
-		case summary.Code == "ci_failed":
+		case judged.Code == "ci_failed":
 			entry.Outcome = ciRerunFailed
-			entry.Detail = summary.Detail
+			entry.Detail = judged.Detail
+		case unjudged(judged.Code):
+			// GitHub took the re-run but it never finished (an outage, a
+			// queued concurrency group) or CI could not be read: that is
+			// no verdict on the code, so CI stays red exactly as it was and
+			// a repair round, or the plain red stop, takes it from here.
+			entry.Outcome = judged.Code
+			entry.Detail = judged.Detail
+			summary.CIReruns = append(summary.CIReruns, entry)
+			return summary
 		default:
-			entry.Outcome = summary.Code
-			entry.Detail = summary.Detail
+			entry.Outcome = judged.Code
+			entry.Detail = judged.Detail
 		}
+		summary = judged
 		summary.CIReruns = append(summary.CIReruns, entry)
 	}
 	return summary
 }
 
-// rerunStopped records a re-run that stopped before its CI wait. A lost
+// unjudged reports whether a re-run's judgement ended without a verdict on
+// the code: CI did not finish in time, or could not be read.
+func unjudged(code string) bool {
+	return code == "ci_timeout" || code == "ci_unavailable"
+}
+
+// rerunStopped records a re-run that stopped before its judgement. A lost
 // lease, a cancellation, and a moved head end the publish on that code; any
 // other stop (a refusal, CI that never settled) leaves CI red, so a repair
 // round or the attempt's end takes it from there. Either way the entry is
@@ -203,38 +239,60 @@ func rerunStopped(summary PublishSummary, entry CIRerunSummary, err error) Publi
 	entry.Outcome = code
 	entry.Detail = boundedText(err.Error(), protocol.MaxPublishDiagnosticBytes)
 	summary.CIReruns = append(summary.CIReruns, entry)
-	switch code {
-	case ciRerunRefused, "ci_timeout", "ci_unavailable":
+	if code == ciRerunRefused || unjudged(code) {
 		return summary
 	}
 	return failSummary(summary, code, err.Error())
 }
 
-// requestReruns asks GitHub to re-run each failed job, freshening the lease
-// before every request so an attempt that lost its lease sends none. An "in
-// progress" refusal is waited out and asked again, within the deadline and
-// maxCIRerunInProgressRetries; any other refusal stops the re-run.
+// requestReruns asks GitHub to re-run the failed jobs of each workflow run
+// they belong to, once per run. Every request is fenced: the lease is
+// freshened and checked for cancellation or loss immediately before it, so
+// an attempt that lost its lease or was cancelled sends none. An "in
+// progress" refusal is waited out and asked again, while the deadline
+// allows and at most maxCIRerunInProgressRetries times; any other refusal
+// stops the re-run.
 func (w *Worker) requestReruns(
 	ctx context.Context, gateway PullRequestGateway, options PublishOptions,
 	target publishTarget, head string, deadline time.Time, failed []CICheck, view *rerunView,
 ) error {
+	runs, order := map[int64][]CICheck{}, []int64{}
 	for _, job := range failed {
+		run, err := gateway.ActionsJobRun(ctx, target.repository, job.CheckRunID)
+		if err != nil {
+			return publishFailure(ciRerunRefused, "the workflow run of %s could not be read: %s", job.Name, err.Error())
+		}
+		if _, seen := runs[run]; !seen {
+			order = append(order, run)
+		}
+		runs[run] = append(runs[run], job)
+	}
+	for _, run := range order {
+		jobs := runs[run]
 		for retries := 0; ; retries++ {
-			if err := target.lease.freshen(ctx); err != nil {
-				return fmt.Errorf("lease could not be freshened: %w", err)
+			if err := fenceRerun(ctx, target); err != nil {
+				return err
 			}
-			err := gateway.RerunActionsJob(ctx, target.repository, job.CheckRunID)
+			err := gateway.RerunFailedJobs(ctx, target.repository, run)
 			if err == nil {
-				view.rerun[job.CheckRunID] = true
+				for _, job := range jobs {
+					view.rerun[job.CheckRunID] = true
+				}
 				break
 			}
 			if publishCode(err) != ciRerunInProgress {
-				return publishFailure(ciRerunRefused, "GitHub refused to re-run %s: %s", job.Name, err.Error())
+				return publishFailure(ciRerunRefused, "GitHub refused to re-run %s: %s",
+					describeChecks(jobs), err.Error())
 			}
 			if retries == maxCIRerunInProgressRetries {
 				return publishFailure(ciRerunRefused,
-					"GitHub still reported %s's workflow run in progress after %d waits: %s",
-					job.Name, retries, err.Error())
+					"GitHub still reported the workflow run of %s in progress after %d waits: %s",
+					describeChecks(jobs), retries, err.Error())
+			}
+			if !time.Now().Before(deadline) {
+				return publishFailure(ciRerunRefused,
+					"GitHub still reported the workflow run of %s in progress at the CI timeout: %s",
+					describeChecks(jobs), err.Error())
 			}
 			if err := w.ciPause(ctx, options, target, head, deadline); err != nil {
 				return err
@@ -247,24 +305,55 @@ func (w *Worker) requestReruns(
 	return nil
 }
 
-// judgeAfterRerun is a fresh, fenced ci step on the branch: green is
-// recorded and publishes, anything else ends the step as the CI wait does.
+// fenceRerun is the lease fence before one re-run request: heartbeat if the
+// lease may be stale, then refuse if the lease is known lost or the job was
+// cancelled — a heartbeat reports cancellation without failing, and a fresh
+// lease is not heartbeated at all, so both are checked here.
+func fenceRerun(ctx context.Context, target publishTarget) error {
+	if err := target.lease.freshen(ctx); err != nil {
+		return fmt.Errorf("lease could not be freshened: %w", err)
+	}
+	if err := target.lease.lostVerdict(); err != nil {
+		return fmt.Errorf("the lease was lost: %w", err)
+	}
+	select {
+	case <-target.lease.cancelled:
+		return publishFailure(ciRerunCancelled, "the job was cancelled before its failed jobs were re-run")
+	default:
+		return nil
+	}
+}
+
+// judgeAfterRerun judges the head the re-run ran on — never whatever the
+// branch has moved to — within the re-run's deadline, and records a green
+// verdict through the fenced ci step. A branch that moves after the re-run
+// ends it with ci_rerun_head_moved: a person's push is theirs to judge, not
+// jig's flaky pass.
 func (w *Worker) judgeAfterRerun(
 	ctx context.Context, gateway PullRequestGateway, options PublishOptions,
-	target publishTarget, summary PublishSummary, ci ciPolicy, view *rerunView,
+	target publishTarget, summary PublishSummary, head string, deadline time.Time, view *rerunView,
 ) PublishSummary {
+	summary.CIRef = head
+	checks, err := w.settleCI(ctx, gateway, options, target, head, deadline, view)
+	if err == nil && len(checks) == 0 {
+		err = publishFailure("ci_unavailable", "no CI checks were reported on %s after the re-run", shortSHA(head))
+	}
+	if err == nil {
+		if failed := failedChecks(checks); len(failed) > 0 {
+			summary.CIFailures = boundedChecks(failed)
+			err = publishFailure("ci_failed", "%d CI check(s) failed on %s after the re-run: %s",
+				len(failed), shortSHA(head), describeChecks(failed))
+		}
+	}
+	if err != nil {
+		return failSummary(summary, publishCode(err),
+			fmt.Sprintf("publish step %q: %s", protocol.PublishStepCI, err.Error()))
+	}
 	summary.CIFailures = nil
 	green, err := w.publishStep(ctx, target, protocol.PublishStepCI, map[string]protocol.PublishRecord{}, &summary,
 		func(authorization protocol.PublishAuthorization) (protocol.PublishStepRequest, error) {
-			ciHead, failures, err := w.awaitCIViewed(ctx, gateway, options, target, authorization.Branch,
-				ci.timeout, view)
-			summary.CIRef = ciHead
-			summary.CIFailures = failures
-			if err != nil {
-				return protocol.PublishStepRequest{}, err
-			}
 			return protocol.PublishStepRequest{Step: protocol.PublishStepCI,
-				Branch: authorization.Branch, RemoteRef: ciHead}, nil
+				Branch: authorization.Branch, RemoteRef: head}, nil
 		})
 	if err != nil {
 		return summary
@@ -315,7 +404,7 @@ func (w *Worker) settleCI(
 		}
 		if !time.Now().Before(deadline) {
 			return nil, publishFailure("ci_timeout",
-				"CI on %s did not finish before the re-run could be requested; still pending: %s",
+				"CI on %s did not finish within the re-run's CI timeout; still pending: %s",
 				shortSHA(head), describeChecks(pending))
 		}
 		if err := w.ciPause(ctx, options, target, head, deadline); err != nil {
