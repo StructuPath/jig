@@ -82,6 +82,7 @@ func TestMigratingAnEmptyDatabaseAppliesAllMigrationsAndRecordsTheLedger(t *test
 	for _, table := range []string{
 		"definitions", "runs", "jobs", "attempts", "claim_requests", "events",
 		"envelopes", "gate_results", "workers", "retained_worktrees", "publish_records",
+		"publish_ci_repairs",
 	} {
 		var name string
 		err := db.QueryRow(

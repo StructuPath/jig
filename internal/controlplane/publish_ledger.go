@@ -239,6 +239,14 @@ func (s *Store) RecordPublishStep(
 	if err := requirePublishPrerequisites(ctx, tx, attemptID, input.Step); err != nil {
 		return record, err
 	}
+	if input.Step == protocol.PublishStepCI {
+		// A ci row is permanent, so a green record on a head a repair round
+		// found red must be refused here: accepted would be refused on it
+		// forever, and no further round is allowed once ci exists.
+		if err := refuseGreenOnRepairedHead(ctx, tx, attemptID, input.RemoteRef); err != nil {
+			return record, err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO publish_records(attempt_id, step, branch, remote_ref, pr_url, completed_at)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -445,6 +453,7 @@ func (a *API) registerPublishRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/attempts/{attempt_id}/publish", a.attemptPublishRecords)
 	mux.HandleFunc("GET /api/jobs/{job_id}/publish", a.jobPublishRecords)
 	mux.HandleFunc("POST /api/jobs/{job_id}/publish-retry", a.retryPublish)
+	a.registerCIRepairRoutes(mux)
 }
 
 func (a *API) authorizePublishStep(w http.ResponseWriter, r *http.Request) {

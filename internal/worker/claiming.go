@@ -248,6 +248,9 @@ func (w *Worker) runAttempt(ctx context.Context, claim *protocol.Claim, token st
 	}
 
 	outcome := w.config.Runner.Run(ctx, prepared)
+	// The runner has used whatever it was going to; a continuation still
+	// held here would only pin the attempt's scratch directory.
+	releaseContinuation(outcome)
 	if _, err := w.manifests.update(claim.Attempt.ID, func(manifest *attemptManifest) error {
 		manifest.Lifecycle = manifestCompleted
 		manifest.TerminalState = outcome.State

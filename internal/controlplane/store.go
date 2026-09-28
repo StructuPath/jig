@@ -195,11 +195,11 @@ type leaseState struct {
 	cancel        bool
 }
 
-// attemptWaitsForCI reads the attempt's run snapshot — the definition frozen
-// at admission (R2) — and reports whether its publish.ci waits. A snapshot
-// that no longer parses cannot have been executed, so it is an error, not a
-// silent "no".
-func attemptWaitsForCI(ctx context.Context, tx *sql.Tx, attemptID string) (bool, error) {
+// attemptDefinition reads the attempt's run snapshot — the definition frozen
+// at admission (R2) — so publish rules come from what the attempt actually
+// ran under, never from the worker's word. A snapshot that no longer parses
+// cannot have been executed, so it is an error, not a silent "no".
+func attemptDefinition(ctx context.Context, tx *sql.Tx, attemptID string) (*protocol.DefinitionSpec, error) {
 	var snapshot string
 	if err := tx.QueryRowContext(ctx, `
 		SELECT r.snapshot FROM attempts a
@@ -207,14 +207,14 @@ func attemptWaitsForCI(ctx context.Context, tx *sql.Tx, attemptID string) (bool,
 		JOIN runs r ON r.id = j.run_id
 		WHERE a.id = ?
 	`, attemptID).Scan(&snapshot); err != nil {
-		return false, unavailable(err)
+		return nil, unavailable(err)
 	}
 	spec, err := protocol.ParseDefinition([]byte(snapshot))
 	if err != nil {
-		return false, conflict("snapshot_unparseable",
+		return nil, conflict("snapshot_unparseable",
 			"the run's frozen definition no longer parses: "+err.Error())
 	}
-	return spec.WaitsForCI(), nil
+	return spec, nil
 }
 
 func loadLease(ctx context.Context, tx *sql.Tx, attemptID string) (leaseState, error) {
@@ -552,11 +552,11 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 		// The same rule for CI, read from the run's frozen definition rather
 		// than from anything the worker says: a definition whose publish.ci
 		// waits is not `accepted` until a green CI run is on the ledger.
-		waits, err := attemptWaitsForCI(ctx, tx, attemptID)
+		spec, err := attemptDefinition(ctx, tx, attemptID)
 		if err != nil {
 			return protocol.Attempt{}, err
 		}
-		if waits {
+		if spec.WaitsForCI() {
 			var green int
 			if err := tx.QueryRowContext(ctx, `
 				SELECT COUNT(*) FROM publish_records WHERE attempt_id = ? AND step = ?
@@ -567,6 +567,9 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 				return protocol.Attempt{}, conflict("publish_ci_required",
 					"this definition waits for CI, so the attempt is `accepted` only with a "+
 						"recorded ci step; complete as accepted_unpublished while CI is not green")
+			}
+			if err := requireCIGreenPastRepairs(ctx, tx, attemptID); err != nil {
+				return protocol.Attempt{}, err
 			}
 		}
 	}

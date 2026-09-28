@@ -375,3 +375,85 @@ func TestGitHubGatewayNormalizesCheckRunsAndCommitStatuses(t *testing.T) {
 		t.Fatal("an invalid ref reached gh")
 	}
 }
+
+// Heads for the round wire test; the ledger checks their shape, not git.
+const (
+	headOne = "1111111111111111111111111111111111111111"
+	headTwo = "2222222222222222222222222222222222222222"
+)
+
+// repairSnapshot declares a CI repair, so the round routes accept it.
+const repairSnapshot = integrationSnapshot + `  - name: review
+    kind: agent
+    owner: builder
+publish:
+  ci:
+    wait: true
+    on_fail: {run: build, budget: 1}
+`
+
+// The worker reaches the round ledger through its client over the real
+// control-plane handler: authorize, record, replay as Completed, and list.
+// The ledger's rules are the control plane's tests; this proves the wire.
+func TestCIRepairRoundsTravelTheClientAndHTTPSurface(t *testing.T) {
+	h := newHarness(t)
+	const identity = "github.com/example/repair"
+	h.seedRunWithSnapshot("run-1", repairSnapshot, protocol.RunTarget{Repository: identity, BaseSHA: headOne})
+	h.enqueue("run-1", identity)
+	w := newTestWorker(t, h, filepath.Join(t.TempDir(), "worker"), 1, nil)
+	ctx := context.Background()
+
+	token, err := mintLeaseToken()
+	if err != nil {
+		t.Fatalf("mint lease token: %v", err)
+	}
+	claim, err := w.client.Claim(ctx, protocol.ClaimRequest{RequestID: "repair-wire", LeaseToken: token})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: claim=%v err=%v", claim, err)
+	}
+	if _, err := w.client.StartAttempt(ctx, claim.Attempt.ID, protocol.StartAttemptRequest{LeaseToken: token}); err != nil {
+		t.Fatalf("start attempt: %v", err)
+	}
+	branch := protocol.PublishBranch(claim.Job.ID, claim.Attempt.AttemptNumber)
+	for _, step := range []protocol.PublishStepRequest{
+		{Step: protocol.PublishStepPush, RemoteRef: headOne},
+		{Step: protocol.PublishStepPullRequest, PullRequestURL: "https://github.com/example/repair/pull/1"},
+		{Step: protocol.PublishStepProof, RemoteRef: headOne},
+	} {
+		step.LeaseToken, step.Branch = token, branch
+		if _, err := w.client.RecordPublishStep(ctx, claim.Attempt.ID, step); err != nil {
+			t.Fatalf("record %s: %v", step.Step, err)
+		}
+	}
+
+	authorization, err := w.client.AuthorizeCIRepair(ctx, claim.Attempt.ID, protocol.CIRepairAuthorizationRequest{
+		LeaseToken: token, Round: 1, Branch: branch, HeadBefore: headOne,
+	})
+	if err != nil || authorization.Budget != 1 || authorization.Completed != nil {
+		t.Fatalf("authorize round 1: %+v err=%v", authorization, err)
+	}
+	record, err := w.client.RecordCIRepair(ctx, claim.Attempt.ID, protocol.CIRepairRecordRequest{
+		LeaseToken: token, Round: 1, Branch: branch, HeadBefore: headOne, HeadAfter: headTwo,
+		FailedChecks: []string{"lint"},
+	})
+	if err != nil || record.HeadAfter != headTwo || record.JobID != claim.Job.ID {
+		t.Fatalf("record round 1: %+v err=%v", record, err)
+	}
+	again, err := w.client.AuthorizeCIRepair(ctx, claim.Attempt.ID, protocol.CIRepairAuthorizationRequest{
+		LeaseToken: token, Round: 1, Branch: branch, HeadBefore: headOne,
+	})
+	if err != nil || again.Completed == nil || again.Completed.HeadAfter != headTwo {
+		t.Fatalf("re-authorize a recorded round: %+v err=%v, want Completed", again, err)
+	}
+	_, err = w.client.AuthorizeCIRepair(ctx, claim.Attempt.ID, protocol.CIRepairAuthorizationRequest{
+		LeaseToken: token, Round: 2, Branch: branch, HeadBefore: headTwo,
+	})
+	var rejected *APIError
+	if !errors.As(err, &rejected) || rejected.Code != "ci_repair_budget_exhausted" {
+		t.Fatalf("round 2 on a budget of 1: err=%v, want ci_repair_budget_exhausted over the wire", err)
+	}
+	rounds, err := w.client.AttemptCIRepairs(ctx, claim.Attempt.ID)
+	if err != nil || len(rounds) != 1 || rounds[0].FailedChecks[0] != "lint" {
+		t.Fatalf("list rounds: %+v err=%v", rounds, err)
+	}
+}

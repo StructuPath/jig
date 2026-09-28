@@ -218,6 +218,10 @@ func engineExecutor(
 			Cancelled:    signalCtx.Done(),
 			FreshenLease: execution.FreshenLease,
 		})
+		// A direct run never publishes, so it never repairs CI either.
+		if outcome.Continuation != nil {
+			outcome.Continuation.Release()
+		}
 		return controlplane.DirectOutcome{
 			State:  outcome.State,
 			Result: outcome.Result,

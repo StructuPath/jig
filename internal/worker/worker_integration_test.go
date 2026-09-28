@@ -548,3 +548,72 @@ func TestReRegistrationShrinksTheAdvertisedEnvNameSetWhenAVariableIsRemoved(t *t
 		t.Fatalf("advertised names %v still contain the removed BRAVO", reregistered.EnvNames)
 	}
 }
+
+// recordingContinuation counts Release calls.
+type recordingContinuation struct{ released int }
+
+func (c *recordingContinuation) RepairCI(context.Context, CIFailure) Outcome {
+	return Outcome{State: protocol.AttemptFailed, Error: "not used"}
+}
+func (c *recordingContinuation) Release() { c.released++ }
+
+// A continuation the runner hands back unused is released by the attempt
+// loop, so an engine kept alive for CI repair never pins its scratch past
+// the attempt.
+func TestTheAttemptLoopReleasesAnUnusedContinuation(t *testing.T) {
+	h := newHarness(t)
+	_, head, identity := newOriginRepo(t)
+	h.seedRun("run-1", protocol.RunTarget{Repository: identity, BaseSHA: head})
+	h.enqueue("run-1", identity)
+	continuation := &recordingContinuation{}
+	runner := RunnerFunc(func(context.Context, *PreparedAttempt) Outcome {
+		return Outcome{State: protocol.AttemptFailed, Error: "done", Continuation: continuation}
+	})
+	w := newTestWorker(t, h, filepath.Join(t.TempDir(), "worker"), 1, runner)
+	if attempt, err := w.ClaimOnce(context.Background()); err != nil || attempt == nil {
+		t.Fatalf("claim once: attempt=%v err=%v", attempt, err)
+	}
+	if continuation.released != 1 {
+		t.Fatalf("continuation released %d times, want exactly once", continuation.released)
+	}
+}
+
+// DeferToContinuation moves a host's cleanup into the continuation's
+// Release: nothing runs while the continuation lives, the inner Release
+// runs first, and the cleanup runs exactly once however often Release is
+// called. With no continuation it takes nothing.
+func TestDeferToContinuationRunsTheHostCleanupOnceAfterRelease(t *testing.T) {
+	if DeferToContinuation(&Outcome{State: protocol.AttemptFailed}, func() { t.Fatal("cleanup taken without a continuation") }) {
+		t.Fatal("DeferToContinuation kept an outcome with no continuation")
+	}
+	inner := &recordingContinuation{}
+	var order []string
+	outcome := Outcome{State: protocol.AttemptAcceptedUnpublished, Continuation: inner}
+	if !DeferToContinuation(&outcome, func() {
+		order = append(order, fmt.Sprintf("cleanup after %d release(s)", inner.released))
+	}) {
+		t.Fatal("DeferToContinuation did not keep an outcome with a continuation")
+	}
+	if len(order) != 0 {
+		t.Fatal("the host cleanup ran before Release")
+	}
+	outcome.Continuation.Release()
+	outcome.Continuation.Release()
+	if len(order) != 1 || order[0] != "cleanup after 1 release(s)" {
+		t.Fatalf("cleanup runs = %v, want exactly one, after the inner Release", order)
+	}
+}
+
+// A publishing runner that was never bound rebuilds the outcome, so it must
+// release the continuation itself rather than drop it.
+func TestAnUnboundPublisherReleasesTheContinuationItDrops(t *testing.T) {
+	continuation := &recordingContinuation{}
+	runner := NewPublishingRunner(RunnerFunc(func(context.Context, *PreparedAttempt) Outcome {
+		return Outcome{State: protocol.AttemptAcceptedUnpublished, Continuation: continuation}
+	}), newFakeGateway(), PublishOptions{})
+	outcome := runner.Run(context.Background(), &PreparedAttempt{})
+	if outcome.Continuation != nil || continuation.released != 1 {
+		t.Fatalf("outcome continuation=%v released=%d, want dropped and released once",
+			outcome.Continuation, continuation.released)
+	}
+}

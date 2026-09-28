@@ -315,6 +315,9 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 	}
 	worker := r.boundWorker()
 	if worker == nil {
+		// This outcome is rebuilt, so the continuation would be dropped
+		// rather than released downstream.
+		releaseContinuation(outcome)
 		return Outcome{State: protocol.AttemptAcceptedUnpublished,
 			Result: withPublishSummary(outcome.Result, PublishSummary{
 				State: PublishStateFailed, Code: "publisher_unbound",
@@ -1643,6 +1646,35 @@ func (c *Client) AttemptPublishRecords(ctx context.Context, attemptID string) ([
 func (c *Client) JobPublishRecords(ctx context.Context, jobID string) ([]protocol.PublishRecord, error) {
 	var records []protocol.PublishRecord
 	err := c.call(ctx, http.MethodGet, "/api/jobs/"+url.PathEscape(jobID)+"/publish", nil, &records)
+	return records, err
+}
+
+// AuthorizeCIRepair asks whether this lease may push one CI repair round
+// (fenced, before the push).
+func (c *Client) AuthorizeCIRepair(
+	ctx context.Context, attemptID string, request protocol.CIRepairAuthorizationRequest,
+) (protocol.CIRepairAuthorization, error) {
+	var authorization protocol.CIRepairAuthorization
+	err := c.call(ctx, http.MethodPost,
+		"/api/attempts/"+url.PathEscape(attemptID)+"/publish/ci-repair/authorize", request, &authorization)
+	return authorization, err
+}
+
+// RecordCIRepair records one pushed CI repair round (fenced, after the push).
+func (c *Client) RecordCIRepair(
+	ctx context.Context, attemptID string, request protocol.CIRepairRecordRequest,
+) (protocol.CIRepairRecord, error) {
+	var record protocol.CIRepairRecord
+	err := c.call(ctx, http.MethodPost,
+		"/api/attempts/"+url.PathEscape(attemptID)+"/publish/ci-repair/record", request, &record)
+	return record, err
+}
+
+// AttemptCIRepairs reads one attempt's recorded CI repair rounds.
+func (c *Client) AttemptCIRepairs(ctx context.Context, attemptID string) ([]protocol.CIRepairRecord, error) {
+	var records []protocol.CIRepairRecord
+	err := c.call(ctx, http.MethodGet,
+		"/api/attempts/"+url.PathEscape(attemptID)+"/publish/ci-repairs", nil, &records)
 	return records, err
 }
 
