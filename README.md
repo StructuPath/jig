@@ -41,7 +41,7 @@ supported platform (`just release`).
 against the published checksums, and put `jig` on your `PATH`:
 
 ```sh
-VERSION=v0.1.0
+VERSION=v0.2.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')          # darwin or linux
 ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 
