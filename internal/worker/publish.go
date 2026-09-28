@@ -315,6 +315,9 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 	}
 	worker := r.boundWorker()
 	if worker == nil {
+		// This outcome is rebuilt, so the continuation would be dropped
+		// rather than released downstream.
+		releaseContinuation(outcome)
 		return Outcome{State: protocol.AttemptAcceptedUnpublished,
 			Result: withPublishSummary(outcome.Result, PublishSummary{
 				State: PublishStateFailed, Code: "publisher_unbound",

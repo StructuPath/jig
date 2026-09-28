@@ -122,6 +122,31 @@ type CIFailure struct {
 	Checks []CICheck
 }
 
+// DeferToContinuation hands cleanup to the outcome's continuation when it
+// carries one, and reports whether it did. A host that owns per-attempt
+// resources the continuation still needs (the scratch directory, the trace
+// stream a round emits into) must not tear them down when the runner
+// returns: they go when the continuation is released, after its own
+// Release, exactly once.
+func DeferToContinuation(outcome *Outcome, cleanup func()) bool {
+	if outcome.Continuation == nil {
+		return false
+	}
+	outcome.Continuation = &hostedContinuation{Continuation: outcome.Continuation, cleanup: cleanup}
+	return true
+}
+
+type hostedContinuation struct {
+	Continuation
+	once    sync.Once
+	cleanup func()
+}
+
+func (h *hostedContinuation) Release() {
+	h.Continuation.Release()
+	h.once.Do(h.cleanup)
+}
+
 // releaseContinuation frees an outcome's continuation when nothing downstream
 // will use it.
 func releaseContinuation(outcome Outcome) {

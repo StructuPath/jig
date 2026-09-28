@@ -272,10 +272,18 @@ func workerAttemptRunner(
 			return worker.Outcome{State: protocol.AttemptFailed, Error: err.Error()}
 		}
 		// Belt to the engine's braces: the seeded credentials in the
-		// ephemeral HOME die with the attempt on every exit path (KTD11).
-		defer func() {
+		// ephemeral HOME die with the attempt on every exit path (KTD11) —
+		// unless a CI repair continuation still needs the scratch, in which
+		// case they die when it is released.
+		kept := false
+		removeScratch := func() {
 			if err := os.RemoveAll(filepath.Join(scratchRoot, attemptID)); err != nil {
 				logger.Warn("attempt_scratch_destroy_failed", "attempt_id", attemptID, "error", err)
+			}
+		}
+		defer func() {
+			if !kept {
+				removeScratch()
 			}
 		}()
 		trace, err := host().OpenTrace(prepared)
@@ -284,10 +292,16 @@ func workerAttemptRunner(
 		}
 		// The drain runs on a detached context: an interrupted attempt still
 		// has events worth delivering, and a dead context would drop the tail
-		// of exactly the run an operator most wants to read.
-		defer func() {
+		// of exactly the run an operator most wants to read. A continuation's
+		// repair rounds emit into the same stream, so it stays open for them.
+		closeTrace := func() {
 			if err := trace.Close(context.WithoutCancel(ctx)); err != nil {
 				logger.Warn("attempt_trace_close_failed", "attempt_id", attemptID, "error", err)
+			}
+		}
+		defer func() {
+			if !kept {
+				closeTrace()
 			}
 		}()
 
@@ -308,7 +322,7 @@ func workerAttemptRunner(
 		// (which rides the heartbeat response) and the operator's Ctrl-C. The
 		// engine watches one channel, so they are merged rather than the
 		// second one being dropped.
-		return runner.Execute(context.WithoutCancel(ctx), engine.Attempt{
+		outcome := runner.Execute(context.WithoutCancel(ctx), engine.Attempt{
 			Claim:        prepared.Claim,
 			WorktreePath: prepared.WorktreePath,
 			Branch:       prepared.Branch,
@@ -316,6 +330,11 @@ func workerAttemptRunner(
 			Cancelled:    anyClosed(signalCtx.Done(), prepared.Cancelled()),
 			FreshenLease: prepared.FreshenLease,
 		})
+		kept = worker.DeferToContinuation(&outcome, func() {
+			closeTrace()
+			removeScratch()
+		})
+		return outcome
 	})
 }
 

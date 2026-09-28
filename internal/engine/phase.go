@@ -182,6 +182,17 @@ func (r *Runner) Execute(ctx context.Context, attempt Attempt) worker.Outcome {
 	if err != nil {
 		return worker.Outcome{State: protocol.AttemptFailed, Error: err.Error()}
 	}
+	// The whole scratch family — ephemeral HOME included — dies with the
+	// attempt on every exit path, panics included (KTD11), unless a CI
+	// repair continuation takes ownership of it below.
+	kept := false
+	defer func() {
+		if !kept {
+			if err := scratch.destroy(); err != nil {
+				r.config.Logger.Warn("attempt_scratch_destroy_failed", "error", err)
+			}
+		}
+	}()
 	e := &execution{
 		runner:       r,
 		attempt:      attempt,
@@ -201,18 +212,13 @@ func (r *Runner) Execute(ctx context.Context, attempt Attempt) worker.Outcome {
 		sessionKey:   attempt.Claim.Attempt.ID,
 	}
 	outcome := e.run(ctx)
-	if e.repairable(outcome) {
-		// The chain stays alive for CI repair: the continuation now owns the
-		// scratch family. The HOME is wiped at once regardless, so nothing an
-		// agent left "at home" (credentials included) outlives this chain
-		// (KTD11); only the handoff notes carry into a round.
-		e.wipeHome()
+	// The chain stays alive for CI repair only when its HOME is provably
+	// empty: nothing an agent left "at home" (credentials included) may
+	// outlive the chain (KTD11). Only the handoff notes carry into a round.
+	if e.repairable(outcome) && e.wipeHome() == nil {
+		kept = true
 		outcome.Continuation = &ciContinuation{e: e}
-		return outcome
 	}
-	// The whole scratch family — ephemeral HOME included — dies with the
-	// attempt (KTD11). Anything an agent wrote "to its home" goes with it.
-	e.destroyScratch()
 	return outcome
 }
 

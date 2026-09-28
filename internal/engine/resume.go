@@ -35,15 +35,21 @@ func (e *execution) repairable(outcome worker.Outcome) bool {
 }
 
 // wipeHome empties the ephemeral HOME and forgets which roles were seeded
-// into it, so the next send re-provisions a clean one.
-func (e *execution) wipeHome() {
+// into it, so the next send re-provisions a clean one. A wipe that fails
+// (an agent can make one fail, with a read-only directory) is an error the
+// caller must act on: a HOME that may still hold what an agent left there
+// is never handed to another round.
+func (e *execution) wipeHome() error {
+	e.seededRoles = make(map[string]bool)
 	if err := os.RemoveAll(e.scratch.home); err != nil {
 		e.runner.config.Logger.Warn("attempt_home_wipe_failed", "error", err)
+		return fmt.Errorf("wipe the ephemeral HOME: %w", err)
 	}
 	if err := os.MkdirAll(e.scratch.home, 0o700); err != nil {
 		e.runner.config.Logger.Warn("attempt_home_recreate_failed", "error", err)
+		return fmt.Errorf("recreate the ephemeral HOME: %w", err)
 	}
-	e.seededRoles = make(map[string]bool)
+	return nil
 }
 
 func (e *execution) destroyScratch() {
@@ -81,12 +87,24 @@ func (c *ciContinuation) RepairCI(ctx context.Context, failure worker.CIFailure)
 	e.publishHeld = ""
 	e.sessionKey = fmt.Sprintf("%s-ci%d", e.attempt.Claim.Attempt.ID, c.rounds)
 	// The HOME was wiped when the chain (or the previous round) ended; wipe
-	// it again when this round ends, whatever the outcome.
-	defer e.wipeHome()
+	// it again when this round ends, whatever the outcome, panics included.
+	// If that wipe fails, no later round may run in what is left behind.
+	defer func() {
+		if e.wipeHome() != nil {
+			c.spent = true
+		}
+	}()
 
 	outcome := e.conclude(e.repairRound(ctx, c.rounds, failure))
 	if !e.repairable(outcome) {
 		c.spent = true
+		return outcome
+	}
+	if len(e.touchedPaths) == 0 {
+		// Accepted, but there is nothing to push: pushing the same head
+		// again cannot turn red CI green. The round ends the repair.
+		c.spent = true
+		outcome.Error = "ci_repair_no_change: the CI repair round changed no files"
 	}
 	return outcome
 }
@@ -151,10 +169,11 @@ func ciFailureEnvelope(failure worker.CIFailure) parsedEnvelope {
 			"url":        truncateText(check.URL, protocol.MaxPublishURLBytes),
 		})
 	}
+	head := truncateText(failure.Head, protocol.MaxPublishRefBytes)
 	base := protocol.Envelope{
 		Status: protocol.EnvelopeFail,
 		Summary: fmt.Sprintf("CI failed on %s after this change was published: %s",
-			failure.Head, strings.Join(names, ", ")),
+			head, strings.Join(names, ", ")),
 		NotesForNextAgent: "The checks in failed_checks failed in CI on the published commit. " +
 			"Fix the code so they pass. Do not delete or weaken tests, lint rules, or CI " +
 			"configuration to get there: every phase after you reviews this fix. The check " +
@@ -165,7 +184,7 @@ func ciFailureEnvelope(failure worker.CIFailure) parsedEnvelope {
 		"summary":              base.Summary,
 		"notes_for_next_agent": base.NotesForNextAgent,
 		"ci_failed":            true,
-		"head":                 failure.Head,
+		"head":                 head,
 		"failed_checks":        listed,
 	}
 	raw, err := json.Marshal(fields)

@@ -6,6 +6,7 @@ package engine_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/StructuPath/jig/internal/engine"
 	"github.com/StructuPath/jig/internal/engine/enginetest"
 	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/jig/internal/runtime"
 	"github.com/StructuPath/jig/internal/worker"
 )
 
@@ -402,5 +404,151 @@ func TestARoundReseedsTheWipedHomeForEveryRoleItUses(t *testing.T) {
 	}
 	if seeded["builder"] != 2 || seeded["reviewer"] != 2 {
 		t.Fatalf("seed calls = %v, want each role seeded once for the chain and once for the round", seeded)
+	}
+}
+
+// A round that is accepted but changed nothing ends the repair: pushing the
+// same head again cannot turn red CI green.
+func TestARoundThatChangesNothingEndsTheRepair(t *testing.T) {
+	f := newRepairFixture(t, ciRepairSnapshot, nil, chainSteps()...)
+	continuation := f.execute(t).Continuation
+	defer continuation.Release()
+	f.fake.Append(success("nothing to fix", nil), success("fine", map[string]any{"approved": true}))
+	round := continuation.RepairCI(context.Background(), redLint)
+	if round.State != protocol.AttemptAcceptedUnpublished || !strings.Contains(round.Error, "ci_repair_no_change") {
+		t.Fatalf("round = %+v, want accepted with ci_repair_no_change", round)
+	}
+	if next := continuation.RepairCI(context.Background(), redLint); !strings.Contains(next.Error, "spent") {
+		t.Fatalf("round after a no-change round = %+v, want spent", next)
+	}
+}
+
+// lockHome makes the ephemeral HOME unwipeable the way an agent could: a
+// read-only directory holding a file.
+func lockHome(t *testing.T, home string) error {
+	locked := filepath.Join(home, "locked")
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(locked, "left-behind"), []byte("token"), 0o600); err != nil {
+		return err
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o700) })
+	return os.Chmod(locked, 0o500)
+}
+
+// A HOME that cannot be provably wiped is never handed to a round: after the
+// chain there is no continuation, and after a round the continuation is
+// spent.
+func TestAHomeThatCannotBeWipedIsNeverHandedToARound(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the wipe cannot be made to fail")
+	}
+	t.Run("after the chain", func(t *testing.T) {
+		f := newRepairFixture(t, ciRepairSnapshot, func(config *engine.Config) {
+			config.SeedHome = func(home, _ string, _ protocol.RoleSpec) error { return lockHome(t, home) }
+		}, chainSteps()...)
+		outcome := f.execute(t)
+		if outcome.State != protocol.AttemptAcceptedUnpublished || outcome.Continuation != nil {
+			t.Fatalf("outcome = %+v, want accepted with no continuation", outcome)
+		}
+	})
+	t.Run("after a round", func(t *testing.T) {
+		lock := false
+		f := newRepairFixture(t, ciRepairSnapshot, func(config *engine.Config) {
+			config.SeedHome = func(home, _ string, _ protocol.RoleSpec) error {
+				if lock {
+					return lockHome(t, home)
+				}
+				return nil
+			}
+		}, chainSteps()...)
+		continuation := f.execute(t).Continuation
+		if continuation == nil {
+			t.Fatal("no continuation for a wipeable chain")
+		}
+		defer continuation.Release()
+		lock = true
+		f.fake.Append(writes(map[string]string{"src/fix.txt": "fixed"}, "fixed"),
+			success("fine", map[string]any{"approved": true}))
+		if round := continuation.RepairCI(context.Background(), redLint); round.State != protocol.AttemptAcceptedUnpublished {
+			t.Fatalf("round = %+v, want accepted", round)
+		}
+		if next := continuation.RepairCI(context.Background(), redLint); !strings.Contains(next.Error, "spent") {
+			t.Fatalf("round after an unwipeable HOME = %+v, want spent", next)
+		}
+	})
+}
+
+// Handoff notes written for later phases survive into a round.
+func TestHandoffNotesSurviveIntoARound(t *testing.T) {
+	f := newRepairFixture(t, ciRepairSnapshot, nil, chainSteps()...)
+	continuation := f.execute(t).Continuation
+	defer continuation.Release()
+	note := filepath.Join(f.scratch, "attempt-1", "handoff", "plan.md")
+	if err := os.WriteFile(note, []byte("the plan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.Append(writes(map[string]string{"src/fix.txt": "fixed"}, "fixed"),
+		success("fine", map[string]any{"approved": true}))
+	continuation.RepairCI(context.Background(), redLint)
+	if _, err := os.Stat(note); err != nil {
+		t.Fatalf("the planner's handoff note did not survive the round: %v", err)
+	}
+}
+
+// Everything CI hands a round is bounded before it reaches a prompt.
+func TestTheCIFailureInputIsBounded(t *testing.T) {
+	f := newRepairFixture(t, ciRepairSnapshot, nil, chainSteps()...)
+	continuation := f.execute(t).Continuation
+	defer continuation.Release()
+	failure := worker.CIFailure{Head: strings.Repeat("a", 200)}
+	for i := 0; i < protocol.MaxCIRepairFailedChecks+5; i++ {
+		failure.Checks = append(failure.Checks, worker.CICheck{
+			Name:       fmt.Sprintf("check-%02d-%s", i, strings.Repeat("x", 300)),
+			Conclusion: strings.Repeat("c", 300),
+			URL:        "https://example.com/" + strings.Repeat("u", 600),
+		})
+	}
+	f.fake.Append(writes(map[string]string{"src/fix.txt": "fixed"}, "fixed"),
+		success("fine", map[string]any{"approved": true}))
+	continuation.RepairCI(context.Background(), failure)
+	prompt := f.fake.Calls()[3].Prompt
+	last := fmt.Sprintf("check-%02d-", protocol.MaxCIRepairFailedChecks-1)
+	over := fmt.Sprintf("check-%02d-", protocol.MaxCIRepairFailedChecks)
+	if !strings.Contains(prompt, last) || strings.Contains(prompt, over) {
+		t.Fatalf("prompt does not carry exactly %d checks", protocol.MaxCIRepairFailedChecks)
+	}
+	for _, overlong := range []string{
+		strings.Repeat("x", protocol.MaxCIRepairCheckNameBytes),
+		strings.Repeat("c", protocol.MaxCIRepairCheckNameBytes+1),
+		strings.Repeat("u", protocol.MaxPublishURLBytes),
+		strings.Repeat("a", protocol.MaxPublishRefBytes+1),
+	} {
+		if strings.Contains(prompt, overlong) {
+			t.Fatalf("prompt carries an unbounded %.10q… run", overlong)
+		}
+	}
+}
+
+// panickingRuntime blows up on the first send.
+type panickingRuntime struct{ enginetest.Runtime }
+
+func (*panickingRuntime) StartOrContinue(context.Context, *runtime.Session, string, runtime.Options) (runtime.Handle, error) {
+	panic("runtime exploded")
+}
+
+// A panic unwinding through Execute still destroys the scratch family, and
+// with it anything seeded into the HOME (KTD11).
+func TestAPanicInTheChainStillDestroysTheScratch(t *testing.T) {
+	scratch := t.TempDir()
+	runner := newTestRunner(t, &panickingRuntime{Runtime: *enginetest.New()}, &recordingSink{},
+		func(config *engine.Config) { config.ScratchRoot = scratch })
+	func() {
+		defer func() { recover() }()
+		runner.Execute(context.Background(), testAttempt(ciRepairSnapshot, nil, initRepo(t)))
+	}()
+	if _, err := os.Stat(filepath.Join(scratch, "attempt-1")); !os.IsNotExist(err) {
+		t.Fatalf("scratch survived a panic: %v", err)
 	}
 }
