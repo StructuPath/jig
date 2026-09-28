@@ -319,6 +319,7 @@ func (a *Adapter) StartOrContinue(
 		watchdog:     watchdog,
 		groupID:      groupID,
 		resumedID:    resumedID,
+		session:      session,
 		events:       make(chan runtime.Event, eventChannelDepth),
 		done:         make(chan struct{}),
 		stderrDone:   make(chan struct{}),
@@ -360,8 +361,11 @@ type claudeHandle struct {
 	// resumedID is the session this send was told to continue, empty on a
 	// creating send. Result compares it against what the CLI reports back.
 	resumedID string
-	events    chan runtime.Event
-	done      chan struct{}
+	// session is where Result records the CLI's running cost total, so the
+	// next send on the conversation can report only its own share.
+	session *runtime.Session
+	events  chan runtime.Event
+	done    chan struct{}
 	// stderrDone closes when the stderr capture goroutine has finished.
 	stderrDone chan struct{}
 	stopped    chan struct{}
@@ -585,6 +589,14 @@ func (h *claudeHandle) Result() (runtime.Result, error) {
 		// corrections misreported downstream.
 		h.finalErr = fmt.Errorf("%w: asked to resume %s, the CLI answered under %s",
 			ErrSessionDiscontinuity, h.resumedID, h.result.SessionID)
+	}
+	if h.resultSeen && !errors.Is(h.finalErr, ErrSessionDiscontinuity) {
+		// total_cost_usd is the session's running total across --resume, not
+		// this invocation's cost (verified against claude 2.1.283: a resume
+		// reported the first send's cost plus its own). Usage is per send.
+		total := h.result.Usage.CostUSD
+		h.result.Usage.CostUSD = total - h.session.ReportedCostUSD
+		h.session.ReportedCostUSD = total
 	}
 	return h.result, h.finalErr
 }
