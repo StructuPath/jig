@@ -730,6 +730,29 @@ func TestACancelledJobOrALostVerdictSendsNoRerunOnAFreshLease(t *testing.T) {
 	}
 }
 
+// A heartbeat that receives a lost-lease verdict records it, so the next
+// re-run fence refuses even though the lease now looks fresh.
+func TestAHeartbeatRecordsTheLostVerdict(t *testing.T) {
+	w, _, target, _ := publishedWorker(t)
+	// A well-formed token that is not the attempt's: the control plane's
+	// answer is a verdict, not a malformed request.
+	target.lease = newAttemptLease(w.client, target.attemptID, strings.Repeat("a", 64))
+	if target.lease.lostVerdict() != nil {
+		t.Fatal("a new lease reports a lost verdict")
+	}
+	target.lease.now = func() time.Time { return time.Now().Add(time.Hour) }
+	if err := target.lease.freshen(context.Background()); err == nil || !leaseLost(err) {
+		t.Fatalf("freshen = %v, want a lost-lease verdict from the terminal attempt", err)
+	}
+	target.lease.now = time.Now
+	if target.lease.lostVerdict() == nil {
+		t.Fatal("the heartbeat's lost verdict was not recorded")
+	}
+	if err := fenceRerun(context.Background(), target); err == nil {
+		t.Fatal("the re-run fence passed a lease the control plane declared lost")
+	}
+}
+
 // Past the deadline an "in progress" refusal is not asked again: no burst of
 // back-to-back requests.
 func TestNoInProgressRetryPastTheDeadline(t *testing.T) {
