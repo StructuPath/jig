@@ -478,22 +478,30 @@ func TestReportClassifiesUnreadableResultsAndReadsSignalsFromHistory(t *testing.
 			"ci_failures": redChecks,
 			"ci_repairs":  []map[string]any{{"round": 1, "head_before": shaA, "outcome": "ci_repair_no_change"}},
 		})))
+	// A re-run that failed again is a re-run, not a flaky pass.
+	seed("s3-rerun-still-red", result(t, summary("failed", "ci_failed", map[string]any{
+		"ci_failures": redChecks,
+		"ci_reruns":   []map[string]any{{"attempt": 1, "jobs": []int64{11}, "outcome": "failed"}},
+	})))
 
 	got := mustReport(t, f.store, now.Add(-time.Hour), now.Add(time.Hour))
+	if got.CI.Reruns != (ReportCIReruns{Attempts: 1, Reruns: 1}) {
+		t.Fatalf("reruns = %+v, want one re-run and no flaky pass", got.CI.Reruns)
+	}
 	if got.UnreadableResults != 5 || got.Publish.Unreadable != 5 {
 		t.Fatalf("unreadable = %d results, %d publish; want 5 and 5", got.UnreadableResults, got.Publish.Unreadable)
 	}
-	if got.Publish.Failed != 2 || !reflect.DeepEqual(got.Publish.FailedCodes, map[string]int{"ci_failed": 2}) {
-		t.Fatalf("publish failed = %d %v, want 2 ci_failed", got.Publish.Failed, got.Publish.FailedCodes)
+	if got.Publish.Failed != 3 || !reflect.DeepEqual(got.Publish.FailedCodes, map[string]int{"ci_failed": 3}) {
+		t.Fatalf("publish failed = %d %v, want 3 ci_failed", got.Publish.Failed, got.Publish.FailedCodes)
 	}
-	if got.CI.Waited != 7 {
-		t.Fatalf("waited = %d, want 7", got.CI.Waited)
+	if got.CI.Waited != 8 {
+		t.Fatalf("waited = %d, want 8", got.CI.Waited)
 	}
 	if got.CI.Revisit.CITimeouts != 1 || got.CI.Revisit.RetryStillRed != 1 {
 		t.Fatalf("revisit = %+v, want 1 timeout and 1 retry still red", got.CI.Revisit)
 	}
 	wantRepair := ReportCIRepair{
-		Entered: 1, EntryRate: floatPointer(1.0 / 7), SuccessRate: floatPointer(0),
+		Entered: 1, EntryRate: floatPointer(1.0 / 8), SuccessRate: floatPointer(0),
 		StopCodes: map[string]int{"ci_repair_no_change": 1},
 	}
 	if !reflect.DeepEqual(got.CI.Repair, wantRepair) {
