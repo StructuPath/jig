@@ -578,7 +578,9 @@ func TestAPersonsPushAfterTheRerunIsNotAFlakyPass(t *testing.T) {
 			return []CICheck{actionsJob("test", CIFail, 11)}
 		}
 		if head == 0 {
-			return []CICheck{actionsJob("test", CIPending, 12)}
+			// jig's head would pass too: only the moved branch may stop
+			// it from being recorded as a flaky pass.
+			return []CICheck{actionsJob("test", CIPass, 12)}
 		}
 		return []CICheck{actionsJob("test", CIPass, 21)}
 	})
@@ -665,11 +667,30 @@ func TestARerunThatNeverFinishesIsBoundedAndLeavesCIRed(t *testing.T) {
 	}
 }
 
+// GitHub reporting no checks at all after a re-run is no green verdict: CI
+// stays red as it was.
+func TestNoChecksAfterARerunIsNotGreen(t *testing.T) {
+	s, _ := newRerunScenario(t, 1, 0, func(_, reruns, _ int) []CICheck {
+		if reruns == 0 {
+			return []CICheck{actionsJob("test", CIFail, 11)}
+		}
+		return nil
+	})
+	attempt, summary := s.run(t)
+	if attempt.State != protocol.AttemptAcceptedUnpublished || summary.Code != "ci_failed" || summary.CIFlaky {
+		t.Fatalf("attempt = %s summary = %+v, want ci_failed, not a flaky pass", attempt.State, summary)
+	}
+	assertReruns(t, summary, CIRerunSummary{Attempt: 1, Outcome: "ci_unavailable"})
+}
+
 // Failed jobs of one workflow run are re-run with one request for the run,
 // not one per job (whose siblings GitHub would refuse while it runs).
 func TestFailedJobsOfOneWorkflowRunAreRerunTogether(t *testing.T) {
-	s, _ := newRerunScenario(t, 1, 0, func(_, reruns, _ int) []CICheck {
-		if reruns == 0 {
+	var lastRequestAt int
+	s, _ := newRerunScenario(t, 1, 0, func(_, reruns, poll int) []CICheck {
+		if reruns < 2 || poll <= lastRequestAt+2 {
+			// Before the re-runs, and for a while after: GitHub still
+			// lists the old red runs of every re-run job.
 			return []CICheck{actionsJob("test (1)", CIFail, 11), actionsJob("test (2)", CIFail, 12),
 				actionsJob("lint", CIFail, 31)}
 		}
@@ -686,6 +707,7 @@ func TestFailedJobsOfOneWorkflowRunAreRerunTogether(t *testing.T) {
 		if run != 1000 && run != 3000 {
 			t.Errorf("re-run of run %d, want a workflow run id", run)
 		}
+		lastRequestAt = s.gateway.checkPolls
 		return nil
 	}
 	attempt, summary := s.run(t)
