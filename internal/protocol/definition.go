@@ -82,9 +82,26 @@ type PublishSpec struct {
 
 // CISpec opts a definition into waiting for the pull request's CI after
 // publish. Timeout is a Go duration ("30m"); empty means DefaultCITimeout.
+// OnFail, when declared, repairs red CI inside the attempt instead of ending
+// it there.
 type CISpec struct {
-	Wait    bool   `yaml:"wait"`
-	Timeout string `yaml:"timeout"`
+	Wait    bool          `yaml:"wait"`
+	Timeout string        `yaml:"timeout"`
+	OnFail  *CIRepairSpec `yaml:"on_fail"`
+}
+
+// CIRepairSpec is the CI repair loop:
+//
+//	on_fail: {run: <agent phase>, budget: N}
+//
+// A red CI run is handed to Run as its input envelope; every phase after Run
+// then runs again, gates and repair edges live, before the fix may be pushed
+// and CI awaited again. There is deliberately no way to resume later in the
+// chain: a skipped phase would carry its verdict on the old code into
+// acceptance of the new. Budget bounds the rounds.
+type CIRepairSpec struct {
+	Run    string `yaml:"run"`
+	Budget int    `yaml:"budget"`
 }
 
 // CI wait bounds. The timeout covers the whole wait for one head commit; the
@@ -93,6 +110,11 @@ const (
 	DefaultCITimeout = 30 * time.Minute
 	MinCITimeout     = time.Minute
 	MaxCITimeout     = 6 * time.Hour
+
+	// MaxCIRepairRounds caps publish.ci.on_fail's budget. Each round re-runs
+	// every phase after the repair phase, reviewers included, so a
+	// larger budget is mostly a larger bill for a fix that is not converging.
+	MaxCIRepairRounds = 3
 )
 
 // WaitsForCI reports whether the definition gates acceptance on CI.
@@ -267,10 +289,10 @@ func (spec *DefinitionSpec) Validate() error {
 	if err := spec.validateAcceptance(); err != nil {
 		return err
 	}
-	return spec.validatePublish()
+	return spec.validatePublish(phasesByName)
 }
 
-func (spec *DefinitionSpec) validatePublish() error {
+func (spec *DefinitionSpec) validatePublish(phases map[string]PhaseSpec) error {
 	if spec.Publish == nil {
 		return nil
 	}
@@ -292,6 +314,34 @@ func (spec *DefinitionSpec) validatePublish() error {
 			return fmt.Errorf("publish: ci: timeout %s is outside %s..%s",
 				timeout, MinCITimeout, MaxCITimeout)
 		}
+	}
+	return spec.validateCIRepair(phases)
+}
+
+func (spec *DefinitionSpec) validateCIRepair(phases map[string]PhaseSpec) error {
+	ci := spec.Publish.CI
+	if ci == nil || ci.OnFail == nil {
+		return nil
+	}
+	repair := ci.OnFail
+	if !ci.Wait {
+		return fmt.Errorf("publish: ci: on_fail repairs red CI, which needs wait: true")
+	}
+	run, defined := phases[repair.Run]
+	if !defined {
+		return fmt.Errorf("publish: ci: on_fail: run targets undefined phase %q", repair.Run)
+	}
+	if run.Kind != PhaseKindAgent {
+		return fmt.Errorf("publish: ci: on_fail: run phase %q is a %s phase; only an agent phase can fix code",
+			repair.Run, run.Kind)
+	}
+	if spec.Phases[len(spec.Phases)-1].Name == repair.Run {
+		return fmt.Errorf(
+			"publish: ci: on_fail: run phase %q is the last phase, so nothing after it would judge the fix",
+			repair.Run)
+	}
+	if repair.Budget < 1 || repair.Budget > MaxCIRepairRounds {
+		return fmt.Errorf("publish: ci: on_fail: budget %d is outside 1..%d", repair.Budget, MaxCIRepairRounds)
 	}
 	return nil
 }
