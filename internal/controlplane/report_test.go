@@ -449,3 +449,54 @@ func TestReportRouteRejectsABadWindow(t *testing.T) {
 		}
 	}
 }
+
+// What the report cannot read is counted, never guessed; and a signal that
+// only history carries — a timeout, a red summary before a retry, a repair
+// with no pushed round — is still read, once.
+func TestReportClassifiesUnreadableResultsAndReadsSignalsFromHistory(t *testing.T) {
+	f, clock := newReportFixture(t)
+	now := clock.Now()
+	seed := func(id, stored string) {
+		f.job(id, reportRunCI, protocol.JobAcceptedUnpublished, now)
+		f.step(f.attempt(id, 1, protocol.AttemptAcceptedUnpublished, stored), protocol.PublishStepProof, shaA)
+	}
+	seed("u1-unknown-marker", result(t, "maybe_later"))
+	seed("u2-number", result(t, 42))
+	seed("u3-unknown-state", result(t, summary("exploded", "", nil)))
+	seed("u4-history-object", `{"publish":{"state":"failed","code":"ci_failed"},"publish_history":{"state":"failed"}}`)
+	seed("u5-no-publish", `{"changed_paths":[]}`)
+	// A timeout, then a retry that went red: the timeout counts, and a
+	// timeout is not red, so this is not the retry-repair signal.
+	seed("s1-timeout-then-red", result(t,
+		summary("failed", "ci_failed", map[string]any{"ci_failures": redChecks}),
+		summary("failed", "ci_timeout", map[string]any{"ci_failures": pendingChecks})))
+	// A repair that stopped before pushing anything, red by its recorded
+	// failures alone, then a retry still red.
+	seed("s2-unpushed-repair", result(t,
+		summary("failed", "ci_failed", map[string]any{"ci_failures": redChecks}),
+		summary("failed", "ci_repair_no_change", map[string]any{
+			"ci_failures": redChecks,
+			"ci_repairs":  []map[string]any{{"round": 1, "head_before": shaA, "outcome": "ci_repair_no_change"}},
+		})))
+
+	got := mustReport(t, f.store, now.Add(-time.Hour), now.Add(time.Hour))
+	if got.UnreadableResults != 5 || got.Publish.Unreadable != 5 {
+		t.Fatalf("unreadable = %d results, %d publish; want 5 and 5", got.UnreadableResults, got.Publish.Unreadable)
+	}
+	if got.Publish.Failed != 2 || !reflect.DeepEqual(got.Publish.FailedCodes, map[string]int{"ci_failed": 2}) {
+		t.Fatalf("publish failed = %d %v, want 2 ci_failed", got.Publish.Failed, got.Publish.FailedCodes)
+	}
+	if got.CI.Waited != 7 {
+		t.Fatalf("waited = %d, want 7", got.CI.Waited)
+	}
+	if got.CI.Revisit.CITimeouts != 1 || got.CI.Revisit.RetryStillRed != 1 {
+		t.Fatalf("revisit = %+v, want 1 timeout and 1 retry still red", got.CI.Revisit)
+	}
+	wantRepair := ReportCIRepair{
+		Entered: 1, EntryRate: floatPointer(1.0 / 7), SuccessRate: floatPointer(0),
+		StopCodes: map[string]int{"ci_repair_no_change": 1},
+	}
+	if !reflect.DeepEqual(got.CI.Repair, wantRepair) {
+		t.Fatalf("repair = %+v, want %+v", got.CI.Repair, wantRepair)
+	}
+}
