@@ -590,7 +590,7 @@ func (h *claudeHandle) Result() (runtime.Result, error) {
 		h.finalErr = fmt.Errorf("%w: asked to resume %s, the CLI answered under %s",
 			ErrSessionDiscontinuity, h.resumedID, h.result.SessionID)
 	}
-	if h.resultSeen && !errors.Is(h.finalErr, ErrSessionDiscontinuity) {
+	if h.resultSeen {
 		// total_cost_usd is the session's running total across --resume, not
 		// this invocation's cost (verified against claude 2.1.283: a resume
 		// reported the first send's cost plus its own). Usage is per send.
