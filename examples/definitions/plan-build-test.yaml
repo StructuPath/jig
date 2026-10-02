@@ -1,7 +1,7 @@
 # plan-build-test.yaml — the code-phase repair edge (U9, KTD2). Plan the
 # change, build it, then run the repository's own test command; a failing
-# test suite routes its adapter envelope back to the builder and re-runs the
-# suite, bounded by the edge's budget.
+# test suite routes its adapter envelope back to the planner, runs the
+# builder with the revised plan, and re-runs the suite, budget bounded.
 #
 #   jig run --def examples/definitions/plan-build-test.yaml <repo> "add a --version flag"
 #
@@ -9,8 +9,8 @@
 # (R8), and the adapter envelope that carries the exit status and output tail
 # enters the repair loop through exactly the same door an agent's failing
 # report would — so "the tests broke" is a workflow state, not an incident.
-# `budget: 2` bounds it and `exhausted: fail-job` means a suite that is still
-# red after two repair rounds fails the job rather than shipping.
+# `budget: 3` bounds it and `exhausted: fail-job` means a suite that is still
+# red after three repair rounds fails the job rather than shipping.
 #
 # TWO THINGS TO EDIT before using this on your own repository:
 #
@@ -43,6 +43,11 @@ roster:
       touch, in what order, and how the result will be verified by the
       repository's own test command.
 
+      If the previous report contains failed tests, diagnose that failure
+      and revise the plan before the builder runs again. Pass the failure
+      evidence and a concrete repair directive in notes_for_next_agent.
+      Preserve the user's scope. Never weaken tests to make them pass.
+
       Your final JSON must also include:
         - "notes_for_next_agent": the plan itself, concrete enough to
           execute without re-deriving it
@@ -63,6 +68,8 @@ roster:
 
       The plan and any previous phase's report are above. Make the change,
       then stop — the test suite runs as its own phase.
+      On repairs, report all paths changed relative to the original commit,
+      including changes already present from the previous build.
 
       Your final JSON must also include:
         - "changed_files": the repo-relative paths of every file you
@@ -89,5 +96,5 @@ phases:
       elif [ -f go.mod ]; then go test ./...;
       elif [ -f package.json ]; then npm test --silent;
       else echo "plan-build-test: no test command detected — edit the test phase"; exit 1; fi
-    on_fail: {run: build, then: rerun-self, budget: 2, exhausted: fail-job}
+    on_fail: {run: plan, then: rerun-chain, budget: 3, exhausted: fail-job}
 acceptance: [all_phases_passed, artifacts_exist, diff_matches_claims]

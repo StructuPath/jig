@@ -55,6 +55,12 @@ export interface RunTarget {
   base_sha: string;
 }
 
+export interface Definition {
+  id: string;
+  name: string;
+  source: string;
+}
+
 export interface Run {
   id: string;
   definition_id: string;
@@ -199,5 +205,12 @@ export interface AttemptSummary {
   phases?: PhaseResult[] | null;
   acceptance?: { passed?: boolean; checks?: GateCheck[] | null };
   changed_paths?: string[] | null;
-  publish?: string;
+  publish?: string | {
+    state: string;
+    code?: string;
+    detail?: string;
+    branch?: string;
+    pr_url?: string;
+  };
+  publish_hold?: string;
 }

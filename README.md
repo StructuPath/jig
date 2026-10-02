@@ -120,7 +120,7 @@ A definition is data, not a script. Five stock ones ship in
 | `smoke.yaml` | the install check: one read-only phase, repo-independent |
 | `scout.yaml` | read-only recon: two agent phases and the hand-off between them |
 | `two-phase.yaml` | an agent phase that writes, verified by a code phase |
-| `plan-build-test.yaml` | a **code-phase repair edge**: a red suite routes back to the builder |
+| `plan-build-test.yaml` | a **code-phase repair edge**: a red suite returns to planning, rebuilds, and retests |
 | `simple-sdlc.yaml` | an **agent-phase repair edge** (review → revise → re-review), a conditional retest, and per-phase commit messages |
 | `factory.yaml` | the **software factory**: plan → build → commit → test → a panel of specialist reviewers looping the builder until they approve, then a deterministic **risk gate** that holds high-risk work for a person |
 

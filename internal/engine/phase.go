@@ -616,15 +616,40 @@ func (e *execution) runPhaseWithEdge(
 			return &chainEnd{endFailed, fmt.Sprintf(
 				"phase %q: repair target %q missing from frozen snapshot", phase.Name, edge.Run)}, nil
 		}
-		repairRun := e.runPhaseOnce(ctx, repairPhase, run.envelopeRef())
-		if end := repairRun.attemptEnd(); end != nil {
-			return end, nil
+		repairPhases := []protocol.PhaseSpec{repairPhase}
+		if edge.Then == protocol.RepairThenRerunChain {
+			repairPhases = nil
+			collect := false
+			for _, candidate := range e.spec.Phases {
+				if candidate.Name == phase.Name {
+					break
+				}
+				if candidate.Name == edge.Run {
+					collect = true
+				}
+				if collect {
+					repairPhases = append(repairPhases, candidate)
+				}
+			}
 		}
-		if repairRun.outcome == phaseFailed {
-			return &chainEnd{endFailed, fmt.Sprintf(
-				"repair phase %q: %s", repairPhase.Name, repairRun.failure)}, nil
+		previous = run.envelopeRef()
+		for _, repairPhase := range repairPhases {
+			if edge.Then == protocol.RepairThenRerunChain && repairPhase.If != "" && !guardHolds(repairPhase.If, e.fieldView) {
+				e.recordResult(protocol.PhaseResult{Phase: repairPhase.Name, Kind: repairPhase.Kind, Status: phaseStatusSkipped})
+				continue
+			}
+			e.freshenLease(ctx)
+			repairRun := e.runPhaseOnce(ctx, repairPhase, previous)
+			if end := repairRun.attemptEnd(); end != nil {
+				return end, nil
+			}
+			if repairRun.outcome == phaseFailed {
+				return &chainEnd{endFailed, fmt.Sprintf("repair phase %q: %s", repairPhase.Name, repairRun.failure)}, nil
+			}
+			if repairRun.hasEnvelope {
+				previous = repairRun.envelopeRef()
+			}
 		}
-		previous = repairRun.envelopeRef()
 		// then: rerun-self.
 	}
 }

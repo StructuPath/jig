@@ -50,17 +50,18 @@ export function Fleet() {
     <div className="view">
       <header className="view-header">
         <div>
-          <h1>Worker fleet</h1>
+          <h1>Workers</h1>
+          <p className="subtle">Online workers execute queued jobs. Offline workers are saved records of previous sessions.</p>
           <p className="subtle">Observed {formatClock(data.observed_at)}</p>
         </div>
         <div className="counters">
           <div className="counter">
             <span className="counter-value">{data.live_count}</span>
-            <span className="counter-label">live</span>
+            <span className="counter-label">online</span>
           </div>
           <div className="counter">
             <span className="counter-value">{data.stale_count}</span>
-            <span className="counter-label">stale</span>
+            <span className="counter-label">offline</span>
           </div>
           <div className="counter">
             <span className="counter-value">{data.available_slots}</span>
