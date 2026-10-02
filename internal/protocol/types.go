@@ -80,6 +80,22 @@ const (
 	EventPhaseDeath = "phase_death"
 )
 
+// Agent outcomes: how an agent phase entry ended, carried on its agent_end
+// event. Every entry that emitted agent_start emits exactly one agent_end, so
+// summing agent_end cost over an attempt is its whole metered spend (R1).
+const (
+	AgentPassed     = "passed"
+	AgentFailed     = "failed"
+	AgentDied       = "died"
+	AgentAborted    = "aborted"
+	AgentCancelled  = "cancelled"
+	AgentCeiling    = "ceiling"
+	AgentSendBudget = "send_budget"
+	// AgentStopped: a parallel group member stopped because a sibling ended
+	// the attempt.
+	AgentStopped = "stopped"
+)
+
 // Envelope statuses. Success must be earned: everything that constructs a
 // phase or envelope result starts from fail.
 const (

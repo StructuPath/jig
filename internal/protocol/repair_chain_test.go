@@ -26,3 +26,13 @@ acceptance: [all_phases_passed]
 		}
 	}
 }
+
+func TestRepairChainCannotReplayTheParallelGroup(t *testing.T) {
+	phases := strings.Replace(panelPhases, `command: "true"}`,
+		`command: "false", on_fail: {run: build, then: rerun-chain, budget: 1}}`, 1)
+	mustParse(t, parallelPanel("", phases, ""))
+	_, err := ParseDefinition([]byte(parallelPanel("", phases, "parallel: [review-a, review-b, review-c]\n")))
+	if err == nil || !strings.Contains(err.Error(), "parallel member") {
+		t.Fatalf("rerun-chain across the parallel group: got %v", err)
+	}
+}

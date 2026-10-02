@@ -219,28 +219,32 @@ func (w *Worker) Reconcile(ctx context.Context) (ReconcileReport, error) {
 // ---- process-group reconciliation (U4's read side) -------------------------
 
 // stopRecordedProcessGroups stops every agent process group a previous worker
-// process recorded as live. Each candidate is identity-checked first: a
-// recorded group id is just a number, and by the time we read it the pid may
-// belong to someone else's shell — or to nobody at all, if the field was
-// zeroed or corrupted. Only a group id that can name a real group AND whose
-// leader still leads that exact group AND that started inside the manifest's
-// own lifetime is ours to signal. Either way the flag is cleared, so one
+// process recorded as live — every group in an attempt's set, since a
+// parallel reviewer group runs several at once, plus the single group an
+// older jig recorded. Each candidate is identity-checked first: a recorded
+// group id is just a number, and by the time we read it the pid may belong
+// to someone else's shell — or to nobody at all, if the field was zeroed or
+// corrupted. Only a group id that can name a real group AND whose leader
+// still leads that exact group AND that started inside the manifest's own
+// lifetime is ours to signal. Either way the record is cleared, so one
 // unverifiable manifest cannot make every later reconciliation re-examine it
 // forever.
 func (w *Worker) stopRecordedProcessGroups(ctx context.Context, manifests []attemptManifest) []int64 {
 	var stopped []int64
 	for _, manifest := range manifests {
-		if !manifest.ProcessActive {
+		groups := recordedProcessGroups(manifest)
+		if len(groups) == 0 {
 			continue
 		}
-		groupID := manifest.ProcessGroupID
-		ours, reason := processGroupIsOurs(ctx, manifest)
-		if ours {
-			stopProcessGroup(groupID)
-			stopped = append(stopped, groupID)
-			w.logger.Info("orphan_process_group_stopped",
-				"attempt_id", manifest.AttemptID, "process_group_id", groupID)
-		} else {
+		for _, groupID := range groups {
+			ours, reason := processGroupIsOurs(ctx, manifest, groupID)
+			if ours {
+				stopProcessGroup(groupID)
+				stopped = append(stopped, groupID)
+				w.logger.Info("orphan_process_group_stopped",
+					"attempt_id", manifest.AttemptID, "process_group_id", groupID)
+				continue
+			}
 			// Not provably ours: never signalled. A recycled pid belongs to
 			// someone else, and this is the line where that is decided.
 			w.logger.Info("orphan_process_group_skipped",
@@ -248,6 +252,7 @@ func (w *Worker) stopRecordedProcessGroups(ctx context.Context, manifests []atte
 		}
 		if _, err := w.manifests.update(manifest.AttemptID, func(value *attemptManifest) error {
 			value.ProcessActive = false
+			value.ProcessGroups = nil
 			return nil
 		}); err != nil {
 			w.logger.Warn("process_group_clear_failed",
@@ -257,32 +262,45 @@ func (w *Worker) stopRecordedProcessGroups(ctx context.Context, manifests []atte
 	return stopped
 }
 
-// processGroupIsOurs answers whether the recorded group's leader is still the
-// process this manifest recorded, and says why when it is not.
-func processGroupIsOurs(ctx context.Context, manifest attemptManifest) (bool, string) {
-	if !signallableProcessGroup(manifest.ProcessGroupID) {
+// recordedProcessGroups is every group a manifest records as live: its set,
+// and the legacy single group when that is flagged active.
+func recordedProcessGroups(manifest attemptManifest) []int64 {
+	groups := append([]int64(nil), manifest.ProcessGroups...)
+	if manifest.ProcessActive {
+		for _, groupID := range groups {
+			if groupID == manifest.ProcessGroupID {
+				return groups
+			}
+		}
+		groups = append(groups, manifest.ProcessGroupID)
+	}
+	return groups
+}
+
+// processGroupIsOurs answers whether a group the manifest recorded is still
+// led by the process this attempt started, and says why when it is not.
+func processGroupIsOurs(ctx context.Context, manifest attemptManifest, recorded int64) (bool, string) {
+	if !signallableProcessGroup(recorded) {
 		// -1 signals every process the operator's user may signal, 0 signals
 		// jig's own group, 1 is init. None can be an attempt's agent group, so
 		// there is nothing here to verify and nothing to signal.
 		return false, fmt.Sprintf(
-			"recorded process group %d can never name an attempt's own group",
-			manifest.ProcessGroupID)
+			"recorded process group %d can never name an attempt's own group", recorded)
 	}
-	groupID, started, found, err := inspectProcessGroupLeader(ctx, manifest.ProcessGroupID)
+	groupID, started, found, err := inspectProcessGroupLeader(ctx, recorded)
 	switch {
 	case err != nil:
 		return false, "process identity could not be read: " + err.Error()
 	case !found:
 		return false, "the recorded group leader no longer exists"
-	case groupID != manifest.ProcessGroupID:
-		return false, fmt.Sprintf("pid %d now leads group %d, not %d",
-			manifest.ProcessGroupID, groupID, manifest.ProcessGroupID)
+	case groupID != recorded:
+		return false, fmt.Sprintf("pid %d now leads group %d, not %d", recorded, groupID, recorded)
 	}
 	earliest := manifest.CreatedAt.Add(-processIdentitySlack)
 	latest := manifest.UpdatedAt.Add(processIdentitySlack)
 	if started.Before(earliest) || started.After(latest) {
 		return false, fmt.Sprintf("pid %d started at %s, outside this attempt's lifetime (%s..%s) — recycled",
-			manifest.ProcessGroupID, started.UTC().Format(time.RFC3339),
+			recorded, started.UTC().Format(time.RFC3339),
 			earliest.UTC().Format(time.RFC3339), latest.UTC().Format(time.RFC3339))
 	}
 	return true, ""

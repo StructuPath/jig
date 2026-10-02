@@ -64,9 +64,62 @@ type DefinitionSpec struct {
 	Name       string              `yaml:"name"`
 	Roster     map[string]RoleSpec `yaml:"roster"`
 	Phases     []PhaseSpec         `yaml:"phases"`
+	Parallel   ParallelGroup       `yaml:"parallel"`
 	Acceptance []string            `yaml:"acceptance"`
 	Publish    *PublishSpec        `yaml:"publish"`
 }
+
+// ParallelGroup is the one opt-in parallel construct: the names of two or
+// more consecutive agent phases, in chain order, that run concurrently as
+// one step of the chain. Every member is a read-only role (`writes: []`)
+// with its own owner, and no member's `if:` guard reads a field a sibling
+// reports, because every member is judged against the envelope and field
+// view that preceded the group. Members' results merge in declared order,
+// and the phase after the group receives the last member's envelope.
+//
+// It reopens v1's "no parallel phases" non-goal (V1:KTD2) for exactly this
+// shape and no other: reviewers that read the same tree and report
+// verdicts. One group per definition.
+type ParallelGroup []string
+
+// UnmarshalYAML accepts a flat list of phase names. A list of lists is a
+// second group, which is refused by name rather than as a type error.
+func (group *ParallelGroup) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.SequenceNode {
+		return fmt.Errorf("parallel: line %d: must be a list of phase names", node.Line)
+	}
+	names := make(ParallelGroup, 0, len(node.Content))
+	for _, item := range node.Content {
+		if item.Kind == yaml.SequenceNode {
+			return fmt.Errorf("parallel: line %d: only one parallel group per definition — "+
+				"declare it as a flat list of phase names", item.Line)
+		}
+		if item.Kind != yaml.ScalarNode {
+			return fmt.Errorf("parallel: line %d: a member must be a phase name", item.Line)
+		}
+		names = append(names, item.Value)
+	}
+	*group = names
+	return nil
+}
+
+// ParallelRange locates the group in the chain: Phases[start:end] are its
+// members. ok is false when the definition declares no group. Call it only
+// on a spec that passed Validate.
+func (spec *DefinitionSpec) ParallelRange() (start, end int, ok bool) {
+	if len(spec.Parallel) == 0 {
+		return 0, 0, false
+	}
+	for i, phase := range spec.Phases {
+		if phase.Name == spec.Parallel[0] {
+			return i, i + len(spec.Parallel), true
+		}
+	}
+	return 0, 0, false
+}
+
+// envelopeBaseFields are reported by every agent phase: the base contract.
+var envelopeBaseFields = []string{"status", "summary", "artifacts", "notes_for_next_agent"}
 
 // PublishSpec is the definition's say over delivery. HoldWhen is a declared
 // envelope predicate (the `on_fail.when` language) evaluated against the
@@ -292,7 +345,95 @@ func (spec *DefinitionSpec) Validate() error {
 	if err := spec.validateAcceptance(); err != nil {
 		return err
 	}
+	if err := spec.validateParallel(phasesByName); err != nil {
+		return err
+	}
 	return spec.validatePublish(phasesByName)
+}
+
+// validateParallel enforces R8. What a member "reports" is what the
+// definition can see it report: the envelope base fields every agent phase
+// emits and the field its own repair edge's `when` reads. An agent envelope
+// may carry more, which no save-time check can know.
+func (spec *DefinitionSpec) validateParallel(phases map[string]PhaseSpec) error {
+	group := spec.Parallel
+	if group == nil {
+		return nil
+	}
+	if len(group) < 2 {
+		return fmt.Errorf("parallel: a group needs two or more phases, got %d", len(group))
+	}
+	owners := make(map[string]string, len(group))
+	seen := make(map[string]bool, len(group))
+	for _, name := range group {
+		phase, defined := phases[name]
+		if !defined {
+			return fmt.Errorf("parallel: member %q is not a phase in the chain", name)
+		}
+		if seen[name] {
+			return fmt.Errorf("parallel: member %q is listed twice", name)
+		}
+		seen[name] = true
+		if phase.Kind != PhaseKindAgent {
+			return fmt.Errorf("parallel: member %q is a %s phase; only agent phases run in a group",
+				name, phase.Kind)
+		}
+		if writes := spec.Roster[phase.Owner].Writes; writes == nil || len(writes) > 0 {
+			return fmt.Errorf("parallel: member %q runs role %q, which may write; "+
+				"every member's role must declare writes: []", name, phase.Owner)
+		}
+		if other, shared := owners[phase.Owner]; shared {
+			return fmt.Errorf("parallel: members %q and %q share owner role %q; "+
+				"every member needs its own role", other, name, phase.Owner)
+		}
+		owners[phase.Owner] = name
+	}
+	start, _, _ := spec.ParallelRange()
+	for i, name := range group {
+		if i > 0 && (start+i >= len(spec.Phases) || spec.Phases[start+i].Name != name) {
+			return fmt.Errorf("parallel: members must be consecutive phases listed in chain order; "+
+				"%q does not directly follow %q in the chain", name, group[i-1])
+		}
+	}
+	for _, name := range group {
+		guard := strings.TrimSpace(phases[name].If)
+		if guard == "" {
+			continue
+		}
+		field := guard
+		if IsPredicate(guard) {
+			predicate, _ := ParsePredicate(guard)
+			field = predicate.Field
+		}
+		for _, sibling := range group {
+			if sibling != name && reportsField(phases[sibling], field) {
+				return fmt.Errorf("parallel: member %q's if: guard reads %q, which member %q reports; "+
+					"every member is judged before any member runs", name, field, sibling)
+			}
+		}
+	}
+	if spec.Publish != nil && spec.Publish.CI != nil && spec.Publish.CI.OnFail != nil &&
+		seen[spec.Publish.CI.OnFail.Run] {
+		return fmt.Errorf("publish: ci: on_fail: run phase %q is a parallel group member; "+
+			"a CI repair round cannot start inside the group", spec.Publish.CI.OnFail.Run)
+	}
+	return nil
+}
+
+// reportsField reports whether an agent phase declares that it reports the
+// field: a base envelope field, or the field its repair edge keys on.
+func reportsField(phase PhaseSpec, field string) bool {
+	for _, base := range envelopeBaseFields {
+		if field == base {
+			return true
+		}
+	}
+	if phase.OnFail != nil && phase.OnFail.When != "" {
+		if predicate, err := ParsePredicate(phase.OnFail.When); err == nil && predicate.Field == field {
+			return true
+		}
+	}
+	return false
 }
 
 func (spec *DefinitionSpec) validatePublish(phases map[string]PhaseSpec) error {
@@ -455,6 +596,26 @@ func (spec *DefinitionSpec) validateRepairEdge(phase PhaseSpec, phases map[strin
 		}
 		if !found {
 			return fmt.Errorf("phase %q: rerun-chain target %q must precede the failed phase", phase.Name, edge.Run)
+		}
+		// A chain replay runs phases one after another; replaying a parallel
+		// group that way would run its members outside the group's read-only
+		// boundary.
+		inChain := false
+		for _, candidate := range spec.Phases {
+			if candidate.Name == edge.Run {
+				inChain = true
+			}
+			if inChain {
+				for _, member := range spec.Parallel {
+					if candidate.Name == member {
+						return fmt.Errorf("phase %q: rerun-chain from %q would replay parallel member %q; "+
+							"a chain replay cannot include the parallel group", phase.Name, edge.Run, member)
+					}
+				}
+			}
+			if candidate.Name == phase.Name {
+				break
+			}
 		}
 	}
 	if edge.Budget <= 0 {
