@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { Tasks } from "./Tasks";
 import { starterSource } from "./starters";
 
@@ -13,6 +13,15 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn() });
 });
 
+// Build jig once; `go run` per starter recompiles each time and outlasts the
+// test timeout on a cold CI cache.
+const binDirectory = mkdtempSync(join(tmpdir(), "jig-bin-"));
+const jig = join(binDirectory, "jig");
+beforeAll(() => {
+  execFileSync("go", ["build", "-o", jig, "./cmd/jig"], { cwd: ".." });
+}, 180000);
+afterAll(() => rmSync(binDirectory, { recursive: true, force: true }));
+
 it("generates Codex starters accepted by Jig's actual definition validator", async () => {
   const directory = mkdtempSync(join(tmpdir(), "jig-starters-"));
   try {
@@ -20,7 +29,7 @@ it("generates Codex starters accepted by Jig's actual definition validator", asy
       const source = await starterSource(mode, "gpt-6.1-sol", "printf '$&'; go test ./...");
       const path = join(directory, `${mode}.yaml`);
       writeFileSync(path, source);
-      expect(execFileSync("go", ["run", "./cmd/jig", "def", "validate", path], { cwd: "..", encoding: "utf8" })).toMatch(/^ok /);
+      expect(execFileSync(jig, ["def", "validate", path], { cwd: "..", encoding: "utf8" })).toMatch(/^ok /);
       expect(source).toContain('hold_when: "jig_ui_delivery != publish"');
       expect(source).not.toMatch(/model: (haiku|sonnet|opus)/);
       if (mode !== "ask") { expect(source).toContain("printf '$&'; go test ./..."); expect(source).toContain("run: plan, then: rerun-chain"); }
