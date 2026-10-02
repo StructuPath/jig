@@ -80,7 +80,7 @@ it("reports the server's liveness verdict and the runtime each worker owns", asy
   render(<Fleet />);
 
   const local = await waitFor(() => screen.getByText("local").closest("tr")!);
-  expect(within(local).getByText("live")).toBeInTheDocument();
+  expect(within(local).getByText("Online")).toBeInTheDocument();
   expect(within(local).getByText("claude-code 2.1.4")).toBeInTheDocument();
   expect(within(local).getByText("1 / 2")).toBeInTheDocument();
   expect(within(local).getByText("2.0s ago")).toBeInTheDocument();
@@ -88,7 +88,7 @@ it("reports the server's liveness verdict and the runtime each worker owns", asy
   // Stale is the server's word, not an inference: worker-b's four idle slots
   // must not be counted as capacity anywhere in the view.
   const spare = screen.getByText("spare").closest("tr")!;
-  expect(within(spare).getByText("stale")).toBeInTheDocument();
+  expect(within(spare).getByText("Offline")).toBeInTheDocument();
   expect(within(spare).getByText("codex 0.9.1")).toBeInTheDocument();
   expect(screen.getByText("free slots").previousSibling).toHaveTextContent("1");
 

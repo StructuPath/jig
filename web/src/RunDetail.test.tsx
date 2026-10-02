@@ -2,7 +2,7 @@
 // rendering (one lane per attempt, tool calls with real durations, live
 // before any envelope exists) and cursor behaviour (per-attempt seq cursors
 // that never interleave and never skip replayed events).
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AttemptLane, JobPanel } from "./RunDetail";
 import { mergeEvents } from "./polling";
@@ -92,6 +92,77 @@ afterEach(() => {
 });
 
 describe("swim lanes", () => {
+  it("shows the agent's directive and automatic repair activity", async () => {
+    mockAPI({ events: { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "plan" }),
+      event(2, "handoff", 1000, { phase: "plan", payload: { summary: "Add validation to the existing input parser." } }),
+      event(3, "log", 2000, { phase: "test", name: "repair_edge", payload: { run: "plan", use: 1, budget: 3 } }),
+    ])] } });
+    render(<AttemptLane compact taskMode="auto" attempt={attempt()} nowMs={BASE + 10000} />);
+    expect(await screen.findByText("Add validation to the existing input parser.")).toBeVisible();
+    expect(screen.getByText("Check failed → agents are repairing and retesting automatically")).toBeVisible();
+  });
+
+  it("shows live progress messages and activity without opening technical details", async () => {
+    mockAPI({ events: { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "scout" }),
+      event(2, "log", 1000, { phase: "scout", name: "agent_text", payload: { text: "I am checking the installation instructions." } }),
+      event(3, "tool_call", 2000, { phase: "scout", name: "command_execution" }),
+    ])] } });
+    render(<AttemptLane compact taskMode="ask" attempt={attempt()} nowMs={BASE + 10000} />);
+    expect(await screen.findByText("I am checking the installation instructions.")).toBeVisible();
+    expect(screen.getByText("Codex used command_execution")).toBeVisible();
+    expect(screen.getByText(/Last activity 8.0s ago/)).toBeVisible();
+  });
+
+  it("keeps the answer visible when a code check follows it", async () => {
+    mockAPI({});
+    render(<AttemptLane compact taskMode="ask" attempt={attempt({
+      state: "accepted_unpublished",
+      result: JSON.stringify({ phases: [
+        { phase: "scout", kind: "agent", status: "success", envelope: { summary: "Your answer is here." } },
+        { phase: "keep-local", kind: "code", status: "success", envelope: { summary: "command exited 0" } },
+      ] }),
+    })} nowMs={BASE} />);
+    expect(await screen.findByText("Your answer is here.")).toBeVisible();
+    expect(screen.getByText("command exited 0")).not.toBeVisible();
+  });
+
+  it("shows a phase's readable result without opening technical evidence", async () => {
+    mockAPI({});
+    render(<AttemptLane attempt={attempt({
+      state: "accepted_unpublished",
+      result: JSON.stringify({ phases: [{ phase: "assess", phase_attempt: 1, status: "success", envelope: { summary: "The setup guide references a missing script." } }] }),
+    })} nowMs={BASE + 10_000} />);
+    expect(await screen.findByText("The setup guide references a missing script.")).toBeVisible();
+    expect(screen.getByText("Accepted · not published")).toBeVisible();
+  });
+
+  it("keeps the agent's rejection visible even when Jig's checks passed", async () => {
+    mockAPI({});
+    render(<AttemptLane attempt={attempt({
+      state: "accepted_unpublished",
+      result: JSON.stringify({
+        publish: { state: "failed", code: "publish_empty_changeset" },
+        acceptance: { passed: true, checks: [{ item: "verdict_consistent", ok: true }] },
+        phases: [{ phase: "assess", phase_attempt: 1, status: "success", envelope: { approved: false, summary: "Setup cannot complete.", blocking: ["Missing setup script"] } }],
+      }),
+    })} nowMs={BASE + 10_000} />);
+    expect(await screen.findByText("Checks passed · nothing to publish")).toBeVisible();
+    expect(screen.getByText("Agent assessment: Not approved")).toBeVisible();
+    expect(screen.getByText("Missing setup script")).toBeVisible();
+  });
+
+  it("opens a selected phase's evidence and preserves unrecognized raw results", async () => {
+    mockAPI({ events: { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "plan" }),
+    ])] } });
+    render(<AttemptLane attempt={attempt({ result: "historical non-JSON result" })} nowMs={BASE + 10_000} />);
+    fireEvent.click(await screen.findByLabelText(/phase plan, running/));
+    expect(screen.getByText(/Evidence · plan/).closest("details")).toHaveAttribute("open");
+    expect(screen.getByText("historical non-JSON result")).toBeInTheDocument();
+  });
+
   it("renders a running agent's tool calls with durations before an envelope exists", async () => {
     mockAPI({
       events: {
@@ -185,11 +256,27 @@ describe("swim lanes", () => {
     // Attempt 1 stays inspectable after attempt 2 exists.
     expect(within(first).getByLabelText(/phase plan, fail/)).toBeInTheDocument();
     expect(screen.getByText("gate files_non_empty failed")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Compare 2 attempts"));
+    const comparison = screen.getByRole("table");
+    expect(within(comparison).getAllByRole("row")).toHaveLength(3);
+    expect(within(comparison).getByText("Work did not pass")).toBeVisible();
+    expect(within(comparison).getByText("Work is running")).toBeVisible();
 
     const cursored = requests.filter((url) => url.includes("/events?"));
     expect(cursored.some((url) => url.includes("attempt-1") && url.includes("after=0"))).toBe(true);
     expect(cursored.some((url) => url.includes("attempt-2") && url.includes("after=0"))).toBe(true);
   });
+});
+
+it.each(["failed", "accepted_unpublished", "active", "queued"])("only offers API-supported actions for a %s job", async (state) => {
+  mockAPI({ job: {
+    job: { id: "job-1", run_id: "run-1", repository: "example/repo", base_sha: "abcdef", state, cancellation_requested: false },
+    run_id: "run-1", attempts: [], publish: [],
+  } });
+  render(<JobPanel jobID="job-1" nowMs={BASE} />);
+  await screen.findByText("example/repo");
+  expect(Boolean(screen.queryByRole("button", { name: "Retry same workflow" }))).toBe(state === "failed");
+  expect(Boolean(screen.queryByRole("button", { name: "Cancel" }))).toBe(["queued", "active"].includes(state));
 });
 
 describe("seq cursors", () => {

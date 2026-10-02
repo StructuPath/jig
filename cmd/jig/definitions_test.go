@@ -128,7 +128,7 @@ func TestPlanBuildTestPassesWhenTheBuildSatisfiesTheTestCommand(t *testing.T) {
 	assertPhasesRan(t, traceEvents(t, report.TracePath), "plan", "build", "test")
 }
 
-func TestPlanBuildTestRoutesAFailingSuiteBackToTheBuilderAndRerunsIt(t *testing.T) {
+func TestPlanBuildTestReplansThenBuildsAndRetestsAFailingSuite(t *testing.T) {
 	repo := makeFixture(t)
 	scriptRuntime(t,
 		map[string]any{"text": envelopeJSON(t, map[string]any{
@@ -145,6 +145,10 @@ func TestPlanBuildTestRoutesAFailingSuiteBackToTheBuilderAndRerunsIt(t *testing.
 			}),
 		},
 		// Dispatched by the edge with the failing adapter envelope in hand.
+		map[string]any{"text": envelopeJSON(t, map[string]any{
+			"status": "success", "summary": "revised plan: create the missing marker",
+			"notes_for_next_agent": "create built.txt and preserve notes.txt",
+		})},
 		map[string]any{
 			"files": map[string]any{"built.txt": "ok\n"},
 			"text": envelopeJSON(t, map[string]any{
@@ -165,6 +169,9 @@ func TestPlanBuildTestRoutesAFailingSuiteBackToTheBuilderAndRerunsIt(t *testing.
 	}
 	if entries := phaseStarts(events, "build"); entries != 2 {
 		t.Fatalf("build ran %d time(s), want 2 (the original and the repair)", entries)
+	}
+	if entries := phaseStarts(events, "plan"); entries != 2 {
+		t.Fatalf("plan ran %d time(s), want initial plan and repair plan", entries)
 	}
 	if entries := phaseStarts(events, "test"); entries != 2 {
 		t.Fatalf("test ran %d time(s), want 2 (the failure and the rerun)", entries)

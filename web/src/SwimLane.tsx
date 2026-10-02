@@ -52,6 +52,8 @@ export function SwimLane({ lane, nowMs, onSelectPhase }: SwimLaneProps) {
           </div>
 
           {lane.tools.length > 0 && (
+            <details className="evidence" open={live}>
+              <summary>Tool activity · {lane.tools.length} calls</summary>
             <ol className="tool-list" aria-label={`attempt ${lane.attemptNumber} tool calls`}>
               {lane.tools.map((span) => (
                 <ToolRow
@@ -63,6 +65,7 @@ export function SwimLane({ lane, nowMs, onSelectPhase }: SwimLaneProps) {
                 />
               ))}
             </ol>
+            </details>
           )}
         </>
       )}

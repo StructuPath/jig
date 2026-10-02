@@ -299,6 +299,69 @@ roster:
     writes: ["src/"]
 `
 
+func TestFailedTestsReplanBuildAndRetestWithoutHumanInput(t *testing.T) {
+	for _, fixed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("fixed=%t", fixed), func(t *testing.T) {
+			repo := initRepo(t)
+			files := map[string]string{}
+			if fixed {
+				files["src/fixed.txt"] = "ok"
+			}
+			fake := enginetest.New(
+				enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "initial plan"})},
+				enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "initial build"})},
+				enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "revised plan", "notes_for_next_agent": "Create src/fixed.txt to repair the failed test."})},
+				enginetest.Step{Files: files, Text: envelope(map[string]any{"status": "success", "summary": "repair build"})},
+			)
+			runner := newTestRunner(t, fake, &recordingSink{}, nil)
+			snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: plan, kind: agent, owner: builder}
+  - {name: build, kind: agent, owner: builder}
+  - name: test
+    kind: code
+    command: "test -f src/fixed.txt"
+    on_fail: {run: plan, then: rerun-chain, budget: 1, exhausted: fail-job}
+acceptance: [all_phases_passed]
+`
+			outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+			want := protocol.AttemptFailed
+			if fixed {
+				want = protocol.AttemptAcceptedUnpublished
+			}
+			if outcome.State != want {
+				t.Fatalf("state=%s error=%s", outcome.State, outcome.Error)
+			}
+			calls := fake.Calls()
+			if len(calls) != 4 {
+				t.Fatalf("agent calls=%d, want plan/build/plan/build", len(calls))
+			}
+			if !strings.Contains(calls[2].Prompt, `"exit_code":1`) && !strings.Contains(calls[2].Prompt, `"exit_code": 1`) {
+				t.Fatal("planner did not receive failing test evidence")
+			}
+			if !strings.Contains(calls[3].Prompt, "Create src/fixed.txt") {
+				t.Fatal("builder did not receive revised plan")
+			}
+			var result struct {
+				Phases []protocol.PhaseResult `json:"phases"`
+			}
+			if err := json.Unmarshal([]byte(outcome.Result), &result); err != nil {
+				t.Fatal(err)
+			}
+			var phases []string
+			for _, phase := range result.Phases {
+				phases = append(phases, phase.Phase)
+			}
+			if strings.Join(phases, ",") != "plan,build,test,plan,build,test" {
+				t.Fatalf("wrong execution order: %v", phases)
+			}
+			if !fixed && !strings.Contains(outcome.Error, "repair budget") {
+				t.Fatalf("missing exhaustion reason: %s", outcome.Error)
+			}
+		})
+	}
+}
+
 func TestCodePhaseFailureRoutesAdapterEnvelopeThroughItsRepairEdge(t *testing.T) {
 	repo := initRepo(t)
 	fake := enginetest.New(
@@ -2096,5 +2159,48 @@ phases:
 	if cost != 0.875 || tokens != 7 || unmetered != 1 || sends != len(fake.Calls()) {
 		t.Fatalf("summed agent_end: cost %v tokens %d unmetered %d sends %d; want 0.875, 7, 1, %d",
 			cost, tokens, unmetered, sends, len(fake.Calls()))
+	}
+}
+
+// A replay keeps each phase's first guard decision: the revised plan turning
+// build's guard false must not record build as skipped (which acceptance
+// would count as passed) instead of rebuilding.
+func TestRerunChainKeepsFirstRunGuardDecisions(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "plan", "quick": false})},
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "build"})},
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "revised plan", "quick": true})},
+		enginetest.Step{Files: map[string]string{"src/fixed.txt": "ok"},
+			Text: envelope(map[string]any{"status": "success", "summary": "repair build"})},
+	)
+	runner := newTestRunner(t, fake, &recordingSink{}, nil)
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: plan, kind: agent, owner: builder}
+  - {name: build, kind: agent, owner: builder, if: "quick == false"}
+  - name: test
+    kind: code
+    command: "test -f src/fixed.txt"
+    on_fail: {run: plan, then: rerun-chain, budget: 1, exhausted: fail-job}
+acceptance: [all_phases_passed]
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state=%s error=%s", outcome.State, outcome.Error)
+	}
+	if calls := len(fake.Calls()); calls != 4 {
+		t.Fatalf("agent calls=%d, want plan/build/plan/build", calls)
+	}
+	var result struct {
+		Phases []protocol.PhaseResult `json:"phases"`
+	}
+	if err := json.Unmarshal([]byte(outcome.Result), &result); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range result.Phases {
+		if phase.Status == "skipped" {
+			t.Fatalf("phase %q recorded skipped during replay", phase.Phase)
+		}
 	}
 }

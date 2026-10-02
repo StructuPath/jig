@@ -36,7 +36,8 @@ var builtinGates = map[string]bool{
 
 // Repair-edge continuation and exhaustion policies (KTD2).
 const (
-	RepairThenRerunSelf = "rerun-self"
+	RepairThenRerunSelf  = "rerun-self"
+	RepairThenRerunChain = "rerun-chain"
 
 	RepairExhaustedFailJob = "fail-job"
 	RepairExhaustedProceed = "proceed"
@@ -264,6 +265,8 @@ type GateSpec struct {
 // Failure that triggers the edge is nonzero exit for code phases and the
 // declared When envelope predicate for agent phases. Budget bounds the loop;
 // an edge without a positive budget is rejected at save time.
+// then: rerun-chain runs the target and every intervening phase before
+// retesting the failed phase; its target must precede the failed phase.
 type RepairEdge struct {
 	When      string `yaml:"when"`
 	Run       string `yaml:"run"`
@@ -610,9 +613,44 @@ func (spec *DefinitionSpec) validateRepairEdge(phase PhaseSpec, phases map[strin
 			"phase %q: repair edge targets itself — rerun-self already reruns the failed phase",
 			phase.Name)
 	}
-	if edge.Then != RepairThenRerunSelf {
-		return fmt.Errorf("phase %q: repair edge \"then\" must be %q, got %q",
-			phase.Name, RepairThenRerunSelf, edge.Then)
+	if edge.Then != RepairThenRerunSelf && edge.Then != RepairThenRerunChain {
+		return fmt.Errorf("phase %q: repair edge \"then\" must be %q or %q, got %q",
+			phase.Name, RepairThenRerunSelf, RepairThenRerunChain, edge.Then)
+	}
+	if edge.Then == RepairThenRerunChain {
+		found := false
+		for _, candidate := range spec.Phases {
+			if candidate.Name == phase.Name {
+				break
+			}
+			if candidate.Name == edge.Run {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("phase %q: rerun-chain target %q must precede the failed phase", phase.Name, edge.Run)
+		}
+		// A chain replay runs phases one after another; replaying a parallel
+		// group that way would run its members outside the group's read-only
+		// boundary.
+		inChain := false
+		for _, candidate := range spec.Phases {
+			if candidate.Name == edge.Run {
+				inChain = true
+			}
+			if inChain {
+				for _, member := range spec.Parallel {
+					if candidate.Name == member {
+						return fmt.Errorf("phase %q: rerun-chain from %q would replay parallel member %q; "+
+							"a chain replay cannot include the parallel group", phase.Name, edge.Run, member)
+					}
+				}
+			}
+			if candidate.Name == phase.Name {
+				break
+			}
+		}
 	}
 	if edge.Budget <= 0 {
 		return fmt.Errorf(

@@ -15,6 +15,7 @@ import type {
   RunView,
   WorktreeLedgerEntry,
   APIErrorBody,
+  Definition,
 } from "./types";
 
 export class APIError extends Error {
@@ -51,6 +52,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  definitions: () => request<Definition[]>("/api/definitions"),
+  createDefinition: (source: string) => request<Definition>("/api/definitions", {
+    method: "POST", body: JSON.stringify({ source }),
+  }),
+  startTask: (definitionID: string, repository: string, task: string, mode: string) => request<RunView>("/api/runs", {
+    method: "POST", body: JSON.stringify({ definition_id: definitionID, instructions: task,
+      parameters: { task_title: task, task_mode: mode }, targets: [{ repository }] }),
+  }),
   queue: () => request<QueueView>("/api/queue"),
   runs: () => request<Run[] | null>("/api/runs").then((runs) => runs ?? []),
   run: (id: string) => request<RunView>(`/api/runs/${encodeURIComponent(id)}`),
@@ -82,13 +91,34 @@ export const api = {
     request<unknown>(`/api/jobs/${encodeURIComponent(jobID)}/cancel`, { method: "POST" }),
 };
 
+export async function ensureDefinition(source: string): Promise<Definition> {
+  const existing = (await api.definitions()).find((definition) => definition.source === source);
+  if (existing) return existing;
+  try {
+    return await api.createDefinition(source);
+  } catch (error) {
+    if (!(error instanceof APIError) || error.code !== "definition_exists") throw error;
+    const concurrent = (await api.definitions()).find((definition) => definition.source === source);
+    if (!concurrent) throw error;
+    return concurrent;
+  }
+}
+
 // parseAttemptSummary reads the engine's result payload. A result that does
 // not parse is not an error the operator can act on — it is raw text to show.
 export function parseAttemptSummary(result: string | undefined): AttemptSummary | null {
   if (!result) return null;
   try {
     const parsed = JSON.parse(result) as AttemptSummary;
-    return typeof parsed === "object" && parsed !== null ? parsed : null;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    if (parsed.phases != null && (!Array.isArray(parsed.phases) || parsed.phases.some(
+      (phase) => !phase || typeof phase !== "object" || typeof phase.phase !== "string" || typeof phase.status !== "string",
+    ))) return null;
+    const checks = [parsed.acceptance?.checks, ...(parsed.phases ?? []).map((phase) => phase.gates?.checks)];
+    if (checks.some((rows) => rows != null && (!Array.isArray(rows) || rows.some(
+      (check) => !check || typeof check !== "object" || typeof check.item !== "string" || typeof check.ok !== "boolean",
+    )))) return null;
+    return parsed;
   } catch {
     return null;
   }
