@@ -10,7 +10,7 @@ commits).
 
 | Path | What |
 |---|---|
-| `cmd/jig/` | CLI entry points (`serve`, `worker`, `run`, `def`, `trigger`, `report`) |
+| `cmd/jig/` | CLI entry points (`start`, `serve`, `worker`, `run`, `def`, `trigger`, `report`) |
 | `internal/protocol/` | Definition schema and save-time validation |
 | `internal/engine/` | Phase engine: chain, gates, repair edges, parallel group |
 | `internal/controlplane/` | HTTP API, SQLite ledger, queue, reports |
