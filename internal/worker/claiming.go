@@ -42,6 +42,17 @@ type attemptLease struct {
 
 	cancelled  chan struct{}
 	cancelOnce sync.Once
+
+	// lost is the control plane's verdict that this lease can never renew
+	// again, once any heartbeat has received one.
+	lost error
+}
+
+// lostVerdict reports the lease-lost verdict a heartbeat received, or nil.
+func (l *attemptLease) lostVerdict() error {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	return l.lost
 }
 
 func newAttemptLease(client *Client, attemptID, token string) *attemptLease {
@@ -60,6 +71,11 @@ func newAttemptLease(client *Client, attemptID, token string) *attemptLease {
 func (l *attemptLease) heartbeat(ctx context.Context) error {
 	response, err := l.client.Heartbeat(ctx, l.attemptID, protocol.HeartbeatRequest{LeaseToken: l.token})
 	if err != nil {
+		if leaseLost(err) {
+			l.mutex.Lock()
+			l.lost = err
+			l.mutex.Unlock()
+		}
 		return err
 	}
 	l.mutex.Lock()

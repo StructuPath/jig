@@ -127,8 +127,12 @@ type PublishSummary struct {
 	CIFailures []CICheck `json:"ci_failures,omitempty"`
 	// CIRepairs lists the CI repair rounds this publish ran, in order.
 	CIRepairs []CIRepairSummary `json:"ci_repairs,omitempty"`
-	Performed []string          `json:"performed_steps,omitempty"`
-	Reused    []string          `json:"reused_steps,omitempty"`
+	// CIReruns lists the flaky-check re-runs this publish ran, in order;
+	// CIFlaky says CI went green only after one (R6), never a clean pass.
+	CIReruns  []CIRerunSummary `json:"ci_reruns,omitempty"`
+	CIFlaky   bool             `json:"ci_flaky,omitempty"`
+	Performed []string         `json:"performed_steps,omitempty"`
+	Reused    []string         `json:"reused_steps,omitempty"`
 }
 
 // Published reports whether the pipeline completed with remote proof — the
@@ -171,6 +175,13 @@ type PullRequestGateway interface {
 	// job's log attached, within the CI repair log bounds. It never fails:
 	// a log that cannot be read leaves a LogNote saying why.
 	FailedCheckLogs(ctx context.Context, repository string, checks []CICheck) []CICheck
+	// ActionsJobRun reports the workflow run one Actions job belongs to.
+	ActionsJobRun(ctx context.Context, repository string, jobID int64) (int64, error)
+	// RerunFailedJobs asks GitHub to re-run every failed job of one
+	// workflow run on the same commit. A refusal because the run is still
+	// in progress carries the code ci_rerun_in_progress, so it can be
+	// waited out rather than counted.
+	RerunFailedJobs(ctx context.Context, repository string, runID int64) error
 }
 
 // CI check verdicts, normalized across check runs and commit statuses.
@@ -240,6 +251,9 @@ type ciPolicy struct {
 	// repairBudget is publish.ci.on_fail's budget; zero means red CI ends
 	// the attempt, as it always has.
 	repairBudget int
+	// rerunBudget is publish.ci.rerun's budget: flaky-check re-runs per
+	// attempt; zero means none.
+	rerunBudget int
 }
 
 // ciPolicyFor reads the policy out of a run snapshot. A snapshot that does
@@ -254,6 +268,9 @@ func ciPolicyFor(snapshot string) ciPolicy {
 	policy := ciPolicy{wait: spec.WaitsForCI(), timeout: spec.CITimeout()}
 	if policy.wait && spec.Publish.CI.OnFail != nil {
 		policy.repairBudget = spec.Publish.CI.OnFail.Budget
+	}
+	if policy.wait && spec.Publish.CI.Rerun != nil {
+		policy.rerunBudget = spec.Publish.CI.Rerun.Budget
 	}
 	return policy
 }
@@ -361,6 +378,9 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 	ci := ciPolicyFor(prepared.Claim.Snapshot)
 	summary := worker.publish(context.WithoutCancel(ctx), r.gateway, r.options,
 		target, changedPathsFromResult(outcome.Result), ci)
+	// A flaky Actions job gets its declared re-runs before red CI costs a
+	// repair round or ends the attempt (R5). Re-runs never move the branch.
+	summary = worker.rerunFlakyCI(context.WithoutCancel(ctx), r.gateway, r.options, target, summary, ci)
 	if summary.Code == "ci_failed" && outcome.Continuation != nil && ci.repairBudget > 0 {
 		// Rounds run on the same uncancelled context: cancellation reaches
 		// the engine through the attempt's cancel channel and the CI wait
@@ -732,6 +752,16 @@ func (w *Worker) awaitCI(
 	ctx context.Context, gateway PullRequestGateway, options PublishOptions,
 	target publishTarget, branch string, timeout time.Duration,
 ) (string, []CICheck, error) {
+	return w.awaitCIViewed(ctx, gateway, options, target, branch, timeout, nil)
+}
+
+// awaitCIViewed is awaitCI reading each poll through a re-run view, so a
+// check run jig just re-ran counts as pending until its new run replaces it
+// rather than being read back red (KTD5). A nil view is the plain wait.
+func (w *Worker) awaitCIViewed(
+	ctx context.Context, gateway PullRequestGateway, options PublishOptions,
+	target publishTarget, branch string, timeout time.Duration, view *rerunView,
+) (string, []CICheck, error) {
 	start := time.Now()
 	deadline := start.Add(timeout)
 	head, headSeen := "", start
@@ -761,6 +791,7 @@ func (w *Worker) awaitCI(
 			}
 		} else {
 			transient = 0
+			checks = view.apply(checks)
 			var failed []CICheck
 			pending = pending[:0]
 			for _, check := range checks {
@@ -790,21 +821,31 @@ func (w *Worker) awaitCI(
 			return head, boundedChecks(pending), publishFailure("ci_timeout",
 				"CI did not finish on %s within %s; %s", shortSHA(head), timeout, waiting)
 		}
-		wait := options.ciPollInterval()
-		if remaining := time.Until(deadline); remaining < wait {
-			wait = remaining
+		if err := w.ciPause(ctx, options, target, head, deadline); err != nil {
+			return head, nil, err
 		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-target.lease.cancelled:
-			timer.Stop()
-			return head, nil, publishFailure("ci_wait_cancelled",
-				"the job was cancelled while waiting for CI on %s", shortSHA(head))
-		case <-ctx.Done():
-			timer.Stop()
-			return head, nil, publishFailure("ci_wait_cancelled", "the CI wait was interrupted: %s", ctx.Err())
-		case <-timer.C:
-		}
+	}
+}
+
+// ciPause sleeps one poll interval, or until the deadline if that is
+// sooner, and ends early with ci_wait_cancelled when the job is cancelled.
+func (w *Worker) ciPause(
+	ctx context.Context, options PublishOptions, target publishTarget, head string, deadline time.Time,
+) error {
+	wait := options.ciPollInterval()
+	if remaining := time.Until(deadline); remaining < wait {
+		wait = remaining
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-target.lease.cancelled:
+		return publishFailure("ci_wait_cancelled",
+			"the job was cancelled while waiting for CI on %s", shortSHA(head))
+	case <-ctx.Done():
+		return publishFailure("ci_wait_cancelled", "the CI wait was interrupted: %s", ctx.Err())
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -1550,6 +1591,81 @@ func (g *GitHubCLIGateway) FailedCheckLogs(ctx context.Context, repository strin
 		}
 	}
 	return annotated
+}
+
+// ActionsJobRun reads the workflow run an Actions job belongs to with
+// `gh api repos/{project}/actions/jobs/{id} --jq .run_id`.
+func (g *GitHubCLIGateway) ActionsJobRun(ctx context.Context, repository string, jobID int64) (int64, error) {
+	project, err := g.rerunPreflight(repository, jobID)
+	if err != nil {
+		return 0, err
+	}
+	stdout, stderr, stdoutTooLarge, stderrTooLarge, err := g.run()(ctx, "gh",
+		"api", "-H", "Accept: application/vnd.github+json",
+		fmt.Sprintf("repos/%s/actions/jobs/%d", project, jobID), "--jq", ".run_id")
+	if err != nil {
+		return 0, ghDiagnostic("gh api actions job", err, stderr, stdoutTooLarge, stderrTooLarge)
+	}
+	run, err := strconv.ParseInt(strings.TrimSpace(string(stdout)), 10, 64)
+	if err != nil || run <= 0 {
+		return 0, publishFailure("gh_malformed_output", "gh api actions job %d reported no workflow run id", jobID)
+	}
+	return run, nil
+}
+
+// RerunFailedJobs re-runs every failed job of one workflow run with
+// `gh api -X POST repos/{project}/actions/runs/{id}/rerun-failed-jobs`: on
+// the same commit, never moving the branch. It is per run rather than per
+// job (the plan's KTD5) because re-running one job puts its run in
+// progress, and GitHub then refuses every sibling in it. GitHub refuses
+// while the run is still going; that refusal is ci_rerun_in_progress.
+func (g *GitHubCLIGateway) RerunFailedJobs(ctx context.Context, repository string, runID int64) error {
+	project, err := g.rerunPreflight(repository, runID)
+	if err != nil {
+		return err
+	}
+	stdout, stderr, stdoutTooLarge, stderrTooLarge, err := g.run()(ctx, "gh",
+		"api", "-X", "POST", "-H", "Accept: application/vnd.github+json",
+		fmt.Sprintf("repos/%s/actions/runs/%d/rerun-failed-jobs", project, runID))
+	if err == nil {
+		return nil
+	}
+	if rerunInProgress(stdout) || rerunInProgress(stderr) {
+		return publishFailure(ciRerunInProgress,
+			"GitHub will not re-run workflow run %d while it is in progress: %s", runID,
+			boundedText(strings.TrimSpace(string(stderr)), protocol.MaxPublishDiagnosticBytes))
+	}
+	return ghDiagnostic("gh api rerun-failed-jobs", err, stderr, stdoutTooLarge, stderrTooLarge)
+}
+
+// rerunPreflight resolves the project and refuses an id that is not one,
+// before gh is run.
+func (g *GitHubCLIGateway) rerunPreflight(repository string, id int64) (string, error) {
+	project, err := githubProject(repository)
+	if err != nil {
+		return "", err
+	}
+	if id <= 0 {
+		return "", publishFailure("ci_rerun_invalid_id", "%d is not an Actions job or run id", id)
+	}
+	if _, err := g.lookPath()("gh"); err != nil {
+		return "", publishFailure("gh_not_found",
+			"the GitHub CLI (gh) was not found on PATH. Install gh, then run `gh auth login`.")
+	}
+	return project, nil
+}
+
+// rerunInProgress recognizes GitHub's refusal to re-run a job whose
+// workflow run has not completed. gh prints the API message on stderr and
+// the response body on stdout; either may carry it.
+func rerunInProgress(output []byte) bool {
+	lower := strings.ToLower(string(output))
+	for _, phrase := range []string{"already running", "in progress", "is running", "not complete"} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // maxCILogReads bounds the log reads one FailedCheckLogs call attempts,

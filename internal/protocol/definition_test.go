@@ -525,6 +525,36 @@ phases:
 		"resume_from")
 }
 
+func TestPublishCIRerunIsBoundedAndNeedsAWait(t *testing.T) {
+	const base = `
+name: ci-rerun
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	if spec := mustParse(t, base+"publish: {ci: {wait: true}}\n"); spec.Publish.CI.Rerun != nil {
+		t.Fatalf("rerun = %+v, want nil when undeclared", spec.Publish.CI.Rerun)
+	}
+	for budget := 1; budget <= MaxCIReruns; budget++ {
+		spec := mustParse(t, base+fmt.Sprintf("publish: {ci: {wait: true, rerun: {budget: %d}}}\n", budget))
+		if spec.Publish.CI.Rerun == nil || spec.Publish.CI.Rerun.Budget != budget {
+			t.Fatalf("rerun = %+v, want budget %d", spec.Publish.CI.Rerun, budget)
+		}
+	}
+	if MaxCIReruns != 3 {
+		t.Fatalf("MaxCIReruns = %d, want 3", MaxCIReruns)
+	}
+	mustReject(t, base+"publish: {ci: {wait: false, rerun: {budget: 1}}}\n",
+		"publish: ci: rerun", "wait: true")
+	mustReject(t, base+"publish: {ci: {rerun: {budget: 1}}}\n",
+		"publish: ci: rerun", "wait: true")
+	mustReject(t, base+"publish: {ci: {wait: true, rerun: {}}}\n",
+		"publish: ci: rerun: budget 0", "outside 1..3")
+	mustReject(t, base+"publish: {ci: {wait: true, rerun: {budget: 4}}}\n",
+		"publish: ci: rerun: budget 4", "outside 1..3")
+}
+
 func TestNegativeRoleBudgetIsRejected(t *testing.T) {
 	spec := mustParse(t, `
 name: budget
@@ -577,6 +607,24 @@ func TestAParallelGroupOfConsecutiveReadOnlyReviewersValidates(t *testing.T) {
 	if _, _, ok := mustParse(t, parallelPanel("", panelPhases, "")).ParallelRange(); ok {
 		t.Fatal("a definition without a group reports one")
 	}
+}
+
+// A parallel panel and the CI re-run and repair policies are independent:
+// declared together they validate, and each keeps its own rules.
+func TestAParallelGroupValidatesWithCIRerunsAndRepair(t *testing.T) {
+	const publish = "publish: {ci: {wait: true, rerun: {budget: 2}, on_fail: {run: build, budget: 1}}}\n"
+	spec := mustParse(t, parallelPanel("", panelPhases, "parallel: [review-a, review-b, review-c]\n"+publish))
+	if _, _, ok := spec.ParallelRange(); !ok {
+		t.Fatal("the group was lost next to a publish block")
+	}
+	if spec.Publish.CI.Rerun == nil || spec.Publish.CI.Rerun.Budget != 2 || spec.Publish.CI.OnFail == nil {
+		t.Fatalf("publish.ci = %+v, want the re-run and repair policies kept", spec.Publish.CI)
+	}
+	mustReject(t, parallelPanel("", panelPhases,
+		"parallel: [review-a, review-b, review-c]\npublish: {ci: {wait: true, rerun: {budget: 4}}}\n"),
+		"publish: ci: rerun: budget 4")
+	mustReject(t, parallelPanel("", panelPhases,
+		"parallel: [build, review-a]\n"+publish), "parallel")
 }
 
 // R8: every rule that keeps a group's members concurrent-safe is enforced at
