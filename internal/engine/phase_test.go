@@ -2161,3 +2161,46 @@ phases:
 			cost, tokens, unmetered, sends, len(fake.Calls()))
 	}
 }
+
+// A replay keeps each phase's first guard decision: the revised plan turning
+// build's guard false must not record build as skipped (which acceptance
+// would count as passed) instead of rebuilding.
+func TestRerunChainKeepsFirstRunGuardDecisions(t *testing.T) {
+	repo := initRepo(t)
+	fake := enginetest.New(
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "plan", "quick": false})},
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "build"})},
+		enginetest.Step{Text: envelope(map[string]any{"status": "success", "summary": "revised plan", "quick": true})},
+		enginetest.Step{Files: map[string]string{"src/fixed.txt": "ok"},
+			Text: envelope(map[string]any{"status": "success", "summary": "repair build"})},
+	)
+	runner := newTestRunner(t, fake, &recordingSink{}, nil)
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: plan, kind: agent, owner: builder}
+  - {name: build, kind: agent, owner: builder, if: "quick == false"}
+  - name: test
+    kind: code
+    command: "test -f src/fixed.txt"
+    on_fail: {run: plan, then: rerun-chain, budget: 1, exhausted: fail-job}
+acceptance: [all_phases_passed]
+`
+	outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state=%s error=%s", outcome.State, outcome.Error)
+	}
+	if calls := len(fake.Calls()); calls != 4 {
+		t.Fatalf("agent calls=%d, want plan/build/plan/build", calls)
+	}
+	var result struct {
+		Phases []protocol.PhaseResult `json:"phases"`
+	}
+	if err := json.Unmarshal([]byte(outcome.Result), &result); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range result.Phases {
+		if phase.Status == "skipped" {
+			t.Fatalf("phase %q recorded skipped during replay", phase.Phase)
+		}
+	}
+}

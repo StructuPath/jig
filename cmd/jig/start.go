@@ -93,7 +93,10 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			command = "xdg-open"
 		}
 		if command != "" {
-			if err := exec.Command(command, url).Run(); err != nil {
+			openCtx, cancelOpen := context.WithTimeout(ctx, 10*time.Second)
+			err := exec.CommandContext(openCtx, command, url).Run()
+			cancelOpen()
+			if err != nil {
 				fmt.Fprintln(stderr, "Open this address in your browser:", url)
 			}
 		}

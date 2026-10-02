@@ -9,12 +9,16 @@ import type { TaskMode } from "./starters";
 import type { Run } from "./types";
 import { ErrorBanner, Link, StatusBadge } from "./ui";
 
+function storedProject(): string | null {
+  try { return localStorage.getItem("jig-project"); } catch { return null; /* Browser storage can be disabled. */ }
+}
+
 export function Tasks() {
   const loadRuns = useCallback(() => api.runs(), []);
   const runs = usePolled(loadRuns, 3000, "tasks");
   const loadFleet = useCallback(() => api.fleet(), []);
   const fleet = usePolled(loadFleet, 3000, "task-workers");
-  const [repository, setRepository] = useState(() => new URLSearchParams(window.location.search).get("project") ?? localStorage.getItem("jig-project") ?? "");
+  const [repository, setRepository] = useState(() => new URLSearchParams(window.location.search).get("project") ?? storedProject() ?? "");
   const [task, setTask] = useState("");
   const [mode, setMode] = useState<TaskMode>(() => { const mode = new URLSearchParams(window.location.search).get("mode"); return mode === "ask" || mode === "build" ? mode : "auto"; });
   const [model, setModel] = useState(defaultModel);
