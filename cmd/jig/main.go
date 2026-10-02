@@ -25,6 +25,7 @@ var version = "dev"
 const usage = `jig — a local-first software factory
 
 Usage:
+  jig start    Start the UI and Codex together and open your browser
   jig serve    Start the control plane (loopback HTTP + embedded UI)
   jig worker   Start the single implicit worker
   jig run      Run a definition directly against a local repository
@@ -53,6 +54,8 @@ func run(ctx context.Context, args []string) int {
 		return 2
 	}
 	switch args[0] {
+	case "start":
+		return startCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "run":
 		return runCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "serve":

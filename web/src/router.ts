@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 export type Route =
+  | { name: "tasks" }
   | { name: "queue" }
   | { name: "runs" }
   | { name: "run"; id: string }
@@ -15,7 +16,8 @@ export type Route =
 
 export function parseRoute(path: string): Route {
   const parts = path.split("/").filter(Boolean);
-  if (parts.length === 0) return { name: "queue" };
+  if (parts.length === 0) return { name: "tasks" };
+  if (parts[0] === "queue" && parts.length === 1) return { name: "queue" };
   if (parts[0] === "runs" && parts.length === 1) return { name: "runs" };
   if (parts[0] === "runs" && parts.length === 2) return { name: "run", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "jobs" && parts.length === 2) return { name: "job", id: decodeURIComponent(parts[1]) };

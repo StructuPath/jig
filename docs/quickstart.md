@@ -23,6 +23,37 @@ If that printed a version, the whole toolchain requirement is satisfied. The
 UI is committed and embedded, and the SQLite driver is pure Go, so there is
 no second build step and no native dependency to install.
 
+## Use the UI with Codex
+
+On a Mac, double-click **Start Jig.command** in the project folder. It builds
+Jig, starts the UI and your signed-in Codex worker, and opens the browser.
+Leave its terminal window open while you work. Press Ctrl+C to stop the
+services it started. Opening it again reuses an already-ready session.
+
+From a terminal, the equivalent is:
+
+```sh
+./bin/jig start
+```
+
+Open <http://127.0.0.1:8383>. Choose a Git project folder or repository,
+use **Let agents improve it**, and press **Start task**. The goal box is optional:
+agents inspect the project, choose one useful improvement, and write the directive
+and plan themselves. Choose **Get an answer** for read-only research or
+**Make changes** when you already have a specific directive.
+The UI creates the workflow for you; no YAML or run command is needed.
+
+Ask reads the project and returns an answer. Make a change runs
+plan → build → test. Failed tests go back to planning, followed by another
+build and test, for up to three repair rounds without waiting for human input.
+Its results stay
+in a separate working folder for review, with no automatic push or PR.
+Work starts at the selected project's latest commit, so commit any changes
+you want included before starting. **Options** lets you choose your Codex
+model and a test command when automatic detection does not fit your project.
+Codex uses its existing login; a ChatGPT login remains subject to your plan's
+usage limits.
+
 ---
 
 ## 2. The smoke run

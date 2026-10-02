@@ -724,15 +724,44 @@ func (e *execution) followEdge(
 		return &chainEnd{endFailed, fmt.Sprintf(
 			"phase %q: repair target %q missing from frozen snapshot", phase.Name, edge.Run)}, nil, false
 	}
-	repairRun := e.runPhaseOnce(ctx, repairPhase, run.envelopeRef())
-	if end := repairRun.attemptEnd(); end != nil {
-		return end, nil, false
+	// then: rerun-chain runs the target and every phase between it and the
+	// failed phase, in chain order, honoring each one's if: guard.
+	repairPhases := []protocol.PhaseSpec{repairPhase}
+	if edge.Then == protocol.RepairThenRerunChain {
+		repairPhases = nil
+		collect := false
+		for _, candidate := range e.spec.Phases {
+			if candidate.Name == phase.Name {
+				break
+			}
+			if candidate.Name == edge.Run {
+				collect = true
+			}
+			if collect {
+				repairPhases = append(repairPhases, candidate)
+			}
+		}
 	}
-	if repairRun.outcome == phaseFailed {
-		return &chainEnd{endFailed, fmt.Sprintf(
-			"repair phase %q: %s", repairPhase.Name, repairRun.failure)}, nil, false
+	previous := run.envelopeRef()
+	for _, repairPhase := range repairPhases {
+		if edge.Then == protocol.RepairThenRerunChain && e.replaySkips(repairPhase) {
+			e.recordResult(protocol.PhaseResult{Phase: repairPhase.Name, Kind: repairPhase.Kind, Status: phaseStatusSkipped})
+			continue
+		}
+		e.freshenLease(ctx)
+		repairRun := e.runPhaseOnce(ctx, repairPhase, previous)
+		if end := repairRun.attemptEnd(); end != nil {
+			return end, nil, false
+		}
+		if repairRun.outcome == phaseFailed {
+			return &chainEnd{endFailed, fmt.Sprintf(
+				"repair phase %q: %s", repairPhase.Name, repairRun.failure)}, nil, false
+		}
+		if repairRun.hasEnvelope {
+			previous = repairRun.envelopeRef()
+		}
 	}
-	return nil, repairRun.envelopeRef(), true
+	return nil, previous, true
 }
 
 func (e *execution) phaseByName(name string) (protocol.PhaseSpec, bool) {
@@ -831,6 +860,21 @@ func (run phaseRun) envelopeRef() *parsedEnvelope {
 }
 
 func (e *execution) nextEntry(phase string) int { return e.counters.nextEntry(phase) }
+
+// replaySkips decides whether a rerun-chain replay skips a phase. A phase
+// this attempt already ran or skipped keeps that first decision: re-reading
+// its guard against fields the repair just changed could record a later
+// "skipped" for a phase that ran, which acceptance (last result per phase)
+// would count as passed without rerunning it. Only a phase with no result
+// yet — the attempt started past it — reads its guard now.
+func (e *execution) replaySkips(phase protocol.PhaseSpec) bool {
+	for _, result := range e.results {
+		if result.Phase == phase.Name {
+			return result.Status == phaseStatusSkipped
+		}
+	}
+	return phase.If != "" && !guardHolds(phase.If, e.fieldView)
+}
 
 func (e *execution) recordResult(result protocol.PhaseResult) {
 	now := time.Now().UTC()

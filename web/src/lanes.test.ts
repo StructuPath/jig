@@ -62,6 +62,19 @@ describe("buildLane", () => {
     expect(lane.endMs).toBe(BASE + 9_000);
     expect(lane.tools[0].endMs).toBe(BASE + 9_000);
     expect(lane.phases[0].endMs).toBe(BASE + 9_000);
+    expect(lane.phases[0].status).toBe("stopped");
+  });
+
+  it("uses the recorded failure when a boundary breach omits the phase-end event", () => {
+    const lane = buildLane({
+      ...attempt, state: "failed", completed_at: at(9_000),
+      result: JSON.stringify({ phases: [
+        { phase: "survey", status: "success", phase_attempt: 1 },
+        { phase: "survey", status: "fail", phase_attempt: 2 },
+      ] }),
+    }, [event(1, "phase_start", 0, { phase: "survey" })]);
+    expect(lane.phases[0].status).toBe("fail");
+    expect(lane.phases[0].endMs).toBe(BASE + 9_000);
   });
 
   it("keeps gate and error marks on the axis", () => {

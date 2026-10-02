@@ -123,7 +123,7 @@ A definition is data, not a script. Five stock ones ship in
 | `smoke.yaml` | the install check: one read-only phase, repo-independent |
 | `scout.yaml` | read-only recon: two agent phases and the hand-off between them |
 | `two-phase.yaml` | an agent phase that writes, verified by a code phase |
-| `plan-build-test.yaml` | a **code-phase repair edge**: a red suite routes back to the builder |
+| `plan-build-test.yaml` | a **code-phase repair edge**: a red suite returns to planning, rebuilds, and retests |
 | `simple-sdlc.yaml` | an **agent-phase repair edge** (review → revise → re-review), a conditional retest, and per-phase commit messages |
 | `factory.yaml` | the **software factory**: plan → build → commit → test → a panel of specialist reviewers looping the builder until they approve, then a deterministic **risk gate** that holds high-risk work for a person |
 
@@ -259,6 +259,35 @@ Rules worth knowing before you write one:
   code is the risk to design for: `factory.yaml` scores edits to CI or lint
   configuration, and test files that lose more lines than they gain, as not
   low, so such a "fix" is held for a person.
+- **A flaky Actions job can be re-run before a round is spent.**
+  `publish: {ci: {wait: true, rerun: {budget: 1}}}` re-runs the failed
+  GitHub Actions jobs on the same head when CI is red on a head jig pushed,
+  before any repair round (or before the job ends red, with no `on_fail`).
+  It first waits until nothing on the head is still running, since GitHub
+  will not re-run a job in a running workflow; then, for each workflow run
+  the failed jobs belong to, it makes one `gh api -X POST
+  repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs` request (per run,
+  not per job: re-running one job would put the run in progress and GitHub
+  would refuse its siblings), checking the lease and cancellation right
+  before each. It then judges that same head again, reading each re-run job
+  as pending until its new run replaces the old red one; if the branch moves
+  meanwhile, the re-run ends `ci_rerun_head_moved`, so a person's fix is
+  never reported as jig's flaky pass. The whole re-run — waiting, requests,
+  and judgement — fits in one CI timeout. GitHub refusing because a
+  workflow run is in progress is waited out and does not spend the budget;
+  any other refusal is recorded and falls through to repair or the end. A
+  re-run GitHub accepted that never finishes, or whose CI cannot be read, is
+  recorded and leaves CI red as it was, so repair still runs. If
+  any red check is not an Actions job (a commit status, another app), no
+  re-run happens. Re-runs never move the branch. The budget, 1–3, is per
+  attempt: a repair round's new head gets only what is left. Every re-run is
+  in the result's `ci_reruns` (`attempt`, `head`, `jobs`, `outcome`), and a
+  pass after one sets `ci_flaky` — it is reported as flaky, never as a clean
+  pass. Re-run waits run on wall-clock time, so time spent on them is time a
+  later repair round no longer has under the attempt's ceiling. The
+  publish-only retry never re-runs. `gh` needs permission to
+  re-run Actions jobs on the repository. `factory.yaml` and
+  `factory-parallel.yaml` both declare `rerun: {budget: 1}`.
 - **A read-only review panel can run in parallel.** `parallel:
   [review-correctness, review-security, review-maintainability]` runs those
   phases at once, as one step of the chain. It is opt-in and narrow: one
@@ -274,8 +303,9 @@ Rules worth knowing before you write one:
   and charges only its own budget, and then the whole group runs again, so
   earlier approvals are re-judged. The group runs at most 1 + the sum of its
   members' budgets times. `examples/definitions/factory-parallel.yaml` is the
-  stock factory with its panel grouped; `factory.yaml` itself stays
-  sequential until the parallel panel has been watched on real work.
+  stock factory with its panel grouped — the same phases, roles, and
+  `publish` block, CI re-runs and repair included; `factory.yaml` itself
+  stays sequential until the parallel panel has been watched on real work.
 - **Validation happens before anything runs.** `jig def validate <file>`
   is the same check the store applies at save time, offline.
 

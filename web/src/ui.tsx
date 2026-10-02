@@ -15,10 +15,11 @@ export function StatusBadge({ state }: { state: string }) {
   );
 }
 
-export function Link({ href, children }: { href: string; children: ReactNode }) {
+export function Link({ href, children, current = false }: { href: string; children: ReactNode; current?: boolean }) {
   return (
     <a
       href={href}
+      aria-current={current ? "page" : undefined}
       onClick={(event) => {
         if (event.metaKey || event.ctrlKey || event.shiftKey) return;
         event.preventDefault();

@@ -46,6 +46,10 @@
 # accepted_unpublished, as red CI did before; the publish retry judges CI
 # but never repairs.
 #
+# THE CI RE-RUN. `rerun: {budget: 1}` re-runs the failed GitHub Actions jobs
+# once, on the same head, before a repair round is spent: a job that passes
+# on re-run publishes, reported as flaky; one still red goes to repair.
+#
 # THE ROSTER. Builders and reviewers are `opus`; the planner and the extra
 # high-risk reviewer are `sonnet`. `effort` is medium for building to a plan
 # and high for reviewers hunting what the build missed. `budget_usd` caps what
@@ -387,5 +391,6 @@ publish:
   hold_when: "risk != low"
   ci:
     wait: true
+    rerun: {budget: 1}
     on_fail: {run: build, budget: 2}
     timeout: 30m

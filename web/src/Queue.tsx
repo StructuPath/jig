@@ -3,14 +3,16 @@
 // answer, so it is the headline, not a column.
 import { useCallback } from "react";
 import { api } from "./api";
-import { formatClock, shortID } from "./format";
+import { formatClock } from "./format";
 import { usePolled } from "./polling";
-import type { Run } from "./types";
+import { TaskCard } from "./Tasks";
 import { Empty, ErrorBanner, Link, Loading, StatusBadge } from "./ui";
 
 export function Queue() {
   const load = useCallback(() => api.queue(), []);
   const { data, error, loading } = usePolled(load, 2000, "queue");
+  const loadFleet = useCallback(() => api.fleet(), []);
+  const fleet = usePolled(loadFleet, 3000, "queue-workers");
 
   if (loading && !data) return <Loading label="Loading queue…" />;
   if (!data) return <ErrorBanner error={error} />;
@@ -21,6 +23,7 @@ export function Queue() {
       <header className="view-header">
         <div>
           <h1>Work queue</h1>
+          <p className="subtle">Live work appears here. Completed and older runs are in Run history.</p>
           <p className="subtle">Observed {formatClock(data.observed_at)}</p>
         </div>
         <div className="counters">
@@ -35,9 +38,22 @@ export function Queue() {
         </div>
       </header>
       <ErrorBanner error={error} />
+      <section className="panel readiness" aria-label="Worker readiness">
+        <h2>{fleet.data ? `${fleet.data.live_count} worker${fleet.data.live_count === 1 ? "" : "s"} online` : "Checking workers…"}</h2>
+        <p>{fleet.data?.live_count ?
+          `Ready runtimes: ${(fleet.data.workers ?? []).filter((worker) => worker.live).flatMap((worker) => (worker.runtimes ?? []).map((runtime) => runtime.name)).join(", ")}. Jobs start when a compatible worker has a free slot.` :
+          "Jobs need an online worker before they can start."}</p>
+        <Link href="/fleet">View workers →</Link>
+        <ErrorBanner error={fleet.error} />
+      </section>
 
       {entries.length === 0 ? (
-        <Empty title="Nothing queued" detail="No job is waiting or running right now." />
+        <section className="panel">
+          <h2>No work is running</h2>
+          <p>The queue is empty. Opening an old run does not restart it.</p>
+          <p><Link href="/">Start a new task →</Link></p>
+          <Link href="/runs">Browse previous results →</Link>
+        </section>
       ) : (
         <table className="table">
           <thead>
@@ -89,36 +105,16 @@ export function Runs() {
   return (
     <div className="view">
       <header className="view-header">
-        <h1>Runs</h1>
+        <div>
+          <h1>My tasks</h1>
+          <p className="subtle">Open a task to follow its progress or read the result.</p>
+        </div>
       </header>
       <ErrorBanner error={error} />
       {data.length === 0 ? (
-        <Empty title="No runs" detail="Invoke a definition to admit one." />
+        <Empty title="No tasks yet" detail="Start a task from the New task page." />
       ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Run</th>
-              <th>Targets</th>
-              <th>State</th>
-              <th>Created</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.map((run: Run) => (
-              <tr key={run.id}>
-                <td>
-                  <Link href={`/runs/${run.id}`}>{shortID(run.id)}</Link>
-                </td>
-                <td>{run.targets.map((target) => target.repository).join(", ")}</td>
-                <td>
-                  <StatusBadge state={run.state} />
-                </td>
-                <td>{formatClock(run.created_at)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="task-cards">{data.map((run) => <TaskCard key={run.id} run={run} />)}</div>
       )}
     </div>
   );

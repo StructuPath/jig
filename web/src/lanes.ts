@@ -12,6 +12,7 @@
 //   - Everything is derived from the events alone. A lane renders from
 //     whatever has arrived so far; nothing waits for a terminal state.
 import { parseTime } from "./format";
+import { parseAttemptSummary } from "./api";
 import type { Attempt, TraceEvent } from "./types";
 
 export interface Span {
@@ -179,9 +180,11 @@ export function buildLane(attempt: Attempt, events: TraceEvent[]): Lane {
 
   const completed = parseTime(attempt.completed_at);
   if (completed !== null) {
+    const recordedPhases = parseAttemptSummary(attempt.result)?.phases?.slice().reverse() ?? [];
     closeTool(Math.max(completed, cursor));
     for (const span of openPhases.values()) {
       if (span.endMs === null) span.endMs = Math.max(completed, cursor);
+      span.status = recordedPhases.find((phase) => phase.phase === span.phase)?.status ?? "stopped";
     }
   }
 

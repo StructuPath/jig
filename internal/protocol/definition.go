@@ -36,7 +36,8 @@ var builtinGates = map[string]bool{
 
 // Repair-edge continuation and exhaustion policies (KTD2).
 const (
-	RepairThenRerunSelf = "rerun-self"
+	RepairThenRerunSelf  = "rerun-self"
+	RepairThenRerunChain = "rerun-chain"
 
 	RepairExhaustedFailJob = "fail-job"
 	RepairExhaustedProceed = "proceed"
@@ -136,11 +137,24 @@ type PublishSpec struct {
 // CISpec opts a definition into waiting for the pull request's CI after
 // publish. Timeout is a Go duration ("30m"); empty means DefaultCITimeout.
 // OnFail, when declared, repairs red CI inside the attempt instead of ending
-// it there.
+// it there. Rerun, when declared, re-runs failed GitHub Actions jobs on the
+// same head before any repair round, to tell a flaky check from a real one.
 type CISpec struct {
 	Wait    bool          `yaml:"wait"`
 	Timeout string        `yaml:"timeout"`
 	OnFail  *CIRepairSpec `yaml:"on_fail"`
+	Rerun   *CIRerunSpec  `yaml:"rerun"`
+}
+
+// CIRerunSpec is the flaky-check re-run policy:
+//
+//	rerun: {budget: N}
+//
+// Budget counts re-runs per attempt, not per head: a repair round's new head
+// gets only what the earlier heads left. A re-run never changes the branch,
+// and a pass after one is reported as flaky, never as a clean pass.
+type CIRerunSpec struct {
+	Budget int `yaml:"budget"`
 }
 
 // CIRepairSpec is the CI repair loop:
@@ -168,6 +182,10 @@ const (
 	// every phase after the repair phase, reviewers included, so a
 	// larger budget is mostly a larger bill for a fix that is not converging.
 	MaxCIRepairRounds = 3
+
+	// MaxCIReruns caps publish.ci.rerun's budget. Re-running more often than
+	// this stops telling a flaky check from a broken one and starts hiding it.
+	MaxCIReruns = 3
 )
 
 // WaitsForCI reports whether the definition gates acceptance on CI.
@@ -247,6 +265,8 @@ type GateSpec struct {
 // Failure that triggers the edge is nonzero exit for code phases and the
 // declared When envelope predicate for agent phases. Budget bounds the loop;
 // an edge without a positive budget is rejected at save time.
+// then: rerun-chain runs the target and every intervening phase before
+// retesting the failed phase; its target must precede the failed phase.
 type RepairEdge struct {
 	When      string `yaml:"when"`
 	Run       string `yaml:"run"`
@@ -456,7 +476,24 @@ func (spec *DefinitionSpec) validatePublish(phases map[string]PhaseSpec) error {
 				timeout, MinCITimeout, MaxCITimeout)
 		}
 	}
+	if err := spec.validateCIRerun(); err != nil {
+		return err
+	}
 	return spec.validateCIRepair(phases)
+}
+
+func (spec *DefinitionSpec) validateCIRerun() error {
+	ci := spec.Publish.CI
+	if ci == nil || ci.Rerun == nil {
+		return nil
+	}
+	if !ci.Wait {
+		return fmt.Errorf("publish: ci: rerun re-runs red CI checks, which needs wait: true")
+	}
+	if ci.Rerun.Budget < 1 || ci.Rerun.Budget > MaxCIReruns {
+		return fmt.Errorf("publish: ci: rerun: budget %d is outside 1..%d", ci.Rerun.Budget, MaxCIReruns)
+	}
+	return nil
 }
 
 func (spec *DefinitionSpec) validateCIRepair(phases map[string]PhaseSpec) error {
@@ -576,9 +613,44 @@ func (spec *DefinitionSpec) validateRepairEdge(phase PhaseSpec, phases map[strin
 			"phase %q: repair edge targets itself — rerun-self already reruns the failed phase",
 			phase.Name)
 	}
-	if edge.Then != RepairThenRerunSelf {
-		return fmt.Errorf("phase %q: repair edge \"then\" must be %q, got %q",
-			phase.Name, RepairThenRerunSelf, edge.Then)
+	if edge.Then != RepairThenRerunSelf && edge.Then != RepairThenRerunChain {
+		return fmt.Errorf("phase %q: repair edge \"then\" must be %q or %q, got %q",
+			phase.Name, RepairThenRerunSelf, RepairThenRerunChain, edge.Then)
+	}
+	if edge.Then == RepairThenRerunChain {
+		found := false
+		for _, candidate := range spec.Phases {
+			if candidate.Name == phase.Name {
+				break
+			}
+			if candidate.Name == edge.Run {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("phase %q: rerun-chain target %q must precede the failed phase", phase.Name, edge.Run)
+		}
+		// A chain replay runs phases one after another; replaying a parallel
+		// group that way would run its members outside the group's read-only
+		// boundary.
+		inChain := false
+		for _, candidate := range spec.Phases {
+			if candidate.Name == edge.Run {
+				inChain = true
+			}
+			if inChain {
+				for _, member := range spec.Parallel {
+					if candidate.Name == member {
+						return fmt.Errorf("phase %q: rerun-chain from %q would replay parallel member %q; "+
+							"a chain replay cannot include the parallel group", phase.Name, edge.Run, member)
+					}
+				}
+			}
+			if candidate.Name == phase.Name {
+				break
+			}
+		}
 	}
 	if edge.Budget <= 0 {
 		return fmt.Errorf(

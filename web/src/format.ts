@@ -1,6 +1,22 @@
 // format.ts — presentation helpers. Durations are the operator's main unit
 // here: a swim lane is only useful if "how long did that take" is readable at
 // a glance.
+import type { Run } from "./types";
+
+export function taskTitle(run: Run): string {
+  return run.parameters?.task_title ?? run.parameters?.prompt?.replace(/^Trusted instructions:\s*/, "").split("\n\nUntrusted context:")[0].trim() ?? "Previous task";
+}
+
+export function projectName(repository: string): string {
+  return repository.replace(/\/$/, "").split("/").pop() || repository;
+}
+
+export function taskState(run: Run): string {
+  if (run.state === "mixed" && run.targets.length === 1 && run.snapshot.includes('hold_when: "jig_ui_delivery != publish"')) {
+    return run.parameters?.task_mode === "ask" ? "complete" : "ready";
+  }
+  return run.state;
+}
 
 export function parseTime(value: string | undefined | null): number | null {
   if (!value) return null;
@@ -36,6 +52,13 @@ export function shortID(value: string): string {
   return value.length > 12 ? `${value.slice(0, 8)}…` : value;
 }
 
+export function formatDateTime(value: string): string {
+  const time = parseTime(value);
+  return time === null ? "—" : new Date(time).toLocaleString(undefined, {
+    year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+  });
+}
+
 const terminalAttemptStates = new Set([
   "accepted",
   "accepted_unpublished",
@@ -49,5 +72,10 @@ export function isTerminalAttempt(state: string): boolean {
 }
 
 export function stateLabel(state: string): string {
-  return state.replace(/_/g, " ");
+  const labels: Record<string, string> = {
+    accepted: "Accepted", accepted_unpublished: "Accepted · not published",
+    mixed: "Mixed results", live: "Online", stale: "Offline", active: "In progress",
+    ready: "Ready to review", complete: "Complete",
+  };
+  return labels[state] ?? state.replace(/_/g, " ");
 }

@@ -83,6 +83,16 @@ func (g *e2eGateway) FailedCheckLogs(_ context.Context, _ string, checks []worke
 	return checks
 }
 
+// ActionsJobRun and RerunFailedJobs are never reached: the definition
+// declares no re-runs, and its checks are not Actions jobs.
+func (g *e2eGateway) ActionsJobRun(context.Context, string, int64) (int64, error) {
+	return 0, fmt.Errorf("unexpected workflow run lookup")
+}
+
+func (g *e2eGateway) RerunFailedJobs(context.Context, string, int64) error {
+	return fmt.Errorf("unexpected re-run request")
+}
+
 // scriptCIRepairRuntime scripts the chain's build and the repair round's.
 func scriptCIRepairRuntime(t *testing.T) {
 	t.Helper()
