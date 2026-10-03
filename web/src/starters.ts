@@ -17,9 +17,16 @@ export async function starterSource(mode: TaskMode, model: string, testCommand =
   // holds keep these starter tasks local without changing worker behavior.
   source = source.replace(/^acceptance:/m, `  - name: keep-local\n    kind: code\n    reports_fields: true\n    command: "printf '%s\\n' '{\\\"jig_ui_delivery\\\":\\\"local\\\"}'"\nacceptance:`);
   source += '\npublish:\n  hold_when: "jig_ui_delivery != publish"\n';
-  const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source))))
+  // The UI always writes Codex model ids, so only a Codex worker may claim the
+  // task (R17, U10). The pin goes in before hashing: the name must change with
+  // the source, or a starter saved before the pin keeps the name and
+  // ensureDefinition can neither match its source nor create it again.
+  source = source.replace(/^name: .+$/m, (line) => `${line}\nruntime: codex`);
+  return source.replace(/^name: .+$/m, `name: jig-task-${mode}-${await sourceHash(source)}`);
+}
+
+// sourceHash is the 16-hex-digit SHA-256 prefix that names a starter.
+export async function sourceHash(source: string): Promise<string> {
+  return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source))))
     .map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 16);
-  // The UI always writes Codex model ids, so the task must only be claimed by
-  // a Codex worker.
-  return source.replace(/^name: .+$/m, `name: jig-task-${mode}-${hash}\nruntime: codex`);
 }
