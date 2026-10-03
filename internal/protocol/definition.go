@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ const (
 	GateDiffMatchesClaims = "diff_matches_claims"
 	GateVerdictConsistent = "verdict_consistent"
 	GateTestsPass         = "tests_pass"
+	GateTestsIntact       = "tests_intact"
 )
 
 // CheckAllPhasesPassed is the built-in acceptance-predicate check that every
@@ -32,6 +34,7 @@ var builtinGates = map[string]bool{
 	GateDiffMatchesClaims: true,
 	GateVerdictConsistent: true,
 	GateTestsPass:         true,
+	GateTestsIntact:       true,
 }
 
 // Repair-edge continuation and exhaustion policies (KTD2).
@@ -265,11 +268,14 @@ type PhaseSpec struct {
 
 // GateSpec configures one built-in gate on a phase. Budget is the
 // gate-correction retry budget; zero means DefaultPhaseRetryBudget. Command
-// is required by tests_pass and meaningless to every other gate.
+// is required by tests_pass and meaningless to every other gate. Allow is
+// tests_intact's list of path.Match globs naming test files a definition
+// authorizes the agent to delete or weaken; it is rejected on any other gate.
 type GateSpec struct {
-	Name    string `yaml:"name"`
-	Command string `yaml:"command"`
-	Budget  int    `yaml:"budget"`
+	Name    string   `yaml:"name"`
+	Command string   `yaml:"command"`
+	Budget  int      `yaml:"budget"`
+	Allow   []string `yaml:"allow"`
 }
 
 // RepairEdge is the one declared loop construct (KTD2):
@@ -645,6 +651,9 @@ func (spec *DefinitionSpec) validatePhase(phase PhaseSpec, phases map[string]Pha
 		if gate.Budget < 0 {
 			return fmt.Errorf("phase %q: gate %q budget must not be negative", phase.Name, gate.Name)
 		}
+		if err := validateGateAllow(gate); err != nil {
+			return fmt.Errorf("phase %q: gate %q: %w", phase.Name, gate.Name, err)
+		}
 	}
 	return spec.validateRepairEdge(phase, phases)
 }
@@ -796,6 +805,34 @@ func (spec *DefinitionSpec) RequiredEnvNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// validateGateAllow checks a gate's allow list at save time (R1): only
+// tests_intact reads one, so on any other gate it is a misconfiguration that
+// would otherwise sit there looking like an exemption. Each entry must be a
+// well-formed path.Match glob. `**` is refused rather than accepted, because
+// path.Match reads it as a plain `*` that stops at `/` — the writes
+// allowlist's `**` crosses directories, and an allow entry that quietly
+// meant less than it says would fail the agent it was written to exempt.
+func validateGateAllow(gate GateSpec) error {
+	if gate.Allow == nil {
+		return nil
+	}
+	if gate.Name != GateTestsIntact {
+		return fmt.Errorf("allow is only meaningful on %q", GateTestsIntact)
+	}
+	for _, pattern := range gate.Allow {
+		if strings.TrimSpace(pattern) == "" {
+			return fmt.Errorf("allow entries must be non-empty globs")
+		}
+		if strings.Contains(pattern, "**") {
+			return fmt.Errorf("allow glob %q: `**` is not supported; allow uses path.Match, where `*` stops at `/`", pattern)
+		}
+		if _, err := path.Match(pattern, ""); err != nil {
+			return fmt.Errorf("allow glob %q is malformed: %w", pattern, err)
+		}
+	}
+	return nil
 }
 
 func builtinGateNames() []string {

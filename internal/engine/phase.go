@@ -928,6 +928,7 @@ func (e *execution) runGates(
 			ctx:      ctx,
 			worktree: e.attempt.WorktreePath,
 			envelope: envelope,
+			baseSHA:  e.attempt.BaseSHA,
 			env:      env,
 			timeout:  e.timeouts,
 		}, gate)

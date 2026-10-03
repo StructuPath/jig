@@ -1558,6 +1558,65 @@ acceptance: [all_phases_passed]
 	}
 }
 
+// The gate diffs against the attempt's pinned base, not HEAD: a weakening the
+// agent committed itself is still a weakening. The correction names the
+// marker, and an emission that removes it passes.
+func TestTestsIntactJudgesTheChangeSinceThePinnedBase(t *testing.T) {
+	repo := initRepo(t)
+	const original = "package src\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {\n\tt.Fatal(\"a\")\n}\n"
+	if err := os.MkdirAll(filepath.Join(repo, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "src", "a_test.go"), []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "src"}, {"commit", "--quiet", "-m", "tests"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	command := exec.Command("git", "rev-parse", "HEAD")
+	command.Dir = repo
+	base, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := envelope(map[string]any{"status": "success", "summary": "done"})
+	fake := enginetest.New(
+		enginetest.Step{Files: map[string]string{"src/a_test.go": strings.Replace(original,
+			"\tt.Fatal", "\tt.Skip(\"later\")\n\tt.Fatal", 1)}, Text: done},
+		enginetest.Step{Files: map[string]string{"src/a_test.go": original}, Text: done},
+	)
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+
+	snapshot := "name: t\n" + oneWriterRoster + `
+phases:
+  - name: build
+    kind: agent
+    owner: writer
+    gates:
+      - {name: tests_intact}
+acceptance: [all_phases_passed, tests_intact]
+`
+	attempt := testAttempt(snapshot, nil, repo)
+	attempt.BaseSHA = strings.TrimSpace(string(base))
+	outcome := runner.Execute(context.Background(), attempt)
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+	}
+	if fail, pass := sink.count(protocol.EventGateFail, "tests_intact"),
+		sink.count(protocol.EventGatePass, "tests_intact"); fail != 1 || pass != 1 {
+		t.Fatalf("tests_intact failed %d and passed %d time(s), want 1 and 1", fail, pass)
+	}
+	if calls := fake.Calls(); !strings.Contains(calls[1].Prompt, "src/a_test.go:6") ||
+		!strings.Contains(calls[1].Prompt, "skip/focus marker") {
+		t.Fatalf("correction prompt does not point at the skip: %.400q", calls[1].Prompt)
+	}
+}
+
 // ---- scenario: a missing verdict is not a rejection (R9) -------------------
 
 // `approved` is read as a bool, so an omitted field and a stated false carry
