@@ -193,32 +193,43 @@ Rules worth knowing before you write one:
   `artifacts_exist`, `files_non_empty`, `diff_matches_claims`,
   `verdict_consistent`, `tests_pass(command)`, and `tests_intact`.
   Repo-specific verification is a code phase, not a new gate.
-- **A builder cannot buy green by weakening tests.** `tests_intact` diffs
-  the worktree against `JIG_BASE_SHA` — committed and uncommitted changes
-  alike, with `--text` so a `-diff` attribute cannot hide a file — and
-  fails when a test file is deleted, loses more test functions or assertion
-  lines than it gains, or gains a marker that stops tests running: a skip
-  or focus (`t.Skip`, `test.only.each`, `mark.skip` in any form, `xit`,
-  inline `skip`), a `//go:build` constraint, an added `TestMain` or
-  `os.Exit(`, `pytestmark`, or a conftest `collect_ignore`. New untracked
-  test files are read too, for markers only. Losses are net per file, and
-  markers are counted per kind, so renaming a test inside its file,
-  swapping an assertion for a stronger one, or rewording a skip's message
-  passes, and new tests always do; renaming a test FILE reads as a
-  deletion. Each finding names `path:line` and says what to put back.
-  It counts lines by pattern and parses nothing, for Go, JavaScript and
-  TypeScript, Python, and Ruby/RSpec in v1, recognizing test files the way
-  `factory.yaml`'s risk classifier does. When a change is meant to remove
+- **A builder cannot cheaply buy green by weakening tests.** `tests_intact`
+  is a tripwire against careless or opportunistic test tampering, not an
+  adversarially complete analysis. Every test file changed since
+  `JIG_BASE_SHA` — committed, uncommitted, or untracked, gitignored
+  included — is compared whole against its base version: both sides are
+  normalized (comments stripped by a string-aware lexer, strings blanked,
+  whitespace collapsed so a token split across lines rejoins), then tests,
+  assertions, and markers are counted. It fails when a test file is
+  deleted, ends with fewer tests, assertions, or `m.Run(` calls, or with
+  more of any marker that stops tests running: a skip or focus (`t.Skip`,
+  `test.only.each`, `mark.skip` in any form, `pytest.importorskip(`, `xit`,
+  RSpec `skip: true` or `:focus`), a `//go:build` constraint, an added
+  `TestMain` or `os.Exit(`, `pytestmark`, `__test__ = False`, an aliased
+  `mark`, or a conftest `collect_ignore` or collection hook. Commenting a
+  test out, or wrapping it in `/* */` or a string, is a loss. Counts are
+  per file and per marker kind, so renaming a test inside its file,
+  converting `test(…)` to `test.each(…)`, swapping an assertion for a
+  stronger one, or rewording a skip's message passes, and new tests always
+  do; renaming a test FILE reads as a deletion. What it cannot inspect
+  fails closed: a binary or over-4 MiB test file, a tracked test file
+  flagged assume-unchanged or skip-worktree, an embedded git repository
+  holding test files. Untracked files under `node_modules`, Go `vendor`,
+  and Python virtualenvs are skipped, as the runners skip them. Each
+  finding names `path:line` where a changed line shows it, and says what
+  to put back. It covers Go, JavaScript and TypeScript, Python, and
+  Ruby/RSpec in v1, recognizing test files the way `factory.yaml`'s risk
+  classifier does, plus `conftest.py`. When a change is meant to remove
   tests, say so in the definition: `{name: tests_intact, allow:
   ["legacy/*_test.go"]}` exempts matching paths. `allow` uses `path.Match`
   globs against the repo-relative path — `*` stops at `/` and `**` is
   refused — and is rejected on any other gate. `factory.yaml` and
   `factory-parallel.yaml` run it on `build`. Known limits: it does not
   catch an assertion replaced by a trivially true one, a test runner
-  neutered through its configuration (jest or pytest config,
-  `package.json`, a `Makefile`), a skip hidden in a non-test helper, or
-  changes inside submodules — the reviewers and the risk classifier are
-  the check there.
+  neutered through configuration outside `conftest.py` (jest or pytest
+  config, `package.json`, a `Makefile`), a skip hidden in a non-test
+  helper, or changes inside submodules — the reviewers and the risk
+  classifier are the check there.
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
   discovered at 2 a.m.
