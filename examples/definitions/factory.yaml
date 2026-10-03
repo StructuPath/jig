@@ -62,6 +62,7 @@
 # classifier's path pattern and line threshold, which should name what is
 # dangerous in YOUR repository.
 name: factory
+runtime: claude-code
 roster:
   planner:
     model: sonnet

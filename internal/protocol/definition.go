@@ -56,12 +56,26 @@ var effortLevels = func() map[string]bool {
 	return levels
 }()
 
+// Runtime names a definition may pin with `runtime:`. They are the names
+// workers advertise in their registration's runtime capabilities, so claim
+// eligibility compares them as plain strings (R17, U10).
+const (
+	RuntimeClaudeCode = "claude-code"
+	RuntimeCodex      = "codex"
+)
+
+// Runtimes is the accepted `runtime:` vocabulary.
+var Runtimes = []string{RuntimeClaudeCode, RuntimeCodex}
+
 // DefinitionSpec is the parsed YAML form of a Job Definition (R1, KTD2): an
 // ordered phase chain, a per-role roster, and an acceptance predicate of
 // named checks. Validate enforces the save-time contract; nothing downstream
-// re-checks it.
+// re-checks it. Runtime, when set, restricts the job to workers that
+// advertise that runtime; empty means any worker, which is how every
+// snapshot frozen before the field existed keeps claiming.
 type DefinitionSpec struct {
 	Name       string              `yaml:"name"`
+	Runtime    string              `yaml:"runtime"`
 	Roster     map[string]RoleSpec `yaml:"roster"`
 	Phases     []PhaseSpec         `yaml:"phases"`
 	Parallel   ParallelGroup       `yaml:"parallel"`
@@ -341,6 +355,9 @@ func (spec *DefinitionSpec) Validate() error {
 			return err
 		}
 	}
+	if err := spec.validateRuntime(); err != nil {
+		return err
+	}
 	phasesByName := make(map[string]PhaseSpec, len(spec.Phases))
 	for _, phase := range spec.Phases {
 		if strings.TrimSpace(phase.Name) == "" {
@@ -366,6 +383,38 @@ func (spec *DefinitionSpec) Validate() error {
 		return err
 	}
 	return spec.validatePublish(phasesByName)
+}
+
+// validateRuntime refuses, at save time, a runtime no worker advertises and
+// a Codex definition whose roster asks for what the Codex adapter refuses at
+// send time. Caught there instead, that refusal costs every agent start in
+// the attempt and fails the job (U10).
+func (spec *DefinitionSpec) validateRuntime() error {
+	switch spec.Runtime {
+	case "", RuntimeClaudeCode:
+		return nil
+	case RuntimeCodex:
+	default:
+		return fmt.Errorf("definition %q: runtime %q is not one of %s",
+			spec.Name, spec.Runtime, strings.Join(Runtimes, ", "))
+	}
+	roles := make([]string, 0, len(spec.Roster))
+	for role := range spec.Roster {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	for _, role := range roles {
+		entry := spec.Roster[role]
+		if len(entry.Tools) > 0 {
+			return fmt.Errorf("role %q: runtime codex: codex exec has no tool allowlist flag; "+
+				"a role tools: list cannot be enforced", role)
+		}
+		if entry.BudgetUSD > 0 {
+			return fmt.Errorf("role %q: runtime codex: codex exec has no spend-cap flag; "+
+				"a role budget_usd cannot be enforced", role)
+		}
+	}
+	return nil
 }
 
 // validateParallel enforces R8. What a member "reports" is what the

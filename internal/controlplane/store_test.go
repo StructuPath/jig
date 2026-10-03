@@ -78,6 +78,12 @@ func newTestStore(t *testing.T) (*Store, *testClock) {
 // API is U5; U2 tests own the fixtures (plan, U2 approach note).
 func seedRun(t *testing.T, store *Store, runID string, targets ...protocol.RunTarget) {
 	t.Helper()
+	seedRunSnapshot(t, store, runID, fixtureSnapshot, targets...)
+}
+
+// seedRunSnapshot is seedRun with a caller-chosen frozen definition.
+func seedRunSnapshot(t *testing.T, store *Store, runID, snapshot string, targets ...protocol.RunTarget) {
+	t.Helper()
 	targetsJSON := "["
 	for i, target := range targets {
 		if i > 0 {
@@ -90,13 +96,13 @@ func seedRun(t *testing.T, store *Store, runID string, targets ...protocol.RunTa
 	if _, err := store.db.Exec(`
 		INSERT INTO definitions(id, name, generation, source, created_at, updated_at)
 		VALUES (?, ?, 1, ?, ?, ?)
-	`, "def-"+runID, "fixture-"+runID, fixtureSnapshot, now, now); err != nil {
+	`, "def-"+runID, "fixture-"+runID, snapshot, now, now); err != nil {
 		t.Fatalf("seed definition: %v", err)
 	}
 	if _, err := store.db.Exec(`
 		INSERT INTO runs(id, definition_id, definition_generation, snapshot, parameters, targets, state, created_at, updated_at)
 		VALUES (?, ?, 1, ?, '{}', ?, 'active', ?, ?)
-	`, runID, "def-"+runID, fixtureSnapshot, targetsJSON, now, now); err != nil {
+	`, runID, "def-"+runID, snapshot, targetsJSON, now, now); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 }

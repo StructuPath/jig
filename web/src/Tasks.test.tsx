@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { Tasks } from "./Tasks";
-import { starterSource } from "./starters";
+import { sourceHash, starterSource } from "./starters";
 
 beforeEach(() => {
   vi.stubGlobal("crypto", webcrypto);
@@ -31,6 +31,7 @@ it("generates Codex starters accepted by Jig's actual definition validator", asy
       writeFileSync(path, source);
       expect(execFileSync(jig, ["def", "validate", path], { cwd: "..", encoding: "utf8" })).toMatch(/^ok /);
       expect(source).toContain('hold_when: "jig_ui_delivery != publish"');
+      expect(source).toMatch(/^runtime: codex$/m);
       expect(source).not.toMatch(/model: (haiku|sonnet|opus)/);
       if (mode !== "ask") { expect(source).toContain("printf '$&'; go test ./..."); expect(source).toContain("run: plan, then: rerun-chain"); }
     }
@@ -38,6 +39,20 @@ it("generates Codex starters accepted by Jig's actual definition validator", asy
     rmSync(directory, { recursive: true });
   }
 }, 30000);
+
+it("names each starter by a hash of its final source, runtime pin included", async () => {
+  for (const mode of ["ask", "build", "auto"] as const) {
+    const source = await starterSource(mode, "gpt-6.1-sol", "go test ./...");
+    const name = source.match(/^name: jig-task-\w+-([0-9a-f]{16})$/m);
+    expect(name).not.toBeNull();
+    const hashed = source.replace(/^name: .+$/m, `name: ${mode === "ask" ? "smoke" : "plan-build-test"}`);
+    expect(hashed).toMatch(/^runtime: codex$/m);
+    expect(await sourceHash(hashed)).toBe(name![1]);
+    // A starter saved before the pin hashed the same source without it; its
+    // name must not collide with the pinned one (definition_exists).
+    expect(await sourceHash(hashed.replace("runtime: codex\n", ""))).not.toBe(name![1]);
+  }
+});
 
 function mockServer({ online = true, fail = false } = {}) {
   const fetch = vi.fn(async (url: string, init?: RequestInit) => {
