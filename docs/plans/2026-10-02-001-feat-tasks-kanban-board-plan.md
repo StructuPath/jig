@@ -82,8 +82,8 @@ My tasks is a flat grid of task cards with a status badge each. With more than a
 **Goal:** Render the board inside My tasks behind a persisted `List | Board` switch.
 **Requirements:** R1, R2, R3, R5, R6, R7
 **Dependencies:** U1
-**Files:** create `web/src/Board.tsx`, `web/src/Board.test.tsx`; modify `web/src/Queue.tsx` (`Runs`), `web/src/styles.css`; rebuild `web/dist/`
-**Approach:** `Runs` keeps its runs poll and owns the layout state (KTD4). The switch is a two-button group in the view header with `aria-pressed`. List renders today's `task-cards` grid untouched. `Board` receives runs, starts its own `usePolled` on `api.queue()` (so the queue is polled only while mounted, R6), folds with U1, and renders five `section` columns each with a heading + count and `TaskCard`s; an empty column shows a muted one-liner. CSS: columns as a grid that collapses to a single stacked column at narrow width; the board container may scroll horizontally on mid widths but the page must not.
+**Files:** create `web/src/TaskBoard.tsx`, `web/src/TaskBoard.test.tsx` (not `Board.tsx`: it collides with U1's `board.ts` on a case-insensitive filesystem, mirroring `lanes.ts`/`SwimLane.tsx`); modify `web/src/Queue.tsx` (`Runs`), `web/src/styles.css`; rebuild `web/dist/`
+**Approach:** `Runs` keeps its runs poll and owns the layout state (KTD4). The switch is a two-button group in the view header with `aria-pressed`. List renders today's `task-cards` grid untouched. `TaskBoard` receives runs, starts its own `usePolled` on `api.queue()` (so the queue is polled only while mounted, R6), folds with U1, and renders five `section` columns each with a heading + count and `TaskCard`s; an empty column shows a muted one-liner. CSS: columns as a grid that collapses to a single stacked column at narrow width; the board container may scroll horizontally on mid widths but the page must not.
 **Patterns to follow:** `Fleet.test.tsx` for mocking `api` and asserting with `within`; `TaskCard` in `web/src/Tasks.tsx`; guarded storage in `Tasks.tsx`.
 **Test scenarios:**
 - Default: no stored layout → List grid renders, no board columns, queue not requested.

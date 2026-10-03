@@ -1,8 +1,9 @@
 // Queue.tsx — the work queue with its depth. Depth is the first number an
 // operator wants ("is anything waiting?") and the one a run list cannot
 // answer, so it is the headline, not a column.
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { api } from "./api";
+import { TaskBoard } from "./TaskBoard";
 import { formatClock } from "./format";
 import { usePolled } from "./polling";
 import { TaskCard } from "./Tasks";
@@ -96,9 +97,22 @@ export function Queue() {
   );
 }
 
+type Layout = "list" | "board";
+
+// The layout is a viewing preference, so it lives in browser storage rather
+// than the URL: deep links stay /runs (2026-10-02-001 KTD4).
+function storedLayout(): Layout {
+  try { return localStorage.getItem("jig-tasks-layout") === "board" ? "board" : "list"; } catch { return "list"; /* Browser storage can be disabled. */ }
+}
+
 export function Runs() {
   const load = useCallback(() => api.runs(), []);
   const { data, error, loading } = usePolled(load, 4000, "runs");
+  const [layout, setLayout] = useState(storedLayout);
+  const choose = (next: Layout) => {
+    setLayout(next);
+    try { localStorage.setItem("jig-tasks-layout", next); } catch { /* The switch still applies for this visit. */ }
+  };
   if (loading && !data) return <Loading label="Loading runs…" />;
   if (!data) return <ErrorBanner error={error} />;
 
@@ -109,10 +123,16 @@ export function Runs() {
           <h1>My tasks</h1>
           <p className="subtle">Open a task to follow its progress or read the result.</p>
         </div>
+        <div className="layout-switch" role="group" aria-label="Layout">
+          <button type="button" aria-pressed={layout === "list"} onClick={() => choose("list")}>List</button>
+          <button type="button" aria-pressed={layout === "board"} onClick={() => choose("board")}>Board</button>
+        </div>
       </header>
       <ErrorBanner error={error} />
       {data.length === 0 ? (
         <Empty title="No tasks yet" detail="Start a task from the New task page." />
+      ) : layout === "board" ? (
+        <TaskBoard runs={data} />
       ) : (
         <div className="task-cards">{data.map((run) => <TaskCard key={run.id} run={run} />)}</div>
       )}
