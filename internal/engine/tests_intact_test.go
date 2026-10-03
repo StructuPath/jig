@@ -37,6 +37,18 @@ const jsTests = `describe("a", () => {
     assert.equal(2, 2);
   });
 });
+test.each([1, 2])("each %i", (n) => {
+  expect(n).toBe(n);
+});
+`
+
+const goSkipped = `package a
+
+import "testing"
+
+func TestSkipped(t *testing.T) {
+	t.Skip("old reason")
+}
 `
 
 const pyTests = `import pytest
@@ -73,6 +85,7 @@ end
 // committed at the pinned base.
 var testsIntactBase = map[string]string{
 	"pkg/a_test.go":      goTests,
+	"pkg/skip_test.go":   goSkipped,
 	"pkg/a.go":           "package a\n",
 	"src/a.test.ts":      jsTests,
 	"tests/test_a.py":    pyTests,
@@ -221,6 +234,90 @@ func TestTestsIntactFlagsWeakenedTestsAndPassesHonestChanges(t *testing.T) {
 			uncommitted: &intactEdit{write: replace("spec/a_spec.rb",
 				"    expect(1).to eq(1)\n", "    pending \"flaky\"\n    expect(1).to eq(1)\n")},
 			want: []string{"spec/a_spec.rb skip"}},
+		// Parameterized JS focus and skip, anywhere in the chain.
+		{name: "a JS test.only.each",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", "test.each([1, 2])", "test.only.each([1, 2])")},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a JS test.skip.each",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", "test.each([1, 2])", "test.skip.each([1, 2])")},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a JS it.only.each",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  it("one"`, `  it.only.each([1])("one"`)},
+			want:        []string{"src/a.test.ts skip", "src/a.test.ts test function"}},
+		{name: "a JS describe.only.each",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `describe("a"`, `describe.only.each([1])("a"`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a JS describe.skip.each",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `describe("a"`, `describe.skip.each([1])("a"`)},
+			want:        []string{"src/a.test.ts skip"}},
+		// Markers that drop a file or end the run, not just skip one test.
+		{name: "a go:build ignore constraint",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/a_test.go": "//go:build ignore\n\n" + goTests}},
+			want:        []string{"pkg/a_test.go skip"}},
+		{name: "a legacy +build constraint",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/a_test.go": "// +build ignore\n\n" + goTests}},
+			want:        []string{"pkg/a_test.go skip"}},
+		{name: "an added TestMain",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/a_test.go": goTests + "\nfunc TestMain(m *testing.M) {}\n"}},
+			want:        []string{"pkg/a_test.go skip"}},
+		{name: "an added os.Exit",
+			uncommitted: &intactEdit{write: replace("pkg/a_test.go",
+				"func TestOne(t *testing.T) {\n", "func TestOne(t *testing.T) {\n\tos.Exit(0)\n")},
+			want: []string{"pkg/a_test.go skip"}},
+		{name: "a module-level pytestmark",
+			uncommitted: &intactEdit{write: replace("tests/test_a.py",
+				"import pytest\n", "import pytest\n\npytestmark = pytest.mark.skip\n")},
+			want: []string{"tests/test_a.py skip"}},
+		{name: "a parenthesized pytest skipif",
+			uncommitted: &intactEdit{write: replace("tests/test_a.py",
+				"def test_two():", "@(pytest.mark.skipif(True, reason=\"x\"))\ndef test_two():")},
+			want: []string{"tests/test_a.py skip"}},
+		{name: "an aliased pytest mark",
+			uncommitted: &intactEdit{write: replace("tests/test_a.py",
+				"import pytest\n", "import pytest\nfrom pytest import mark\nskip_it = mark.skip\n")},
+			want: []string{"tests/test_a.py skip"}},
+		{name: "an xfail through pytest.param",
+			uncommitted: &intactEdit{write: replace("tests/test_a.py", "def test_two():",
+				"@pytest.mark.parametrize(\"n\", [pytest.param(1, marks=pytest.mark.xfail)])\ndef test_two():")},
+			want: []string{"tests/test_a.py skip"}},
+		{name: "a committed conftest collect_ignore",
+			committed: &intactEdit{write: map[string]string{"conftest.py": "collect_ignore = [\"tests/test_a.py\"]\n"}},
+			want:      []string{"conftest.py skip"}},
+		{name: "an RSpec inline skip after do;",
+			uncommitted: &intactEdit{write: replace("spec/a_spec.rb", "\nend\n", "\n  it \"three\" do; skip; end\nend\n")},
+			want:        []string{"spec/a_spec.rb skip"}},
+		{name: "an RSpec skip in a one-line block",
+			uncommitted: &intactEdit{write: replace("spec/a_spec.rb", "\nend\n", "\n  it(\"four\") { skip }\nend\n")},
+			want:        []string{"spec/a_spec.rb skip"}},
+		// Untracked files: git diff never shows them.
+		{name: "an untracked test file with a build constraint",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/c_test.go": "//go:build ignore\n\n" + goTests}},
+			want:        []string{"pkg/c_test.go skip"}},
+		{name: "an untracked conftest collect_ignore",
+			uncommitted: &intactEdit{write: map[string]string{"tests/conftest.py": "collect_ignore = [\"test_a.py\"]\n"}},
+			want:        []string{"tests/conftest.py skip"}},
+		{name: "an untracked test file without markers",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/c_test.go": goTests, "src/c.spec.js": jsTests}}},
+		{name: "an untracked test file the allow list covers",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/c_test.go": "//go:build ignore\n\n" + goTests}},
+			allow:       []string{"pkg/c_test.go"}},
+		// A -diff attribute must not hide a weakened file as binary.
+		{name: "an untracked -diff attribute",
+			uncommitted: &intactEdit{write: map[string]string{
+				".gitattributes": "*_test.go -diff\n",
+				"pkg/a_test.go":  strings.Replace(goTests, "\t\tt.Fatal(\"one\")\n", "", 1)}},
+			want: []string{"pkg/a_test.go assertion"}},
+		{name: "a committed -diff attribute",
+			committed: &intactEdit{write: map[string]string{
+				".gitattributes": "*.ts binary\n",
+				"src/a.test.ts":  strings.Replace(jsTests, "    expect(1).toBe(1);\n", "", 1)}},
+			want: []string{"src/a.test.ts assertion"}},
+		// A reworded skip is the same skip.
+		{name: "a skip message edited",
+			uncommitted: &intactEdit{write: replace("pkg/skip_test.go", "old reason", "new reason")}},
+		{name: "a skip moved to another test",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/skip_test.go": strings.Replace(goSkipped,
+				"\tt.Skip(\"old reason\")\n}\n", "}\n\nfunc TestOther(t *testing.T) {\n\tt.Skip(\"other reason\")\n}\n", 1)}}},
 		{name: "committed and uncommitted losses are both seen",
 			committed:   &intactEdit{write: replace("src/a.test.ts", "    expect(1).toBe(1);\n", "")},
 			uncommitted: &intactEdit{remove: []string{"spec/a_spec.rb"}},
@@ -309,6 +406,54 @@ func TestTestsIntactFindingsCarryTheLineAndTheFix(t *testing.T) {
 	}
 	if len(want) > 0 {
 		t.Fatalf("missing findings %v in %+v", want, report.Checks)
+	}
+}
+
+// A repository's diff.interHunkContext would merge nearby hunks and fill the
+// gap with context lines; the gate forces it off and counts context anyway,
+// so the second finding still names its own line.
+func TestTestsIntactLineNumbersSurviveInterHunkContext(t *testing.T) {
+	dir, base := testsIntactRepo(t)
+	intactGit(t, dir, "config", "diff.interHunkContext", "20")
+	skipped := strings.Replace(goTests, "func TestOne(t *testing.T) {\n",
+		"func TestOne(t *testing.T) {\n\tt.Skip(\"one\")\n", 1)
+	skipped = strings.Replace(skipped, "func TestTwo(t *testing.T) {\n",
+		"func TestTwo(t *testing.T) {\n\tt.Skip(\"two\")\n", 1)
+	writeIntactFile(t, dir, "pkg/a_test.go", skipped)
+	report := gateTestsIntact(gateContext{ctx: context.Background(), worktree: dir, baseSHA: base})
+	var items []string
+	for _, check := range report.Checks {
+		if !check.Ok {
+			items = append(items, check.Item)
+		}
+	}
+	if want := []string{"pkg/a_test.go:6", "pkg/a_test.go:13"}; strings.Join(items, ",") != strings.Join(want, ",") {
+		t.Fatalf("failed items = %q, want %q", items, want)
+	}
+	// The parser alone, on a hunk that carries context: the counter must
+	// advance over it.
+	files := parseUnifiedDiff("diff --git a/x_test.go b/x_test.go\n--- a/x_test.go\n+++ b/x_test.go\n" +
+		"@@ -5,3 +5,4 @@\n func TestA(t *testing.T) {\n+\tt.Skip()\n \tt.Fatal(\"a\")\n }\n")
+	if len(files) != 1 || len(files[0].added) != 1 || files[0].added[0].line != 6 {
+		t.Fatalf("parsed %+v, want one added line at 6", files)
+	}
+}
+
+// Should git ever report a test file as binary despite --text, the gate
+// refuses to vouch for what it cannot read.
+func TestTestsIntactFailsABinaryTestFile(t *testing.T) {
+	files := parseUnifiedDiff("diff --git a/pkg/a_test.go b/pkg/a_test.go\nindex 1111111..2222222 100644\n" +
+		"Binary files a/pkg/a_test.go and b/pkg/a_test.go differ\n")
+	var report protocol.GateReport
+	judgeTestFiles(&report, files, nil, "base")
+	if report.Passed() || report.Checks[0].Item != "pkg/a_test.go" ||
+		!strings.Contains(report.Checks[0].Note, "binary") {
+		t.Fatalf("checks = %+v, want a failed binary check", report.Checks)
+	}
+	report = protocol.GateReport{}
+	judgeTestFiles(&report, files, []string{"pkg/*"}, "base")
+	if !report.Passed() {
+		t.Fatalf("checks = %+v, want allow to exempt it", report.Checks)
 	}
 }
 

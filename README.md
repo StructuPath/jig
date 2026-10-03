@@ -195,12 +195,17 @@ Rules worth knowing before you write one:
   Repo-specific verification is a code phase, not a new gate.
 - **A builder cannot buy green by weakening tests.** `tests_intact` diffs
   the worktree against `JIG_BASE_SHA` — committed and uncommitted changes
-  alike — and fails when a test file is deleted, loses more test functions
-  or assertion lines than it gains, or gains a skip or focus marker
-  (`t.Skip`, `.only(`, `@pytest.mark.skip`, `xit`, …). Losses are net per
-  file, so renaming a test inside its file or swapping an assertion for a
-  stronger one passes, and new tests always do; renaming a test FILE reads
-  as a deletion. Each finding names `path:line` and says what to put back.
+  alike, with `--text` so a `-diff` attribute cannot hide a file — and
+  fails when a test file is deleted, loses more test functions or assertion
+  lines than it gains, or gains a marker that stops tests running: a skip
+  or focus (`t.Skip`, `test.only.each`, `mark.skip` in any form, `xit`,
+  inline `skip`), a `//go:build` constraint, an added `TestMain` or
+  `os.Exit(`, `pytestmark`, or a conftest `collect_ignore`. New untracked
+  test files are read too, for markers only. Losses are net per file, and
+  markers are counted per kind, so renaming a test inside its file,
+  swapping an assertion for a stronger one, or rewording a skip's message
+  passes, and new tests always do; renaming a test FILE reads as a
+  deletion. Each finding names `path:line` and says what to put back.
   It counts lines by pattern and parses nothing, for Go, JavaScript and
   TypeScript, Python, and Ruby/RSpec in v1, recognizing test files the way
   `factory.yaml`'s risk classifier does. When a change is meant to remove
@@ -208,7 +213,12 @@ Rules worth knowing before you write one:
   ["legacy/*_test.go"]}` exempts matching paths. `allow` uses `path.Match`
   globs against the repo-relative path — `*` stops at `/` and `**` is
   refused — and is rejected on any other gate. `factory.yaml` and
-  `factory-parallel.yaml` run it on `build`.
+  `factory-parallel.yaml` run it on `build`. Known limits: it does not
+  catch an assertion replaced by a trivially true one, a test runner
+  neutered through its configuration (jest or pytest config,
+  `package.json`, a `Makefile`), a skip hidden in a non-test helper, or
+  changes inside submodules — the reviewers and the risk classifier are
+  the check there.
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
   discovered at 2 a.m.
