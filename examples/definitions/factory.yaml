@@ -257,12 +257,17 @@ phases:
   - name: plan
     kind: agent
     owner: planner
+  # tests_intact refuses a build that deletes a test file, loses tests or
+  # assertions, or adds a skip/focus marker since the pinned base — the
+  # cheapest way to turn red tests or red CI green. It runs on every build,
+  # repair rounds included; name exempt paths with `allow: [<glob>]`.
   - name: build
     kind: agent
     owner: builder
     gates:
       - {name: artifacts_exist}
       - {name: diff_matches_claims}
+      - {name: tests_intact}
   # The commit phases stage with `git add -A` deliberately: by the time a
   # code phase runs, the write boundary has already verified every path the
   # agent changed against its allowlist and rolled back anything else (R10),

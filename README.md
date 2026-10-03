@@ -191,8 +191,24 @@ Rules worth knowing before you write one:
   a builder, and a verdict nobody stated must not decide that either way.
 - **Gates verify claims, they do not judge quality.** The registry is
   `artifacts_exist`, `files_non_empty`, `diff_matches_claims`,
-  `verdict_consistent`, and `tests_pass(command)`. Repo-specific
-  verification is a code phase, not a new gate.
+  `verdict_consistent`, `tests_pass(command)`, and `tests_intact`.
+  Repo-specific verification is a code phase, not a new gate.
+- **A builder cannot buy green by weakening tests.** `tests_intact` diffs
+  the worktree against `JIG_BASE_SHA` — committed and uncommitted changes
+  alike — and fails when a test file is deleted, loses more test functions
+  or assertion lines than it gains, or gains a skip or focus marker
+  (`t.Skip`, `.only(`, `@pytest.mark.skip`, `xit`, …). Losses are net per
+  file, so renaming a test inside its file or swapping an assertion for a
+  stronger one passes, and new tests always do; renaming a test FILE reads
+  as a deletion. Each finding names `path:line` and says what to put back.
+  It counts lines by pattern and parses nothing, for Go, JavaScript and
+  TypeScript, Python, and Ruby/RSpec in v1, recognizing test files the way
+  `factory.yaml`'s risk classifier does. When a change is meant to remove
+  tests, say so in the definition: `{name: tests_intact, allow:
+  ["legacy/*_test.go"]}` exempts matching paths. `allow` uses `path.Match`
+  globs against the repo-relative path — `*` stops at `/` and `**` is
+  refused — and is rejected on any other gate. `factory.yaml` and
+  `factory-parallel.yaml` run it on `build`.
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
   discovered at 2 a.m.
@@ -261,7 +277,8 @@ Rules worth knowing before you write one:
   heads, changed paths, and outcome in the result. The publish-only retry
   judges CI but never repairs — a continuation lives only in the process that
   ran the chain. Budget is 1–3. A fix that weakens a check instead of the
-  code is the risk to design for: `factory.yaml` scores edits to CI or lint
+  code is the risk to design for: `factory.yaml` refuses lost tests and new
+  skips at the build with `tests_intact`, and scores edits to CI or lint
   configuration, and test files that lose more lines than they gain, as not
   low, so such a "fix" is held for a person.
 - **A flaky Actions job can be re-run before a round is spent.**
