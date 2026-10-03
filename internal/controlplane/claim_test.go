@@ -153,15 +153,19 @@ func runtimeSnapshot(runtime string) string {
 	return "runtime: " + runtime + "\n" + fixtureSnapshot
 }
 
-// registerRuntimeWorker registers a worker that advertises one runtime.
-func registerRuntimeWorker(t *testing.T, store *Store, workerID, runtime string) {
+// registerRuntimeWorker registers a worker that advertises the runtimes.
+func registerRuntimeWorker(t *testing.T, store *Store, workerID string, runtimes ...string) {
 	t.Helper()
+	capabilities := make([]protocol.RuntimeCapability, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		capabilities = append(capabilities, protocol.RuntimeCapability{Name: runtime, Version: "1.0.0"})
+	}
 	_, err := store.RegisterWorker(context.Background(), workerID, protocol.WorkerRegistration{
 		Name:          workerID,
 		WorkerVersion: "dev",
 		Capacity:      2,
 		EnvNames:      []string{"GITHUB_TOKEN", "HOME", "PATH"},
-		Runtimes:      []protocol.RuntimeCapability{{Name: runtime, Version: "1.0.0"}},
+		Runtimes:      capabilities,
 	})
 	if err != nil {
 		t.Fatalf("register worker %s: %v", workerID, err)
@@ -227,6 +231,61 @@ func TestAJobWithNoRuntimeIsClaimedByEitherRuntime(t *testing.T) {
 			}
 			if claim := claimAs(t, store, workerA, "req-1", tokenA); claim == nil {
 				t.Fatalf("%s worker claimed nothing, want the unpinned job", runtime)
+			}
+		})
+	}
+}
+
+// A worker row may advertise no runtimes: registration stores `[]`, and a
+// row written outside it may hold `null`. Either way the worker runs only
+// unpinned jobs.
+func TestAWorkerAdvertisingNoRuntimesClaimsOnlyUnpinnedJobs(t *testing.T) {
+	for _, stored := range []string{"[]", "null"} {
+		t.Run(stored, func(t *testing.T) {
+			store, clock := newTestStore(t)
+			ctx := context.Background()
+			seedRunSnapshot(t, store, "run-pinned", runtimeSnapshot(protocol.RuntimeCodex),
+				protocol.RunTarget{Repository: repoA, BaseSHA: "pin000"})
+			seedRunSnapshot(t, store, "run-any", runtimeSnapshot(""),
+				protocol.RunTarget{Repository: repoA, BaseSHA: "pin000"})
+			registerRuntimeWorker(t, store, workerA)
+			if _, err := store.db.Exec(`UPDATE workers SET runtimes_json = ? WHERE id = ?`,
+				stored, workerA); err != nil {
+				t.Fatalf("store runtimes %s: %v", stored, err)
+			}
+			if _, err := store.EnqueueJob(ctx, "run-pinned", repoA); err != nil {
+				t.Fatalf("enqueue pinned job: %v", err)
+			}
+			if claim := claimAs(t, store, workerA, "req-1", tokenA); claim != nil {
+				t.Fatalf("worker with runtimes %s claimed pinned job %s, want empty", stored, claim.Job.ID)
+			}
+			clock.Advance(time.Millisecond)
+			anyJob, err := store.EnqueueJob(ctx, "run-any", repoA)
+			if err != nil {
+				t.Fatalf("enqueue unpinned job: %v", err)
+			}
+			claim := claimAs(t, store, workerA, "req-2", tokenB)
+			if claim == nil || claim.Job.ID != anyJob.ID {
+				t.Fatalf("worker with runtimes %s claimed %+v, want unpinned job %s", stored, claim, anyJob.ID)
+			}
+		})
+	}
+}
+
+func TestAWorkerAdvertisingSeveralRuntimesClaimsAJobPinnedToAnyOfThem(t *testing.T) {
+	for _, runtime := range protocol.Runtimes {
+		t.Run(runtime, func(t *testing.T) {
+			store, _ := newTestStore(t)
+			seedRunSnapshot(t, store, "run-1", runtimeSnapshot(runtime),
+				protocol.RunTarget{Repository: repoA, BaseSHA: "pin000"})
+			registerRuntimeWorker(t, store, workerA, protocol.RuntimeClaudeCode, protocol.RuntimeCodex)
+			job, err := store.EnqueueJob(context.Background(), "run-1", repoA)
+			if err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			claim := claimAs(t, store, workerA, "req-1", tokenA)
+			if claim == nil || claim.Job.ID != job.ID {
+				t.Fatalf("two-runtime worker claimed %+v, want %s job %s", claim, runtime, job.ID)
 			}
 		})
 	}
