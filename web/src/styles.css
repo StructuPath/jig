@@ -614,6 +614,22 @@ button:disabled { cursor: wait; opacity: 0.6; }
 .result-facts h3:nth-last-child(2) { grid-column: 2; grid-row: 1; }
 .result-facts > p:last-child { grid-column: 2; grid-row: 2; margin: 0; font-size: 14px; }
 .next-action { border-radius: 0 12px 12px 0; }
+.layout-switch { display: inline-flex; flex-shrink: 0; }
+.layout-switch button { border-radius: 0; padding: 6px 14px; font-size: 13px; color: var(--muted); }
+.layout-switch button:first-child { border-radius: 6px 0 0 6px; }
+.layout-switch button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+.layout-switch button[aria-pressed="true"] { background: var(--panel); color: var(--text); border-color: var(--accent); }
+/* The board scrolls inside itself on mid widths; the page never scrolls sideways (R7). */
+.board { display: grid; grid-template-columns: repeat(5, minmax(240px, 1fr)); gap: 14px; overflow-x: auto; padding-bottom: 6px; }
+.board-column { min-width: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; border-top: 2px solid var(--line); }
+.board-column h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); display: flex; justify-content: space-between; align-items: baseline; }
+.board-count { font: 12px ui-monospace, monospace; color: var(--text); }
+.board-empty { margin: 0; font-size: 12px; }
+.board-column-running { border-top-color: var(--ok); }
+.board-column-review { border-top-color: var(--warn); }
+.board-column-done { border-top-color: #82965e; }
+.board-column-stopped { border-top-color: var(--bad); }
+.board .task-card { padding: 14px; }
 @media (max-width: 1180px) { main { padding: 32px; } .workspace-grid { grid-template-columns: minmax(0, 1fr) 290px; gap: 20px; } .app { grid-template-columns: 180px minmax(0, 1fr); } }
 @media (max-width: 1000px) { .workspace-grid { grid-template-columns: 1fr; } .recent-work .task-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .loop-guide { display: none; } }
 @media (max-width: 700px) {
@@ -636,6 +652,7 @@ button:disabled { cursor: wait; opacity: 0.6; }
   .runtime-status { align-self: flex-start; flex-direction: row; align-items: center; }
   .composer-heading h2 { font-size: 24px; }
   .recent-work .task-cards { grid-template-columns: 1fr; }
+  .board { grid-template-columns: 1fr; overflow-x: visible; }
   .task-steps { grid-template-columns: 1fr; }
   .task-steps li { padding: 14px 16px; }
   .task-steps li::before { width: auto; }
