@@ -575,6 +575,63 @@ phases:
 `, `"builder"`, "budget_usd must not be negative")
 }
 
+func TestRuntimeIsOptionalAndParsedWhenInTheVocabulary(t *testing.T) {
+	if spec := mustParse(t, simpleSDLC); spec.Runtime != "" {
+		t.Fatalf("runtime = %q, want empty (any worker)", spec.Runtime)
+	}
+	for _, runtime := range Runtimes {
+		spec := mustParse(t, `
+name: pinned
+runtime: `+runtime+`
+roster:
+  builder: {model: m, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`)
+		if spec.Runtime != runtime {
+			t.Fatalf("runtime = %q, want %q", spec.Runtime, runtime)
+		}
+	}
+}
+
+func TestUnknownRuntimeIsRejectedNamingTheFieldAndAllowedValues(t *testing.T) {
+	mustReject(t, `
+name: bad
+runtime: pi
+roster:
+  builder: {model: m, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`, `runtime "pi"`, "claude-code, codex")
+}
+
+func TestCodexRuntimeRejectsARoleWithABudgetOrToolAllowlist(t *testing.T) {
+	mustReject(t, `
+name: bad
+runtime: codex
+roster:
+  builder: {model: m, budget_usd: 2.5, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`, `role "builder"`, "budget_usd cannot be enforced")
+	mustReject(t, `
+name: bad
+runtime: codex
+roster:
+  builder: {model: m, tools: [read], system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`, `role "builder"`, "tools: list cannot be enforced")
+	mustParse(t, `
+name: fine
+runtime: claude-code
+roster:
+  builder: {model: m, budget_usd: 2.5, tools: [read], system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`)
+}
+
 // parallelPanel is a builder, three read-only reviewers, and a code check;
 // the tests below splice roster entries, phases, and group lines into it.
 func parallelPanel(extraRoster, phases, tail string) string {

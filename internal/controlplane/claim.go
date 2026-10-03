@@ -102,10 +102,10 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 	// Worker eligibility: liveness and capacity (R4, KTD12).
 	var capacity int
 	var lastHeartbeat int64
-	var envNamesJSON string
+	var envNamesJSON, runtimesJSON string
 	err = tx.QueryRowContext(ctx, `
-		SELECT capacity, last_heartbeat, env_names_json FROM workers WHERE id = ?
-	`, workerID).Scan(&capacity, &lastHeartbeat, &envNamesJSON)
+		SELECT capacity, last_heartbeat, env_names_json, runtimes_json FROM workers WHERE id = ?
+	`, workerID).Scan(&capacity, &lastHeartbeat, &envNamesJSON, &runtimesJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -129,6 +129,14 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 	advertised := make(map[string]bool, len(advertisedNames))
 	for _, name := range advertisedNames {
 		advertised[name] = true
+	}
+	var advertisedRuntimes []protocol.RuntimeCapability
+	if err := json.Unmarshal([]byte(runtimesJSON), &advertisedRuntimes); err != nil {
+		return nil, unavailable(err)
+	}
+	runtimes := make(map[string]bool, len(advertisedRuntimes))
+	for _, runtime := range advertisedRuntimes {
+		runtimes[runtime.Name] = true
 	}
 
 	// Candidate selection: FIFO with retained-worktree skip-over (R4). The
@@ -178,6 +186,12 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 		if !envNamesSubset(spec.RequiredEnvNames(), advertised) {
 			// The definition requires an env name this worker did not
 			// advertise: ineligible at claim, not N phases deep (R17).
+			continue
+		}
+		if spec.Runtime != "" && !runtimes[spec.Runtime] {
+			// The definition was written for a runtime this worker does not
+			// run. Claimed anyway, the adapter refuses the roster only after
+			// the attempt starts, burning every agent start (U10).
 			continue
 		}
 		chosenJob = value.jobID

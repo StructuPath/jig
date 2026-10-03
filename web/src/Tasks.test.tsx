@@ -31,6 +31,7 @@ it("generates Codex starters accepted by Jig's actual definition validator", asy
       writeFileSync(path, source);
       expect(execFileSync(jig, ["def", "validate", path], { cwd: "..", encoding: "utf8" })).toMatch(/^ok /);
       expect(source).toContain('hold_when: "jig_ui_delivery != publish"');
+      expect(source).toMatch(/^runtime: codex$/m);
       expect(source).not.toMatch(/model: (haiku|sonnet|opus)/);
       if (mode !== "ask") { expect(source).toContain("printf '$&'; go test ./..."); expect(source).toContain("run: plan, then: rerun-chain"); }
     }

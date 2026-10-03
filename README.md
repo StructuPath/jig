@@ -72,9 +72,14 @@ release that serves Opus 5.5.
 
 One process runs one runtime: the engine holds a single adapter per attempt,
 so `--runtime` is an operator choice, not a per-role one. The `model:` value
-in a definition's roster goes straight to that CLI, which is why the stock
-definitions (written against Claude Code) need their models renamed before
-they run on Codex.
+in a definition's roster goes straight to that CLI, so a definition written
+for one runtime says so with a top-level `runtime: claude-code` or
+`runtime: codex`: only a worker that advertises that runtime claims its jobs,
+and the rest wait in the queue for one. A definition without `runtime:` runs
+on any worker. `runtime: codex` is refused at save time if any role sets
+`budget_usd` or `tools`, which `codex exec` cannot enforce. The stock
+`factory` definitions pin `claude-code`; the other stock definitions are
+unpinned and need their models renamed before they run on Codex.
 
 ---
 

@@ -19,5 +19,7 @@ export async function starterSource(mode: TaskMode, model: string, testCommand =
   source += '\npublish:\n  hold_when: "jig_ui_delivery != publish"\n';
   const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source))))
     .map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 16);
-  return source.replace(/^name: .+$/m, `name: jig-task-${mode}-${hash}`);
+  // The UI always writes Codex model ids, so the task must only be claimed by
+  // a Codex worker.
+  return source.replace(/^name: .+$/m, `name: jig-task-${mode}-${hash}\nruntime: codex`);
 }
