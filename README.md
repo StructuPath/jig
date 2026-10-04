@@ -198,7 +198,8 @@ Rules worth knowing before you write one:
   adversarially complete analysis. Every test file changed since
   `JIG_BASE_SHA` — committed, uncommitted, or untracked, gitignored
   included — is compared whole against its base version: both sides are
-  normalized (comments stripped by a string-aware lexer, strings blanked,
+  normalized (comments stripped by a lexer that knows strings, regex
+  literals, and Ruby heredocs and %-literals; literals blanked,
   whitespace collapsed so a token split across lines rejoins), then tests,
   assertions, and markers are counted. It fails when a test file is
   deleted, ends with fewer tests, assertions, or `m.Run(` calls, or with
@@ -212,7 +213,9 @@ Rules worth knowing before you write one:
   converting `test(…)` to `test.each(…)`, swapping an assertion for a
   stronger one, or rewording a skip's message passes, and new tests always
   do; renaming a test FILE reads as a deletion. What it cannot inspect
-  fails closed: a binary or over-4 MiB test file, a tracked test file
+  fails closed: a binary or over-4 MiB test file, a source test file with
+  a NUL byte or a UTF-16/UTF-32 byte-order mark, a comment, string, or
+  heredoc still open at end of file, a tracked test file
   flagged assume-unchanged or skip-worktree, an embedded git repository
   holding test files. Untracked files under `node_modules`, Go `vendor`,
   and Python virtualenvs are skipped, as the runners skip them. Each
@@ -228,8 +231,12 @@ Rules worth knowing before you write one:
   catch an assertion replaced by a trivially true one, a test runner
   neutered through configuration outside `conftest.py` (jest or pytest
   config, `package.json`, a `Makefile`), a skip hidden in a non-test
-  helper, or changes inside submodules — the reviewers and the risk
-  classifier are the check there.
+  helper, a skip hidden inside a JS template-literal expression or behind
+  an exotic string escape, an existing marker whose arguments are widened
+  (`skipif(False)` → `skipif(True)`, edited `collect_ignore` contents,
+  `if testing.Short()` → `if true`), arithmetic that keeps `m.Run(` but
+  discards its result, `pytest.exit(..., 0)`, or changes inside
+  submodules — the reviewers and the risk classifier are the check there.
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
   discovered at 2 a.m.

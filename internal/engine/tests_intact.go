@@ -48,11 +48,14 @@ const maxTestFileBytes = 4 << 20
 type lexStyle struct {
 	slashComments   bool // `//` and `/* */`
 	hashComments    bool // `#`
-	rubyBlocks      bool // `=begin` … `=end` at line starts
+	ruby            bool // `=begin`/`=end`, heredocs, `%r{…}` and other % literals
 	tripleQuotes    bool // Python `"""` and `'''`
 	backticks       bool // a backtick string: Go raw, JS template
 	backtickEscapes bool // JS templates honor `\`; Go raw strings do not
 	goDirectives    bool // keep `//go:build` and `// +build` lines as tokens
+	// regexLiterals: a `/` in expression position opens a regex, so a `/*`
+	// or `#` inside one is not a comment (JS, Ruby).
+	regexLiterals bool
 }
 
 // markerPattern finds one thing that stops tests from running: a skip, a
@@ -105,7 +108,7 @@ var (
 		},
 	}
 	langJS = &testLanguage{
-		lex: lexStyle{slashComments: true, backticks: true, backtickEscapes: true},
+		lex: lexStyle{slashComments: true, backticks: true, backtickEscapes: true, regexLiterals: true},
 		losses: []lossCount{
 			// Any chain counts as the test it declares, so test(…) →
 			// test.each(…)(…) is no loss; a .only/.skip is a marker below.
@@ -113,7 +116,9 @@ var (
 			{regexp.MustCompile(`\bexpect\(|\bassert(\.\w+)?\(`), "assertion(s)", fixAssertions},
 		},
 		markers: []markerPattern{
-			{regexp.MustCompile(`\b(describe|context|suite|it|test|specify)(\.\w+)*?\.(?P<kind>only|skip|todo)\b`)},
+			// vitest's skipIf/runIf/fails included: each turns a test off
+			// or inverts it.
+			{regexp.MustCompile(`\b(describe|context|suite|it|test|specify|bench)(\.\w+)*?\.(?P<kind>only|skip|todo|skipIf|runIf|fails)\b`)},
 			{regexp.MustCompile(`(^|[^.\w$])(?P<kind>xit|xdescribe|xtest|xcontext|fit|fdescribe)[.(]`)},
 		},
 	}
@@ -129,18 +134,21 @@ var (
 			{regexp.MustCompile(`\bmark\.(skip|skipif|xfail)\b`)},
 			{regexp.MustCompile(`\bunittest\.(skip\w*|expectedFailure)\b`)},
 			{regexp.MustCompile(`\bpytest\.(skip|xfail|importorskip)\(|\bself\.skipTest\(`)},
+			// unittest's decorators imported bare: `from unittest import skip`.
+			{regexp.MustCompile(`@(?P<kind>skipIf|skipUnless|skip|expectedFailure)\b`)},
+			{regexp.MustCompile(`\braise (unittest\.)?(?P<kind>SkipTest)\b`)},
 			{regexp.MustCompile(`(^|[^.\w])(?P<kind>pytestmark)(:[^=]+)?\+?=`)},
 			{regexp.MustCompile(`(^|[^.\w])(?P<kind>__test__=False)\b`)},
 			// An alias puts mark.skip out of a pattern's reach: flag the
 			// alias itself.
-			{regexp.MustCompile(`\b(?P<kind>mark as)\b`)},
+			{regexp.MustCompile(`\b(?P<kind>(mark|skip|skipIf|skipUnless|expectedFailure|SkipTest) as)\b`)},
 			{regexp.MustCompile(`=(?P<kind>pytest\.mark)([^.\w]|$)`)},
 			{regexp.MustCompile(`\bdef (?P<kind>pytest_(ignore_collect|collection_modifyitems))\(`)},
 			{regexp.MustCompile(`(^|[^.\w])(?P<kind>collect_ignore(_glob)?)(:[^=]+)?(\+?=|\.(append|extend|insert)\()`)},
 		},
 	}
 	langRuby = &testLanguage{
-		lex: lexStyle{hashComments: true, rubyBlocks: true},
+		lex: lexStyle{hashComments: true, ruby: true, regexLiterals: true},
 		losses: []lossCount{
 			// `it` followed by a description, a paren, a block — not
 			// Ruby 3.4's implicit block parameter.
@@ -171,15 +179,17 @@ func testLanguageOf(file string) *testLanguage {
 	return nil
 }
 
-// stripCode drops comments and blanks string contents to `""`, so neither
-// a commented-out test nor a marker spelled inside a string counts. A
-// comment becomes a space, so `a/*x*/b` stays two tokens. It is a lexer,
-// not a parser: regex literals and nested template expressions are not
-// understood, which only matters if the two sides differ there.
-func stripCode(src string, style lexStyle) string {
+// stripCode drops comments and blanks string, regex, and heredoc contents to
+// `""`, so neither a commented-out test nor a marker spelled inside a
+// literal counts. A comment becomes a space, so `a/*x*/b` stays two tokens.
+// It is a lexer, not a parser. The second result is a problem when a
+// comment, string, or literal is still open at end of file: everything after
+// an unclosed opener went unread, and the gate does not vouch for it.
+func stripCode(src string, style lexStyle) (string, string) {
 	src = strings.TrimPrefix(src, string(rune(0xFEFF)))
-	var out strings.Builder
+	out := make([]byte, 0, len(src))
 	n := len(src)
+	var heredocs []string // Ruby heredoc terminators opened on this line
 	for i := 0; i < n; {
 		c := src[i]
 		lineStart := i == 0 || src[i-1] == '\n'
@@ -187,37 +197,70 @@ func stripCode(src string, style lexStyle) string {
 		case style.slashComments && strings.HasPrefix(src[i:], "//"):
 			end := lineEnd(src, i)
 			if style.goDirectives && goDirective.MatchString(src[i:end]) {
-				out.WriteString(" \x00build:" + strings.Join(strings.Fields(src[i+2:end]), " ") + "\x00 ")
+				out = append(out, " \x00build:"+strings.Join(strings.Fields(src[i+2:end]), " ")+"\x00 "...)
 			}
-			out.WriteByte(' ')
+			out = append(out, ' ')
 			i = end
 		case style.slashComments && strings.HasPrefix(src[i:], "/*"):
-			if end := strings.Index(src[i+2:], "*/"); end >= 0 {
-				i += 2 + end + 2
-			} else {
-				i = n
+			end := strings.Index(src[i+2:], "*/")
+			if end < 0 {
+				return "", "a /* block comment"
 			}
-			out.WriteByte(' ')
+			out = append(out, ' ')
+			i += 2 + end + 2
 		case style.hashComments && c == '#':
-			out.WriteByte(' ')
+			out = append(out, ' ')
 			i = lineEnd(src, i)
-		case style.rubyBlocks && lineStart && strings.HasPrefix(src[i:], "=begin"):
-			if end := strings.Index(src[i:], "\n=end"); end >= 0 {
-				i = lineEnd(src, i+end+1)
-			} else {
-				i = n
+		case style.ruby && lineStart && strings.HasPrefix(src[i:], "=begin"):
+			end := strings.Index(src[i:], "\n=end")
+			if end < 0 {
+				return "", "an =begin block"
 			}
-			out.WriteByte(' ')
+			out = append(out, ' ')
+			i = lineEnd(src, i+end+1)
 		case style.tripleQuotes && (strings.HasPrefix(src[i:], `"""`) || strings.HasPrefix(src[i:], `'''`)):
-			if end := strings.Index(src[i+3:], src[i:i+3]); end >= 0 {
-				i += 3 + end + 3
-			} else {
-				i = n
+			end := strings.Index(src[i+3:], src[i:i+3])
+			if end < 0 {
+				return "", "a triple-quoted string"
 			}
-			out.WriteString(`""`)
+			out = append(out, `""`...)
+			i += 3 + end + 3
+		case style.regexLiterals && c == '/' && regexPosition(out, src, i, style.ruby):
+			if end, ok := scanRegex(src, i); ok {
+				out = append(out, `""`...)
+				i = end
+				continue
+			}
+			out = append(out, c) // no closing `/` on the line: division after all
+			i++
+		case style.ruby && c == '%' && i+2 < n && strings.IndexByte("qQwWiIrsx", src[i+1]) >= 0 &&
+			isLiteralDelimiter(src[i+2]):
+			end, ok := scanPercentLiteral(src, i+2)
+			if !ok {
+				return "", "a %" + string(src[i+1]) + " literal"
+			}
+			out = append(out, `""`...)
+			i = end
+		case style.ruby && strings.HasPrefix(src[i:], "<<") && rubyHeredocStart(src[i:]) != nil:
+			match := rubyHeredocStart(src[i:])
+			heredocs = append(heredocs, match[3])
+			out = append(out, `""`...)
+			i += len(match[0])
+		case c == '\n' && len(heredocs) > 0:
+			// The rest of the opening line has been read; the bodies follow,
+			// in order, and none of them is code.
+			out = append(out, '\n')
+			i++
+			for _, terminator := range heredocs {
+				var ok bool
+				if i, ok = skipHeredoc(src, i, terminator); !ok {
+					return "", "a heredoc"
+				}
+			}
+			heredocs = nil
 		case c == '"' || c == '\'' || (c == '`' && style.backticks):
 			escapes := c != '`' || style.backtickEscapes
-			j := i + 1
+			j, closed := i+1, false
 			for j < n {
 				if escapes && src[j] == '\\' {
 					j += 2
@@ -225,21 +268,154 @@ func stripCode(src string, style lexStyle) string {
 				}
 				if src[j] == c {
 					j++
+					closed = true
 					break
 				}
 				if src[j] == '\n' && c != '`' {
-					break // unterminated: end it at the line
+					break // a one-line string ends at the line, closed or not
 				}
 				j++
 			}
-			out.WriteString(`""`)
+			if !closed && j >= n {
+				return "", "a string or template literal"
+			}
+			out = append(out, `""`...)
 			i = min(j, n)
 		default:
-			out.WriteByte(c)
+			out = append(out, c)
 			i++
 		}
 	}
-	return out.String()
+	if len(heredocs) > 0 {
+		return "", "a heredoc"
+	}
+	return string(out), ""
+}
+
+// regexKeywords end an expression's left side: a `/` after one opens a regex.
+var regexKeywords = map[string]bool{
+	"return": true, "typeof": true, "instanceof": true, "in": true, "of": true, "new": true,
+	"delete": true, "void": true, "throw": true, "case": true, "do": true, "else": true,
+	"yield": true, "await": true, "when": true, "if": true, "unless": true, "and": true,
+	"or": true, "not": true, "while": true, "until": true, "elsif": true, "then": true,
+}
+
+// regexPosition reports whether a `/` at src[i] is in expression position:
+// at a line start, after an operator or opener, or after a keyword — where
+// it cannot be division. In Ruby, `match /re/` (a name, a space, then no
+// space) is a regex argument, which is how Ruby itself reads it.
+func regexPosition(out []byte, src string, i int, ruby bool) bool {
+	k := len(out) - 1
+	spaced := false
+	for k >= 0 && (out[k] == ' ' || out[k] == '\t' || out[k] == '\r') {
+		k--
+		spaced = true
+	}
+	if k < 0 || out[k] == '\n' {
+		return true
+	}
+	prev := out[k]
+	if strings.IndexByte("(,=:[!&|?{};~", prev) >= 0 {
+		return true
+	}
+	if !isWordByte(prev) {
+		return false
+	}
+	start := k
+	for start > 0 && isWordByte(out[start-1]) {
+		start--
+	}
+	if regexKeywords[string(out[start:k+1])] {
+		return true
+	}
+	return ruby && spaced && i+1 < len(src) && src[i+1] != ' ' && src[i+1] != '='
+}
+
+// scanRegex finds the end of a regex literal opening at src[i]: the first
+// unescaped `/` outside a `[...]` class. A newline first means it was never
+// a regex.
+func scanRegex(src string, i int) (int, bool) {
+	inClass := false
+	for j := i + 1; j < len(src); j++ {
+		switch src[j] {
+		case '\\':
+			j++
+		case '[':
+			inClass = true
+		case ']':
+			inClass = false
+		case '/':
+			if !inClass {
+				return j + 1, true
+			}
+		case '\n':
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+func isLiteralDelimiter(c byte) bool {
+	return c > ' ' && c < 0x7f && !isWordByte(c)
+}
+
+// scanPercentLiteral finds the end of a Ruby %-literal whose delimiter is at
+// src[open]; bracket delimiters nest.
+func scanPercentLiteral(src string, open int) (int, bool) {
+	closer := src[open]
+	switch closer {
+	case '(':
+		closer = ')'
+	case '[':
+		closer = ']'
+	case '{':
+		closer = '}'
+	case '<':
+		closer = '>'
+	}
+	depth := 1
+	for j := open + 1; j < len(src); j++ {
+		switch {
+		case src[j] == '\\':
+			j++
+		case closer != src[open] && src[j] == src[open]:
+			depth++
+		case src[j] == closer:
+			depth--
+			if depth == 0 {
+				return j + 1, true
+			}
+		}
+	}
+	return 0, false
+}
+
+var rubyHeredocPattern = regexp.MustCompile("^<<([~-]?)([\"'`]?)([A-Za-z_]\\w*)([\"'`]?)")
+
+// rubyHeredocStart matches a heredoc opener. A bare `<<NAME` needs an
+// upper-case name and `<<~`/`<<-` or quotes otherwise, so `items<<item` stays
+// an append.
+func rubyHeredocStart(s string) []string {
+	match := rubyHeredocPattern.FindStringSubmatch(s)
+	if match == nil || match[2] != match[4] {
+		return nil
+	}
+	if match[1] == "" && match[2] == "" && !unicode.IsUpper(rune(match[3][0])) {
+		return nil
+	}
+	return match
+}
+
+// skipHeredoc skips a heredoc body from src[i] through its terminator line.
+func skipHeredoc(src string, i int, terminator string) (int, bool) {
+	for i < len(src) {
+		end := lineEnd(src, i)
+		if strings.TrimSpace(src[i:end]) == terminator {
+			return min(end+1, len(src)), true
+		}
+		i = end + 1
+	}
+	return 0, false
 }
 
 func lineEnd(src string, from int) int {
@@ -274,8 +450,32 @@ func collapseSpace(s string) string {
 	return string(out)
 }
 
-func (l *testLanguage) normalize(src string) string {
-	return collapseSpace(stripCode(src, l.lex))
+// normalize is a whole file's normalized form, or the construct left open at
+// end of file.
+func (l *testLanguage) normalize(src string) (string, string) {
+	stripped, problem := stripCode(src, l.lex)
+	return collapseSpace(stripped), problem
+}
+
+// normalizeLine normalizes one line out of context, for line numbers only;
+// a construct it leaves open is expected there and costs nothing.
+func (l *testLanguage) normalizeLine(src string) string {
+	normalized, _ := l.normalize(src)
+	return normalized
+}
+
+// uninspectableText names why content cannot be read as source text: a NUL
+// byte, or a UTF-16/UTF-32 byte-order mark (those encodings put NULs
+// between the ASCII a pattern looks for, so nothing would match).
+func uninspectableText(content string) string {
+	switch {
+	case strings.HasPrefix(content, "\xFF\xFE"), strings.HasPrefix(content, "\xFE\xFF"),
+		strings.HasPrefix(content, "\x00\x00\xFE\xFF"):
+		return "is UTF-16 or UTF-32 encoded"
+	case strings.IndexByte(content, 0) >= 0:
+		return "contains a NUL byte"
+	}
+	return ""
 }
 
 // markerKinds counts each marker kind in normalized text.
@@ -686,7 +886,28 @@ func (j *intactJudge) compare(name, before, after string, file *fileDiff) {
 		return
 	}
 	failed := len(j.report.Violations())
-	old, now := lang.normalize(before), lang.normalize(after)
+	// Only source files are read as text: a binary fixture under tests/ is
+	// judged on deletion alone, above.
+	sides := []struct{ which, content string }{{"base", before}, {"worktree", after}}
+	for _, side := range sides {
+		if problem := uninspectableText(side.content); problem != "" {
+			j.report.Check(name, false, fmt.Sprintf(
+				"uninspectable: the %s version %s, so it cannot be read as source; "+
+					"save it as UTF-8 text or name it in the tests_intact allow list", side.which, problem))
+			return
+		}
+	}
+	old, oldOpen := lang.normalize(before)
+	now, nowOpen := lang.normalize(after)
+	for _, open := range []struct{ which, construct string }{{"base", oldOpen}, {"worktree", nowOpen}} {
+		if open.construct != "" {
+			j.report.Check(name, false, fmt.Sprintf(
+				"unterminated: in the %s version %s is still open at end of file, so the rest of the "+
+					"file cannot be read; close it or name the file in the tests_intact allow list",
+				open.which, open.construct))
+			return
+		}
+	}
 	for _, loss := range lang.losses {
 		was, is := len(loss.re.FindAllStringIndex(old, -1)), len(loss.re.FindAllStringIndex(now, -1))
 		if is >= was {
@@ -737,7 +958,7 @@ func findingItem(name string, line int) string {
 // line out of context normalizes imperfectly; that only costs the number.
 func lineOf(lang *testLanguage, lines []diffLine, re *regexp.Regexp) int {
 	for _, line := range lines {
-		if re.MatchString(lang.normalize(line.text)) {
+		if re.MatchString(lang.normalizeLine(line.text)) {
 			return line.line
 		}
 	}
@@ -749,13 +970,13 @@ func lineOf(lang *testLanguage, lines []diffLine, re *regexp.Regexp) int {
 func markerLines(lang *testLanguage, file *fileDiff, kind string) []diffLine {
 	removed := map[string]int{}
 	for _, line := range file.removed {
-		if lang.markerKinds(lang.normalize(line.text))[kind] > 0 {
+		if lang.markerKinds(lang.normalizeLine(line.text))[kind] > 0 {
 			removed[strings.TrimSpace(line.text)]++
 		}
 	}
 	var fresh, moved []diffLine
 	for _, line := range file.added {
-		if lang.markerKinds(lang.normalize(line.text))[kind] == 0 {
+		if lang.markerKinds(lang.normalizeLine(line.text))[kind] == 0 {
 			continue
 		}
 		text := strings.TrimSpace(line.text)

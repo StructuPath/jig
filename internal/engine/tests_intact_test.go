@@ -51,6 +51,33 @@ func TestSkipped(t *testing.T) {
 }
 `
 
+// jsRegexTests holds regex literals whose `/*` would open a comment to a
+// lexer without a regex state, blinding the rest of the file on both sides.
+const jsRegexTests = `const re = /^\/*/;
+const cls = /[/*]/;
+it("matches", () => {
+  expect(re.test("x")).toBe(true);
+  expect(cls.test("*")).toBe(true);
+});
+`
+
+// rbRegexSpec holds a heredoc whose `=begin` line is text, not a block
+// comment, and `#` inside regex literals, which is not a comment either.
+const rbRegexSpec = `describe C do
+  it "reads a heredoc" do
+    text = <<-DOC
+=begin
+    DOC
+    expect(text).to match(/#/)
+    expect(text).to match(%r{#})
+  end
+
+  it "still counts" do
+    expect(1).to eq(1)
+  end
+end
+`
+
 const goMain = `package a
 
 import (
@@ -99,6 +126,10 @@ var testsIntactBase = map[string]string{
 	"pkg/a_test.go":      goTests,
 	"pkg/skip_test.go":   goSkipped,
 	"pkg/main_test.go":   goMain,
+	"pkg/open_test.go":   goTests + "/* never closed\n",
+	"pkg/nul_test.go":    goTests + "\x00",
+	"src/re.test.ts":     jsRegexTests,
+	"spec/re_spec.rb":    rbRegexSpec,
 	"pkg/a.go":           "package a\n",
 	"src/a.test.ts":      jsTests,
 	"tests/test_a.py":    pyTests,
@@ -172,7 +203,7 @@ func intactViolations(report protocol.GateReport) []string {
 		}
 		file, _, _ := strings.Cut(check.Item, ":")
 		kind := "?"
-		for _, candidate := range []string{"too large", "embedded", "index flag", "m.Run",
+		for _, candidate := range []string{"unterminated", "uninspectable", "too large", "embedded", "index flag", "m.Run",
 			"deleted", "test function", "assertion", "skip"} {
 			if strings.Contains(check.Note, candidate) {
 				kind = candidate
@@ -408,6 +439,93 @@ func TestTestsIntactFlagsWeakenedTestsAndPassesHonestChanges(t *testing.T) {
 			uncommitted: &intactEdit{write: map[string]string{
 				".gitignore":                 "node_modules/\n",
 				"node_modules/dep/a.test.js": "describe.only(\"dep\", () => {});\n"}}},
+		// Regex literals, heredocs, and %-literals are not comments.
+		{name: "an assertion removed after a JS regex holding /*",
+			uncommitted: &intactEdit{write: replace("src/re.test.ts", "  expect(cls.test(\"*\")).toBe(true);\n", "")},
+			want:        []string{"src/re.test.ts assertion"}},
+		{name: "an assertion removed after a Ruby heredoc holding =begin",
+			uncommitted: &intactEdit{write: replace("spec/re_spec.rb", "    expect(1).to eq(1)\n", "")},
+			want:        []string{"spec/re_spec.rb assertion"}},
+		{name: "a pending hidden after # in a Ruby regex",
+			uncommitted: &intactEdit{write: replace("spec/a_spec.rb",
+				"    expect(1).to eq(1)\n", "    expect(\"#\").to match(/#/); pending\n    expect(1).to eq(1)\n")},
+			want: []string{"spec/a_spec.rb skip"}},
+		{name: "a pending hidden after # in a Ruby %r literal",
+			uncommitted: &intactEdit{write: replace("spec/a_spec.rb",
+				"    expect(1).to eq(1)\n", "    expect(\"#\").to match(%r{#}); pending\n    expect(1).to eq(1)\n")},
+			want: []string{"spec/a_spec.rb skip"}},
+		{name: "a Go block comment left open",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/a_test.go": goTests + "/*\n"}},
+			want:        []string{"pkg/a_test.go unterminated"}},
+		{name: "a JS template literal left open",
+			uncommitted: &intactEdit{write: map[string]string{"src/a.test.ts": jsTests + "const s = `open\n"}},
+			want:        []string{"src/a.test.ts unterminated"}},
+		{name: "a Ruby heredoc left open",
+			uncommitted: &intactEdit{write: map[string]string{"spec/a_spec.rb": rbTests + "text = <<~EOS\nnever ends\n"}},
+			want:        []string{"spec/a_spec.rb unterminated"}},
+		{name: "a base version left open",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/open_test.go": goTests}},
+			want:        []string{"pkg/open_test.go unterminated"}},
+		// Bare unittest skips.
+		{name: "a bare @skip from unittest",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"import unittest\n", "import unittest\nfrom unittest import skip\n")}},
+		{name: "a bare @skip decorator",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"    def test_one(self):", "    @skip(\"flaky\")\n    def test_one(self):")},
+			want: []string{"tests/test_unit.py skip"}},
+		{name: "a bare @skipIf decorator",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"    def test_one(self):", "    @skipIf(True, \"flaky\")\n    def test_one(self):")},
+			want: []string{"tests/test_unit.py skip"}},
+		{name: "a bare @skipUnless decorator",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"    def test_one(self):", "    @skipUnless(False, \"flaky\")\n    def test_one(self):")},
+			want: []string{"tests/test_unit.py skip"}},
+		{name: "a bare @expectedFailure decorator",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"    def test_one(self):", "    @expectedFailure\n    def test_one(self):")},
+			want: []string{"tests/test_unit.py skip"}},
+		{name: "raise unittest.SkipTest",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"        self.assertEqual(1, 1)\n", "        raise unittest.SkipTest(\"x\")\n        self.assertEqual(1, 1)\n")},
+			want: []string{"tests/test_unit.py skip"}},
+		{name: "raise a bare SkipTest",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"        self.assertEqual(1, 1)\n", "        raise SkipTest(\"x\")\n        self.assertEqual(1, 1)\n")},
+			want: []string{"tests/test_unit.py skip"}},
+		{name: "a unittest skip imported under an alias",
+			uncommitted: &intactEdit{write: replace("tests/test_unit.py",
+				"import unittest\n", "import unittest\nfrom unittest import skip as later\n")},
+			want: []string{"tests/test_unit.py skip"}},
+		// vitest chain modifiers.
+		{name: "a vitest test.skipIf",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two"`, `  test.skipIf(true)("two"`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest it.runIf",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  it("one"`, `  it.runIf(false)("one"`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest test.fails",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two"`, `  test.fails("two"`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest it.concurrent.only",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  it("one"`, `  it.concurrent.only("one"`)},
+			want:        []string{"src/a.test.ts skip"}},
+		// NUL bytes and wide encodings cannot be read as source.
+		{name: "a NUL byte in a tracked worktree file",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/a_test.go": goTests + "\x00"}},
+			want:        []string{"pkg/a_test.go uninspectable"}},
+		{name: "a NUL byte in the base version",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/nul_test.go": goTests}},
+			want:        []string{"pkg/nul_test.go uninspectable"}},
+		{name: "a NUL byte in an untracked test file",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/z_test.go": "package a\n\x00func TestZ(t *testing.T) { t.Skip() }\n"}},
+			want:        []string{"pkg/z_test.go uninspectable"}},
+		{name: "a UTF-16 byte-order mark",
+			uncommitted: &intactEdit{write: map[string]string{"pkg/w_test.go": "\xFF\xFEpackage a\n"}},
+			want:        []string{"pkg/w_test.go uninspectable"}},
+		{name: "a binary fixture under tests/",
+			uncommitted: &intactEdit{write: map[string]string{"tests/fixtures/image.bin": "\x89PNG\x00\x01"}}},
 		{name: "committed and uncommitted losses are both seen",
 			committed:   &intactEdit{write: replace("src/a.test.ts", "    expect(1).toBe(1);\n", "")},
 			uncommitted: &intactEdit{remove: []string{"spec/a_spec.rb"}},
