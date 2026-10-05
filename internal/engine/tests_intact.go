@@ -79,6 +79,10 @@ type testLanguage struct {
 	lex     lexStyle
 	losses  []lossCount
 	markers []markerPattern
+	// optionMarkers finds a test call's options object (group `opts`):
+	// each marker key set to anything but a falsy literal counts as that
+	// kind, so `test.skip(…)` → `test(…, {skip: true}, …)` is no change.
+	optionMarkers *regexp.Regexp
 }
 
 const (
@@ -107,6 +111,15 @@ var (
 			{regexp.MustCompile("\x00build:[^\x00]*\x00")},
 		},
 	}
+	// langGoTest is a _test.go file, where `go test` also runs examples and
+	// fuzz targets. A named func with no receiver is always top-level.
+	langGoTest = &testLanguage{
+		lex: langGo.lex,
+		losses: append([]lossCount{{
+			regexp.MustCompile(`\bfunc (Test\w*\(|Example\w*\(\)|Fuzz\w*\(\w+\*testing\.F\))`),
+			"test function(s)", fixTests}}, langGo.losses[1:]...),
+		markers: langGo.markers,
+	}
 	langJS = &testLanguage{
 		lex: lexStyle{slashComments: true, backticks: true, backtickEscapes: true, regexLiterals: true},
 		losses: []lossCount{
@@ -121,6 +134,9 @@ var (
 			{regexp.MustCompile(`\b(describe|context|suite|it|test|specify|bench)(\.\w+)*?\.(?P<kind>only|skip|todo|skipIf|runIf|fails)\b`)},
 			{regexp.MustCompile(`(^|[^.\w$])(?P<kind>xit|xdescribe|xtest|xcontext|fit|fdescribe)[.(]`)},
 		},
+		// vitest's options object, second argument: test("…", {skip: true}, fn).
+		optionMarkers: regexp.MustCompile(
+			`(^|[^.\w$])(describe|context|suite|it|test|specify|bench)(\.\w+)*\([^(){},]*,(?P<opts>\{[^{}]*\})`),
 	}
 	langPython = &testLanguage{
 		lex: lexStyle{hashComments: true, tripleQuotes: true},
@@ -161,12 +177,16 @@ var (
 			{regexp.MustCompile(`(^|[^.\w])(?P<kind>skip|pending|xit|xspecify|xexample|xdescribe|xcontext|fit|fdescribe|fcontext|focus)\b`)},
 		},
 	}
+	// optionKey is one marker key in a normalized options object.
+	optionKey   = regexp.MustCompile(`(?:^|[{,])(?P<kind>skip|only|fails|todo):(?P<value>[^,}]*)`)
 	jsExtension = regexp.MustCompile(`\.[cm]?[jt]sx?$`)
 	goDirective = regexp.MustCompile(`^//\s*(go:build|\+build)\b`)
 )
 
 func testLanguageOf(file string) *testLanguage {
 	switch {
+	case strings.HasSuffix(file, "_test.go"):
+		return langGoTest
 	case strings.HasSuffix(file, ".go"):
 		return langGo
 	case strings.HasSuffix(file, ".py"):
@@ -315,7 +335,9 @@ func regexPosition(out []byte, src string, i int, ruby bool) bool {
 		return true
 	}
 	prev := out[k]
-	if strings.IndexByte("(,=:[!&|?{};~", prev) >= 0 {
+	// `=>` returns an expression; a bare `>` is a comparison, whose right
+	// side is never directly a `/`, so it stays out.
+	if strings.IndexByte("(,=:[!&|?{};~", prev) >= 0 || prev == '>' && k > 0 && out[k-1] == '=' {
 		return true
 	}
 	if !isWordByte(prev) {
@@ -489,6 +511,18 @@ func (l *testLanguage) markerKinds(normalized string) map[string]int {
 				kind = match[kindIndex]
 			}
 			kinds[kind]++
+		}
+	}
+	if l.optionMarkers != nil {
+		opts := l.optionMarkers.SubexpIndex("opts")
+		for _, match := range l.optionMarkers.FindAllStringSubmatch(normalized, -1) {
+			for _, option := range optionKey.FindAllStringSubmatch(match[opts], -1) {
+				switch option[2] {
+				case "false", "0", "null", "undefined":
+				default:
+					kinds[option[1]]++
+				}
+			}
 		}
 	}
 	return kinds

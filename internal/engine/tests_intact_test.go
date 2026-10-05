@@ -55,10 +55,31 @@ func TestSkipped(t *testing.T) {
 // lexer without a regex state, blinding the rest of the file on both sides.
 const jsRegexTests = `const re = /^\/*/;
 const cls = /[/*]/;
+const arrow = () => /[/*]/;
 it("matches", () => {
   expect(re.test("x")).toBe(true);
   expect(cls.test("*")).toBe(true);
+  expect(arrow().test("*")).toBe(true);
 });
+`
+
+// goExamples holds the other functions `go test` runs, and a method that
+// only looks like one.
+const goExamples = `package a
+
+import "testing"
+
+type helper struct{}
+
+func ExampleOne() {
+	// Output:
+}
+
+func FuzzOne(f *testing.F) {
+	f.Fuzz(func(t *testing.T, s string) {})
+}
+
+func (helper) ExampleMethod() {}
 `
 
 // rbRegexSpec holds a heredoc whose `=begin` line is text, not a block
@@ -123,19 +144,21 @@ end
 // testsIntactBase is every fixture file; each case starts from all of them
 // committed at the pinned base.
 var testsIntactBase = map[string]string{
-	"pkg/a_test.go":      goTests,
-	"pkg/skip_test.go":   goSkipped,
-	"pkg/main_test.go":   goMain,
-	"pkg/open_test.go":   goTests + "/* never closed\n",
-	"pkg/nul_test.go":    goTests + "\x00",
-	"src/re.test.ts":     jsRegexTests,
-	"spec/re_spec.rb":    rbRegexSpec,
-	"pkg/a.go":           "package a\n",
-	"src/a.test.ts":      jsTests,
-	"tests/test_a.py":    pyTests,
-	"tests/test_unit.py": pyUnittest,
-	"spec/a_spec.rb":     rbTests,
-	"src/helpers.py":     "def helper():\n    return 1\n",
+	"pkg/a_test.go":             goTests,
+	"pkg/example_test.go":       goExamples,
+	"tests/fixtures/example.go": goExamples,
+	"pkg/skip_test.go":          goSkipped,
+	"pkg/main_test.go":          goMain,
+	"pkg/open_test.go":          goTests + "/* never closed\n",
+	"pkg/nul_test.go":           goTests + "\x00",
+	"src/re.test.ts":            jsRegexTests,
+	"spec/re_spec.rb":           rbRegexSpec,
+	"pkg/a.go":                  "package a\n",
+	"src/a.test.ts":             jsTests,
+	"tests/test_a.py":           pyTests,
+	"tests/test_unit.py":        pyUnittest,
+	"spec/a_spec.rb":            rbTests,
+	"src/helpers.py":            "def helper():\n    return 1\n",
 }
 
 type intactEdit struct {
@@ -443,6 +466,9 @@ func TestTestsIntactFlagsWeakenedTestsAndPassesHonestChanges(t *testing.T) {
 		{name: "an assertion removed after a JS regex holding /*",
 			uncommitted: &intactEdit{write: replace("src/re.test.ts", "  expect(cls.test(\"*\")).toBe(true);\n", "")},
 			want:        []string{"src/re.test.ts assertion"}},
+		{name: "an assertion removed after an arrow-returned regex holding /*",
+			uncommitted: &intactEdit{write: replace("src/re.test.ts", "  expect(arrow().test(\"*\")).toBe(true);\n", "")},
+			want:        []string{"src/re.test.ts assertion"}},
 		{name: "an assertion removed after a Ruby heredoc holding =begin",
 			uncommitted: &intactEdit{write: replace("spec/re_spec.rb", "    expect(1).to eq(1)\n", "")},
 			want:        []string{"spec/re_spec.rb assertion"}},
@@ -511,6 +537,43 @@ func TestTestsIntactFlagsWeakenedTestsAndPassesHonestChanges(t *testing.T) {
 		{name: "a vitest it.concurrent.only",
 			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  it("one"`, `  it.concurrent.only("one"`)},
 			want:        []string{"src/a.test.ts skip"}},
+		// vitest options objects: the same markers as the chain, and still a test.
+		{name: "a vitest skip: true option",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two", () => {`, `  test("two", { skip: true }, () => {`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest only: true option",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  it("one", () => {`, `  it("one", { only: true }, () => {`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest fails: true option",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two", () => {`, `  test("two", { fails: true }, () => {`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest todo: true option",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two", () => {`, `  test("two", { todo: true }, () => {`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest only beside concurrent",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two", () => {`,
+				`  test("two", { concurrent: true, only: true }, () => {`)},
+			want: []string{"src/a.test.ts skip"}},
+		{name: "a vitest skip option on describe",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `describe("a", () => {`, `describe("a", { skip: true }, () => {`)},
+			want:        []string{"src/a.test.ts skip"}},
+		{name: "a vitest options object without a marker",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two", () => {`,
+				`  test("two", { timeout: 5, skip: false }, () => {`)}},
+		{name: "skip: true inside a test name",
+			uncommitted: &intactEdit{write: replace("src/a.test.ts", `  test("two", () => {`, `  test("two, { skip: true }", () => {`)}},
+		// Go examples and fuzz targets are tests in a _test.go file only.
+		{name: "a Go Example removed",
+			uncommitted: &intactEdit{write: replace("pkg/example_test.go", "func ExampleOne() {\n\t// Output:\n}\n", "")},
+			want:        []string{"pkg/example_test.go test function"}},
+		{name: "a Go fuzz target removed",
+			uncommitted: &intactEdit{write: replace("pkg/example_test.go",
+				"func FuzzOne(f *testing.F) {\n\tf.Fuzz(func(t *testing.T, s string) {})\n}\n", "")},
+			want: []string{"pkg/example_test.go test function"}},
+		{name: "a method named like an Example removed",
+			uncommitted: &intactEdit{write: replace("pkg/example_test.go", "func (helper) ExampleMethod() {}\n", "")}},
+		{name: "an Example removed from a Go file that is not _test.go",
+			uncommitted: &intactEdit{write: replace("tests/fixtures/example.go", "func ExampleOne() {\n\t// Output:\n}\n", "")}},
 		// NUL bytes and wide encodings cannot be read as source.
 		{name: "a NUL byte in a tracked worktree file",
 			uncommitted: &intactEdit{write: map[string]string{"pkg/a_test.go": goTests + "\x00"}},
@@ -585,6 +648,24 @@ func TestTestsIntactFlagsWeakenedTestsAndPassesHonestChanges(t *testing.T) {
 			}
 			if len(report.Checks) == 0 {
 				t.Fatal("a green gate must still record what it checked (R9)")
+			}
+		})
+	}
+}
+
+// A `/` after `=>` opens a regex, so its `/*` is no comment; after a
+// comparison's operand it is still division.
+func TestTestsIntactLexesRegexAfterArrow(t *testing.T) {
+	cases := []struct{ name, src, want string }{
+		{"an arrow-returned regex holding /*", "const re = () => /[/*]/;\n", `const re=()=>"";`},
+		{"an arrow-returned regex in a call", "xs.map(x => /a*/.test(x));\n", `xs.map(x=>"".test(x));`},
+		{"a comparison followed by division", "x = a > b / c / d;\n", `x=a>b/c/d;`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, open := langJS.normalize(tc.src)
+			if open != "" || got != tc.want {
+				t.Fatalf("normalize = %q (open %q), want %q", got, open, tc.want)
 			}
 		})
 	}

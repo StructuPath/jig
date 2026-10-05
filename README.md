@@ -202,10 +202,13 @@ Rules worth knowing before you write one:
   literals, and Ruby heredocs and %-literals; literals blanked,
   whitespace collapsed so a token split across lines rejoins), then tests,
   assertions, and markers are counted. It fails when a test file is
-  deleted, ends with fewer tests, assertions, or `m.Run(` calls, or with
+  deleted, ends with fewer tests (Go `Example` and `Fuzz` functions in a
+  `_test.go` file included), assertions, or `m.Run(` calls, or with
   more of any marker that stops tests running: a skip or focus (`t.Skip`,
-  `test.only.each`, `mark.skip` in any form, `pytest.importorskip(`, `xit`,
-  RSpec `skip: true` or `:focus`), a `//go:build` constraint, an added
+  `test.only.each`, a vitest options object such as `test("…", {skip:
+  true}, fn)` with `skip`, `only`, `fails`, or `todo`, `mark.skip` in any
+  form, `pytest.importorskip(`, `xit`, RSpec `skip: true` or `:focus`), a
+  `//go:build` constraint, an added
   `TestMain` or `os.Exit(`, `pytestmark`, `__test__ = False`, an aliased
   `mark`, or a conftest `collect_ignore` or collection hook. Commenting a
   test out, or wrapping it in `/* */` or a string, is a loss. Counts are
