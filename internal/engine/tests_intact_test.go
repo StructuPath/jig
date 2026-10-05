@@ -200,9 +200,12 @@ func testsIntactRepo(t *testing.T) (string, string) {
 	return dir, strings.TrimSpace(intactGit(t, dir, "rev-parse", "HEAD"))
 }
 
+// intactGit runs a fixture git command with auto gc and auto maintenance
+// off, so no detached git is still writing the repository's .git when
+// TempDir's cleanup removes it.
 func intactGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	command := exec.Command("git", args...)
+	command := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
 	command.Dir = dir
 	output, err := command.CombinedOutput()
 	if err != nil {

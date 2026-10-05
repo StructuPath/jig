@@ -507,12 +507,16 @@ func restoreSnapshot(ctx context.Context, dir string, before treeSnapshot) error
 // `.git/hooks/pre-commit`, a `core.fsmonitor` command, or an `ext::` remote
 // would otherwise execute jig-side, with jig's privileges, during the very
 // commands that are supposed to be POLICING the agent. `core.quotepath=off`
-// keeps non-ASCII paths literal to match the `-z` enumeration.
+// keeps non-ASCII paths literal to match the `-z` enumeration. Auto gc and
+// auto maintenance are off so no jig command detaches a background git that
+// rewrites the agent's .git after jig has returned.
 var gitHardening = []string{
 	"-c", "core.hooksPath=/dev/null",
 	"-c", "core.fsmonitor=",
 	"-c", "protocol.ext.allow=never",
 	"-c", "core.quotepath=off",
+	"-c", "gc.auto=0",
+	"-c", "maintenance.auto=false",
 }
 
 // gitEnv is the EXPLICIT environment every jig-side git command runs with —
