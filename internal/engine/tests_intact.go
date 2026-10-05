@@ -53,9 +53,14 @@ type lexStyle struct {
 	backticks       bool // a backtick string: Go raw, JS template
 	backtickEscapes bool // JS templates honor `\`; Go raw strings do not
 	goDirectives    bool // keep `//go:build` and `// +build` lines as tokens
+	goOutput        bool // keep an example's `// Output:` and `// Unordered output:` lines as tokens
 	// regexLiterals: a `/` in expression position opens a regex, so a `/*`
 	// or `#` inside one is not a comment (JS, Ruby).
 	regexLiterals bool
+	// optionStrings keeps what an options object needs from a literal: an
+	// identifier's text (a quoted key), and whether it is empty. Everything
+	// else becomes `"x"`.
+	optionStrings bool
 }
 
 // markerPattern finds one thing that stops tests from running: a skip, a
@@ -79,10 +84,11 @@ type testLanguage struct {
 	lex     lexStyle
 	losses  []lossCount
 	markers []markerPattern
-	// optionMarkers finds a test call's options object (group `opts`):
-	// each marker key set to anything but a falsy literal counts as that
-	// kind, so `test.skip(…)` → `test(…, {skip: true}, …)` is no change.
-	optionMarkers *regexp.Regexp
+	// optionCalls finds a test call's name; every `{…}` argument in its
+	// argument lists is an options object, whose marker keys set to
+	// anything but a falsy literal count as that kind, so `test.skip(…)` →
+	// `test(…, {skip: true}, …)` is no change.
+	optionCalls *regexp.Regexp
 }
 
 const (
@@ -112,12 +118,18 @@ var (
 		},
 	}
 	// langGoTest is a _test.go file, where `go test` also runs examples and
-	// fuzz targets. A named func with no receiver is always top-level.
+	// fuzz targets. A named func with no receiver is always top-level. An
+	// example's `// Output:` line is its assertion: without one it is only
+	// compiled, never run.
 	langGoTest = &testLanguage{
-		lex: langGo.lex,
-		losses: append([]lossCount{{
-			regexp.MustCompile(`\bfunc (Test\w*\(|Example\w*\(\)|Fuzz\w*\(\w+\*testing\.F\))`),
-			"test function(s)", fixTests}}, langGo.losses[1:]...),
+		lex: lexStyle{slashComments: true, backticks: true, goDirectives: true, goOutput: true},
+		losses: []lossCount{
+			{regexp.MustCompile(`\bfunc (Test\w*\(|Example\w*\(\)|Fuzz\w*\(\w+\*testing\.F\))`),
+				"test function(s)", fixTests},
+			{regexp.MustCompile(`\bt\.(Error|Fatal|Fail)|\b(assert|require)\.\w+\(|\x00output\x00`),
+				"assertion(s)", fixAssertions},
+			langGo.losses[2],
+		},
 		markers: langGo.markers,
 	}
 	langJS = &testLanguage{
@@ -134,9 +146,9 @@ var (
 			{regexp.MustCompile(`\b(describe|context|suite|it|test|specify|bench)(\.\w+)*?\.(?P<kind>only|skip|todo|skipIf|runIf|fails)\b`)},
 			{regexp.MustCompile(`(^|[^.\w$])(?P<kind>xit|xdescribe|xtest|xcontext|fit|fdescribe)[.(]`)},
 		},
-		// vitest's options object, second argument: test("…", {skip: true}, fn).
-		optionMarkers: regexp.MustCompile(
-			`(^|[^.\w$])(describe|context|suite|it|test|specify|bench)(\.\w+)*\([^(){},]*,(?P<opts>\{[^{}]*\})`),
+		// vitest's options object, in any argument position:
+		// test("…", {skip: true}, fn), test("…", fn, {skip: true}).
+		optionCalls: regexp.MustCompile(`(^|[^.\w$])(describe|context|suite|it|test|specify|bench)(\.\w+)*`),
 	}
 	langPython = &testLanguage{
 		lex: lexStyle{hashComments: true, tripleQuotes: true},
@@ -177,11 +189,20 @@ var (
 			{regexp.MustCompile(`(^|[^.\w])(?P<kind>skip|pending|xit|xspecify|xexample|xdescribe|xcontext|fit|fdescribe|fcontext|focus)\b`)},
 		},
 	}
-	// optionKey is one marker key in a normalized options object.
-	optionKey   = regexp.MustCompile(`(?:^|[{,])(?P<kind>skip|only|fails|todo):(?P<value>[^,}]*)`)
 	jsExtension = regexp.MustCompile(`\.[cm]?[jt]sx?$`)
 	goDirective = regexp.MustCompile(`^//\s*(go:build|\+build)\b`)
+	// goOutput is how go/doc recognizes an example's expected output.
+	goOutput     = regexp.MustCompile(`(?i)^//\s*(unordered )?output:`)
+	jsIdentifier = regexp.MustCompile(`^[A-Za-z_$][\w$]*$`)
 )
+
+// optionKinds are the options-object keys that stop or invert a test, named
+// as the chain markers name them.
+var optionKinds = map[string]bool{"skip": true, "only": true, "fails": true, "todo": true}
+
+// falsyOptions are the literal values that leave an option off, in the
+// optionStrings normalized form.
+var falsyOptions = map[string]bool{"false": true, "0": true, "null": true, "undefined": true, `""`: true}
 
 func testLanguageOf(file string) *testLanguage {
 	switch {
@@ -216,8 +237,11 @@ func stripCode(src string, style lexStyle) (string, string) {
 		switch {
 		case style.slashComments && strings.HasPrefix(src[i:], "//"):
 			end := lineEnd(src, i)
-			if style.goDirectives && goDirective.MatchString(src[i:end]) {
+			switch {
+			case style.goDirectives && goDirective.MatchString(src[i:end]):
 				out = append(out, " \x00build:"+strings.Join(strings.Fields(src[i+2:end]), " ")+"\x00 "...)
+			case style.goOutput && goOutput.MatchString(src[i:end]):
+				out = append(out, " \x00output\x00 "...)
 			}
 			out = append(out, ' ')
 			i = end
@@ -247,7 +271,7 @@ func stripCode(src string, style lexStyle) (string, string) {
 			i += 3 + end + 3
 		case style.regexLiterals && c == '/' && regexPosition(out, src, i, style.ruby):
 			if end, ok := scanRegex(src, i); ok {
-				out = append(out, `""`...)
+				out = append(out, blankLiteral("/", style)...)
 				i = end
 				continue
 			}
@@ -299,7 +323,11 @@ func stripCode(src string, style lexStyle) (string, string) {
 			if !closed && j >= n {
 				return "", "a string or template literal"
 			}
-			out = append(out, `""`...)
+			content := src[i+1 : j]
+			if closed {
+				content = src[i+1 : j-1]
+			}
+			out = append(out, blankLiteral(content, style)...)
 			i = min(j, n)
 		default:
 			out = append(out, c)
@@ -310,6 +338,19 @@ func stripCode(src string, style lexStyle) (string, string) {
 		return "", "a heredoc"
 	}
 	return string(out), ""
+}
+
+// blankLiteral is what a string or regex literal with the given contents
+// normalizes to: `""`, or under optionStrings `""` when empty, the quoted
+// text of an identifier, and `"x"` otherwise.
+func blankLiteral(content string, style lexStyle) string {
+	switch {
+	case !style.optionStrings || content == "":
+		return `""`
+	case jsIdentifier.MatchString(content):
+		return `"` + content + `"`
+	}
+	return `"x"`
 }
 
 // regexKeywords end an expression's left side: a `/` after one opens a regex.
@@ -486,6 +527,12 @@ func (l *testLanguage) normalizeLine(src string) string {
 	return normalized
 }
 
+// lineKinds counts marker kinds on one line out of context, for line
+// numbers only.
+func (l *testLanguage) lineKinds(src string) map[string]int {
+	return l.markerKinds(l.normalizeLine(src), src)
+}
+
 // uninspectableText names why content cannot be read as source text: a NUL
 // byte, or a UTF-16/UTF-32 byte-order mark (those encodings put NULs
 // between the ASCII a pattern looks for, so nothing would match).
@@ -500,8 +547,8 @@ func uninspectableText(content string) string {
 	return ""
 }
 
-// markerKinds counts each marker kind in normalized text.
-func (l *testLanguage) markerKinds(normalized string) map[string]int {
+// markerKinds counts each marker kind in src, given its normalized form.
+func (l *testLanguage) markerKinds(normalized, src string) map[string]int {
 	kinds := map[string]int{}
 	for _, marker := range l.markers {
 		kindIndex := marker.re.SubexpIndex("kind")
@@ -513,19 +560,106 @@ func (l *testLanguage) markerKinds(normalized string) map[string]int {
 			kinds[kind]++
 		}
 	}
-	if l.optionMarkers != nil {
-		opts := l.optionMarkers.SubexpIndex("opts")
-		for _, match := range l.optionMarkers.FindAllStringSubmatch(normalized, -1) {
-			for _, option := range optionKey.FindAllStringSubmatch(match[opts], -1) {
-				switch option[2] {
-				case "false", "0", "null", "undefined":
-				default:
-					kinds[option[1]]++
+	if l.optionCalls != nil {
+		l.countOptions(src, kinds)
+	}
+	return kinds
+}
+
+// countOptions adds the marker keys of every options object passed to a
+// test call. It reads its own normalized form, one that keeps quoted keys
+// and empty strings, and finds each argument by balanced-bracket scanning,
+// so an object counts in any position and after any first argument. A
+// construct left open only costs a line its number: compare has already
+// failed the file on one.
+func (l *testLanguage) countOptions(src string, kinds map[string]int) {
+	style := l.lex
+	style.optionStrings = true
+	stripped, _ := stripCode(src, style)
+	text := collapseSpace(stripped)
+	for _, call := range l.optionCalls.FindAllStringIndex(text, -1) {
+		for _, args := range callArguments(text, call[1]) {
+			for _, arg := range splitTopLevel(args) {
+				if !strings.HasPrefix(arg, "{") || closingBracket(arg, 0) != len(arg)-1 {
+					continue
+				}
+				for _, entry := range splitTopLevel(arg[1 : len(arg)-1]) {
+					key, value, ok := strings.Cut(entry, ":")
+					if !ok {
+						continue // shorthand, spread, or a method: not read
+					}
+					if unquoted, err := strconv.Unquote(key); err == nil {
+						key = unquoted
+					}
+					if optionKinds[key] && !falsyOptions[value] {
+						kinds[key]++
+					}
 				}
 			}
 		}
 	}
-	return kinds
+}
+
+// callArguments lists the argument lists of the call chain at text[at]: one
+// for test(…), two for test.each(…)(…). A list never closed runs to the end
+// of text, which is how a single line out of context reads.
+func callArguments(text string, at int) []string {
+	var lists []string
+	for at < len(text) {
+		switch text[at] {
+		case '(':
+			end := closingBracket(text, at)
+			lists = append(lists, text[at+1:min(end, len(text))])
+			at = end + 1
+		case '.':
+			at++
+			for at < len(text) && isWordByte(text[at]) {
+				at++
+			}
+		default:
+			return lists
+		}
+	}
+	return lists
+}
+
+// closingBracket is the index of the bracket closing the one at text[open],
+// or len(text) when none does. Normalized text holds no brackets inside
+// literals, so depth alone is exact.
+func closingBracket(text string, open int) int {
+	depth := 0
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return len(text)
+}
+
+// splitTopLevel splits s at the commas outside any bracket.
+func splitTopLevel(s string) []string {
+	var parts []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, s[start:])
 }
 
 // diffLine is one added or removed line. For an added line, line is its
@@ -950,7 +1084,7 @@ func (j *intactJudge) compare(name, before, after string, file *fileDiff) {
 		j.report.Check(findingItem(name, lineOf(lang, file.removed, loss.re)), false, fmt.Sprintf(
 			"net loss of %d %s (%d at base %s, %d now); %s", was-is, loss.what, was, j.base, is, loss.fix))
 	}
-	oldKinds, nowKinds := lang.markerKinds(old), lang.markerKinds(now)
+	oldKinds, nowKinds := lang.markerKinds(old, before), lang.markerKinds(now, after)
 	// One finding per line: `pytestmark = pytest.mark.skip` gains two kinds
 	// but is one thing to remove.
 	reported := map[int]bool{}
@@ -1004,13 +1138,13 @@ func lineOf(lang *testLanguage, lines []diffLine, re *regexp.Regexp) int {
 func markerLines(lang *testLanguage, file *fileDiff, kind string) []diffLine {
 	removed := map[string]int{}
 	for _, line := range file.removed {
-		if lang.markerKinds(lang.normalizeLine(line.text))[kind] > 0 {
+		if lang.lineKinds(line.text)[kind] > 0 {
 			removed[strings.TrimSpace(line.text)]++
 		}
 	}
 	var fresh, moved []diffLine
 	for _, line := range file.added {
-		if lang.markerKinds(lang.normalizeLine(line.text))[kind] == 0 {
+		if lang.lineKinds(line.text)[kind] == 0 {
 			continue
 		}
 		text := strings.TrimSpace(line.text)

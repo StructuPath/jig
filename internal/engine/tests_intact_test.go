@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,6 +83,25 @@ func FuzzOne(f *testing.F) {
 func (helper) ExampleMethod() {}
 `
 
+// goOutputExamples holds examples whose expected output is their assertion.
+const goOutputExamples = `package a
+
+import "fmt"
+
+func ExampleHello() {
+	fmt.Println("hello")
+	// Output: hello
+}
+
+func ExampleOrder() {
+	fmt.Println("a")
+	fmt.Println("b")
+	// Unordered output:
+	// b
+	// a
+}
+`
+
 // rbRegexSpec holds a heredoc whose `=begin` line is text, not a block
 // comment, and `#` inside regex literals, which is not a comment either.
 const rbRegexSpec = `describe C do
@@ -146,6 +166,7 @@ end
 var testsIntactBase = map[string]string{
 	"pkg/a_test.go":             goTests,
 	"pkg/example_test.go":       goExamples,
+	"pkg/output_test.go":        goOutputExamples,
 	"tests/fixtures/example.go": goExamples,
 	"pkg/skip_test.go":          goSkipped,
 	"pkg/main_test.go":          goMain,
@@ -565,7 +586,7 @@ func TestTestsIntactFlagsWeakenedTestsAndPassesHonestChanges(t *testing.T) {
 		// Go examples and fuzz targets are tests in a _test.go file only.
 		{name: "a Go Example removed",
 			uncommitted: &intactEdit{write: replace("pkg/example_test.go", "func ExampleOne() {\n\t// Output:\n}\n", "")},
-			want:        []string{"pkg/example_test.go test function"}},
+			want:        []string{"pkg/example_test.go assertion", "pkg/example_test.go test function"}},
 		{name: "a Go fuzz target removed",
 			uncommitted: &intactEdit{write: replace("pkg/example_test.go",
 				"func FuzzOne(f *testing.F) {\n\tf.Fuzz(func(t *testing.T, s string) {})\n}\n", "")},
@@ -666,6 +687,111 @@ func TestTestsIntactLexesRegexAfterArrow(t *testing.T) {
 			got, open := langJS.normalize(tc.src)
 			if open != "" || got != tc.want {
 				t.Fatalf("normalize = %q (open %q), want %q", got, open, tc.want)
+			}
+		})
+	}
+}
+
+// intactRunner commits the base fixtures once and judges each later edit
+// against them; one file is rewritten per call, so cases run in sequence.
+func intactRunner(t *testing.T) func(t *testing.T, edit map[string]string) []string {
+	dir, base := testsIntactRepo(t)
+	return func(t *testing.T, edit map[string]string) []string {
+		t.Helper()
+		for name := range testsIntactBase {
+			writeIntactFile(t, dir, name, testsIntactBase[name])
+		}
+		applyIntactEdit(t, dir, &intactEdit{write: edit})
+		return intactViolations(gateTestsIntact(gateContext{ctx: context.Background(), worktree: dir, baseSHA: base}))
+	}
+}
+
+// A vitest options object stops a test wherever it sits in the argument
+// list, whatever the first argument is, and whether its key is quoted.
+func TestTestsIntactOptionsObjectMarkers(t *testing.T) {
+	run := intactRunner(t)
+	forms := []string{
+		`%s("x", { %s: true }, fn);`,
+		`%s("x", fn, { %s: true });`,
+		`%s(makeName(), { %s: true }, fn);`,
+		`%s("x", { "%s": true }, fn);`,
+		`%s("x", { '%s': true }, fn);`,
+		`%s.each([1])("x %%i", { %s: true }, fn);`,
+		"%s(\"x\", {\n  timeout: 5,\n  %s: 1,\n}, () => {\n  expect(1).toBe(1);\n});",
+	}
+	for _, call := range []string{"test", "it", "describe"} {
+		for _, kind := range []string{"skip", "only", "fails", "todo"} {
+			for _, form := range forms {
+				line := fmt.Sprintf(form, call, kind)
+				t.Run(line, func(t *testing.T) {
+					got := run(t, map[string]string{"src/a.test.ts": jsTests + line + "\n"})
+					if want := []string{"src/a.test.ts skip"}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+						t.Fatalf("violations = %q, want %q", got, want)
+					}
+				})
+			}
+		}
+	}
+}
+
+// A falsy option leaves the test running, and option syntax inside a string
+// is text.
+func TestTestsIntactOptionsObjectFalsyAndStrings(t *testing.T) {
+	run := intactRunner(t)
+	for _, line := range []string{
+		`test("x", { skip: false }, fn);`,
+		`test("x", { skip: 0 }, fn);`,
+		`test("x", { skip: null }, fn);`,
+		`test("x", { skip: undefined }, fn);`,
+		`test("x", { skip: "" }, fn);`,
+		`test("x", { skip: '' }, fn);`,
+		`test("x", fn, { "only": false });`,
+		`test("x, { skip: true }", fn);`,
+		`test("x", fn, "{ skip: true }");`,
+		`test("x", { name: "skip: true" }, fn);`,
+		`it("x", () => { const o = { skip: true }; expect(o).toBeTruthy(); });`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			if got := run(t, map[string]string{"src/a.test.ts": jsTests + line + "\n"}); len(got) > 0 {
+				t.Fatalf("violations = %q, want none", got)
+			}
+		})
+	}
+}
+
+// An example's `// Output:` line is its assertion: deleting it leaves an
+// example that is compiled and never run.
+func TestTestsIntactGoExampleOutput(t *testing.T) {
+	run := intactRunner(t)
+	replace := func(old, new string) map[string]string {
+		edited := strings.Replace(goOutputExamples, old, new, 1)
+		if edited == goOutputExamples {
+			t.Fatalf("%q is not in the fixture", old)
+		}
+		return map[string]string{"pkg/output_test.go": edited}
+	}
+	cases := []struct {
+		name string
+		edit map[string]string
+		want []string
+	}{
+		{"an Output line deleted", replace("\t// Output: hello\n", ""),
+			[]string{"pkg/output_test.go assertion"}},
+		{"an Unordered output line deleted", replace("\t// Unordered output:\n", ""),
+			[]string{"pkg/output_test.go assertion"}},
+		{"an example with output turned into an empty test",
+			replace("func ExampleHello() {\n\tfmt.Println(\"hello\")\n\t// Output: hello\n}",
+				"func TestHello(t *testing.T) {}"),
+			[]string{"pkg/output_test.go assertion"}},
+		{"the expected output edited, its line kept",
+			replace("\tfmt.Println(\"hello\")\n\t// Output: hello\n", "\tfmt.Println(\"hello, world\")\n\t// Output: hello, world\n"),
+			nil},
+		{"the unordered output reordered", replace("\t// b\n\t// a\n", "\t// a\n\t// b\n"), nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := run(t, tc.edit); strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("violations = %q, want %q", got, tc.want)
 			}
 		})
 	}

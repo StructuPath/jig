@@ -203,10 +203,15 @@ Rules worth knowing before you write one:
   whitespace collapsed so a token split across lines rejoins), then tests,
   assertions, and markers are counted. It fails when a test file is
   deleted, ends with fewer tests (Go `Example` and `Fuzz` functions in a
-  `_test.go` file included), assertions, or `m.Run(` calls, or with
+  `_test.go` file included), assertions (a Go example's `// Output:` or
+  `// Unordered output:` line included, so deleting expected output is a
+  loss), or `m.Run(` calls, or with
   more of any marker that stops tests running: a skip or focus (`t.Skip`,
-  `test.only.each`, a vitest options object such as `test("…", {skip:
-  true}, fn)` with `skip`, `only`, `fails`, or `todo`, `mark.skip` in any
+  `test.only.each`, a vitest options object with `skip`, `only`, `fails`,
+  or `todo` set to anything but `false`, `0`, `null`, `undefined`, or
+  `""` — in any argument position, after any first argument, through
+  `.each(…)(…)`, with the key bare or quoted, as in `test("…", {skip:
+  true}, fn)` or `test(name(), fn, {"only": 1})`, `mark.skip` in any
   form, `pytest.importorskip(`, `xit`, RSpec `skip: true` or `:focus`), a
   `//go:build` constraint, an added
   `TestMain` or `os.Exit(`, `pytestmark`, `__test__ = False`, an aliased
@@ -238,7 +243,10 @@ Rules worth knowing before you write one:
   an exotic string escape, an existing marker whose arguments are widened
   (`skipif(False)` → `skipif(True)`, edited `collect_ignore` contents,
   `if testing.Short()` → `if true`), arithmetic that keeps `m.Run(` but
-  discards its result, `pytest.exit(..., 0)`, or changes inside
+  discards its result, `pytest.exit(..., 0)`, vitest options passed
+  through a variable (`const opts = {skip: true}`), spread (`{...opts}`)
+  or nested in another object, or written as `{ skip }` shorthand, a
+  gutted `f.Fuzz(...)` body, or changes inside
   submodules — the reviewers and the risk classifier are the check there.
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
