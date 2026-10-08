@@ -88,10 +88,16 @@ type DefinitionSpec struct {
 	// BuildOutputs names the directories any role — `writes: []` reviewers
 	// and parallel-group members included — may write without breaching the
 	// write boundary, so a read-only role can run the repository's own check
-	// command (`go build -o bin/...`). Every entry is a directory grant:
-	// `<dir>/**` (glob characters allowed before the `/**`) or a literal
-	// `<dir>/`. A path is a build output only while it is NOT tracked in
-	// HEAD; tracked files and git metadata are never covered.
+	// command (`go build -o bin/...`). Every entry is a directory grant of
+	// exactly one shape, `<dir>` literal: `<dir>/**`, `**/<dir>/**` (matches
+	// the directory at the root and nested), or `<dir>/`. A grant covers
+	// gitignored paths only: a path under a grant that is not gitignored is
+	// ordinary repository content judged by `writes` (for `writes: []`, a
+	// breach saying so). A grant matches a path as git enumerates it — a
+	// wholly-ignored directory is one `dir/` entry — so declare the directory
+	// git ignores: with `cache/` ignored, `cache/**` covers `cache/bin/x`
+	// but `cache/bin/**` does not. A path tracked in HEAD is never an
+	// output, and git metadata is never covered.
 	//
 	// Scope: the grant governs how the write boundary classifies untracked
 	// paths and, through it, the engine-computed changed paths jig stages
@@ -861,22 +867,26 @@ func validateGateAllow(gate GateSpec) error {
 }
 
 // validateBuildOutputs checks the build_outputs grant at save time. Every
-// entry must be a DIRECTORY grant, because the write boundary sees a
-// wholly-ignored directory as one collapsed `dir/` entry: a file-level
-// pattern (`bin/*.o`) could never match that entry for an ignored file while
-// matching the same file unignored, so ignored and unignored would disagree.
-// A directory grant ends in `/**` (glob characters allowed before it) or is
-// a literal `dir/` with no glob character — a trailing-slash pattern is a
-// literal prefix, never a wildcard. Whether a path is tracked in HEAD is
-// decided at enforcement time, not here.
+// entry must be a DIRECTORY grant of exactly one of three shapes —
+// `<literal>/**`, `**/<literal>/**`, or `<literal>/` — because the write
+// boundary sees a wholly-ignored directory as one collapsed `dir/` entry and
+// a grant is honoured only when it matches the path as git enumerates it. A
+// file-level pattern (`bin/*.o`) or an interior wildcard (`*/bin/**`,
+// `b?n/**`) could match a file while missing the collapsed entry that holds
+// it, so ignored and unignored would disagree. Whitespace around an entry is
+// refused, not trimmed: validation and matching must see one string.
+// Whether a path is gitignored or tracked in HEAD is decided at enforcement
+// time, not here.
 func (spec *DefinitionSpec) validateBuildOutputs() error {
-	for _, raw := range spec.BuildOutputs {
-		pattern := strings.TrimSpace(raw)
+	for _, pattern := range spec.BuildOutputs {
 		if pattern == "" {
-			return fmt.Errorf("build_outputs: %q: entries must be non-empty directory patterns", raw)
+			return fmt.Errorf("build_outputs: %q: entries must be non-empty directory patterns", pattern)
+		}
+		if pattern != strings.TrimSpace(pattern) {
+			return fmt.Errorf("build_outputs: %q: must not have leading or trailing whitespace", pattern)
 		}
 		if err := validateBuildOutput(pattern); err != nil {
-			return fmt.Errorf("build_outputs: %q: %w", raw, err)
+			return fmt.Errorf("build_outputs: %q: %w", pattern, err)
 		}
 	}
 	return nil
@@ -903,18 +913,21 @@ func validateBuildOutput(pattern string) error {
 	if strings.Trim(pattern, "*?/") == "" {
 		return fmt.Errorf("must name at least one literal character; a pattern of only globs grants everything")
 	}
+	literal := pattern
 	switch {
 	case strings.HasSuffix(pattern, "/**"):
-		return nil
+		literal = strings.TrimPrefix(strings.TrimSuffix(pattern, "/**"), "**/")
 	case strings.HasSuffix(pattern, "/"):
-		if strings.ContainsAny(pattern, "*?") {
-			return fmt.Errorf("a trailing-slash pattern is a literal directory prefix; " +
-				"use `<dir>/**` for a wildcard directory")
-		}
-		return nil
+		literal = strings.TrimSuffix(pattern, "/")
 	default:
-		return fmt.Errorf("must be a directory grant ending in `/**` or `/`; file-level patterns are refused")
+		return fmt.Errorf("must be a directory grant `<dir>/**`, `**/<dir>/**`, or `<dir>/`; " +
+			"file-level patterns are refused")
 	}
+	if literal == "" || strings.ContainsAny(literal, "*?") {
+		return fmt.Errorf("must be exactly `<dir>/**`, `**/<dir>/**`, or `<dir>/` with a literal `<dir>`; " +
+			"wildcards elsewhere cannot match a collapsed ignored directory")
+	}
+	return nil
 }
 
 func builtinGateNames() []string {

@@ -394,14 +394,15 @@ func TestBuildOutputsAreParsedAndRetained(t *testing.T) {
 }
 
 func TestBuildOutputsAreValidatedAtSaveTime(t *testing.T) {
-	for _, accepted := range []string{"bin/**", "out/", "**/__pycache__/**", "*/bin/**"} {
+	for _, accepted := range []string{"bin/**", "out/", "**/__pycache__/**", "a/b/**"} {
 		t.Run("accepts "+accepted, func(t *testing.T) {
 			mustParse(t, buildOutputsBase+fmt.Sprintf("build_outputs: [%q]\n", accepted))
 		})
 	}
 	for _, rejected := range []string{
-		"", "   ", "bin\x00/**", "bin\n/**", "/abs/**", "../x/**", "a/../b/**", "-x/**", ":x/**",
-		".git/**", "x/.git/**", "**", "*", "**/*", "*/", "bin/*.o", "**/*.o", "bin/*/", "bin",
+		"", "   ", " bin/**", "bin/** ", "bin\x00/**", "bin\n/**", "/abs/**", "../x/**", "a/../b/**",
+		"-x/**", ":x/**", ".git/**", "x/.git/**", "**", "*", "**/*", "*/", "bin/*.o", "**/*.o",
+		"bin/*/", "*/bin/**", "a/*/b/**", "b?n/**", "bin",
 	} {
 		t.Run(fmt.Sprintf("rejects %q", rejected), func(t *testing.T) {
 			// JSON string syntax is a valid YAML double-quoted scalar, so

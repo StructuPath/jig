@@ -946,6 +946,7 @@ func payloadStrings(payload map[string]any, key string) []string {
 func TestAMemberMayWriteDeclaredBuildOutputsAndNothingElse(t *testing.T) {
 	t.Run("only an output", func(t *testing.T) {
 		f := newRepairFixture(t, panelSnapshot(nil, panelGroup)+buildOutputsLine, nil)
+		ignoreBin(t, f.repo)
 		reviewer := approve("correct", nil)
 		reviewer.Files = map[string]string{"bin/jig": "a reviewer ran the build"}
 		f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
@@ -965,8 +966,8 @@ func TestAMemberMayWriteDeclaredBuildOutputsAndNothingElse(t *testing.T) {
 		if _, hasRole := payload["role"]; hasRole {
 			t.Fatalf("payload = %v, want no role: one snapshot cannot attribute a write", payload)
 		}
-		if paths := payloadStrings(payload, "paths"); !contains(paths, "bin/jig") {
-			t.Fatalf("paths = %v, want bin/jig", paths)
+		if paths := payloadStrings(payload, "paths"); !contains(paths, "bin/") {
+			t.Fatalf("paths = %v, want the collapsed bin/", paths)
 		}
 		if _, err := os.Stat(filepath.Join(f.repo, "bin/jig")); err != nil {
 			t.Fatalf("the build output did not survive the group: %v", err)
@@ -974,6 +975,7 @@ func TestAMemberMayWriteDeclaredBuildOutputsAndNothingElse(t *testing.T) {
 	})
 	t.Run("an output and a stray write", func(t *testing.T) {
 		f := newRepairFixture(t, panelSnapshot(nil, panelGroup)+buildOutputsLine, nil)
+		ignoreBin(t, f.repo)
 		sneaky := approve("correct", nil)
 		sneaky.Files = map[string]string{"bin/jig": "a reviewer ran the build", "notes.txt": "scratch"}
 		f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
@@ -989,8 +991,8 @@ func TestAMemberMayWriteDeclaredBuildOutputsAndNothingElse(t *testing.T) {
 			t.Fatalf("error %q names the declared build output as a breach", outcome.Error)
 		}
 		payload := groupEventPayload(t, f.sink, protocol.EventError, "write_boundary_breach")
-		if outputs := payloadStrings(payload, "build_outputs"); !contains(outputs, "bin/jig") {
-			t.Fatalf("breach payload build_outputs = %v, want bin/jig", outputs)
+		if outputs := payloadStrings(payload, "build_outputs"); !contains(outputs, "bin/") {
+			t.Fatalf("breach payload build_outputs = %v, want the collapsed bin/", outputs)
 		}
 	})
 }
@@ -999,6 +1001,7 @@ func TestAMemberMayWriteDeclaredBuildOutputsAndNothingElse(t *testing.T) {
 // nothing back, and the group's one enforcement passes declared outputs.
 func TestADeadMembersBuildOutputsSurviveTheGroup(t *testing.T) {
 	f := newRepairFixture(t, panelSnapshot(nil, panelGroup)+buildOutputsLine, nil)
+	ignoreBin(t, f.repo)
 	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
 	f.fake.Route(correctnessRole,
 		enginetest.Step{Crash: true, Files: map[string]string{"bin/x": "half a build"}},
@@ -1021,6 +1024,7 @@ func TestADeadMembersBuildOutputsSurviveTheGroup(t *testing.T) {
 
 func TestAPanickingGroupReportsBuildOutputsBesideBreaches(t *testing.T) {
 	f := newRepairFixture(t, panelSnapshot(nil, twoMemberGroup)+buildOutputsLine, nil)
+	ignoreBin(t, f.repo)
 	correctnessStarted := make(chan struct{})
 	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
 	f.fake.Route(correctnessRole, enginetest.Step{Hang: true, Started: correctnessStarted,
@@ -1039,8 +1043,8 @@ func TestAPanickingGroupReportsBuildOutputsBesideBreaches(t *testing.T) {
 		t.Fatalf("Execute recovered %v, want the member's panic re-raised", recovered)
 	}
 	payload := groupEventPayload(t, f.sink, protocol.EventError, "parallel_group_panic")
-	if outputs := payloadStrings(payload, "build_outputs"); !contains(outputs, "bin/jig") {
-		t.Fatalf("panic payload build_outputs = %v, want bin/jig", outputs)
+	if outputs := payloadStrings(payload, "build_outputs"); !contains(outputs, "bin/") {
+		t.Fatalf("panic payload build_outputs = %v, want the collapsed bin/", outputs)
 	}
 	breaches, _ := payload["breaches"].([]any)
 	found := false

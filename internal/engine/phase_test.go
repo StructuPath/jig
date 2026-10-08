@@ -2268,6 +2268,22 @@ acceptance: [all_phases_passed]
 
 const buildOutputsLine = "build_outputs: [\"bin/**\"]\n"
 
+// ignoreBin commits a .gitignore listing bin/, so a grant covers it and a
+// wholly-untracked bin/ is the one collapsed entry git enumerates.
+func ignoreBin(t *testing.T, repo string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("bin/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", ".gitignore"}, {"commit", "--quiet", "-m", "ignore bin"}} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+}
+
 // outputsTouched returns the paths of every build_outputs_touched event the
 // phase emitted, and whether each carried the role that wrote them.
 func outputsTouched(t *testing.T, sink *recordingSink, phase string) (paths []string, roles []string) {
@@ -2304,6 +2320,7 @@ func TestBuildOutputsAreExcludedFromChangedPathsForEveryAllowlist(t *testing.T) 
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			repo := initRepo(t)
+			ignoreBin(t, repo)
 			checkFiles := map[string]string{"bin/check": "check build"}
 			want := []string{"src/app.txt"}
 			if c.legitimate {
@@ -2335,12 +2352,12 @@ acceptance: [all_phases_passed]
 			if got := changedPaths(t, outcome.Result); strings.Join(got, ",") != strings.Join(want, ",") {
 				t.Fatalf("changed_paths = %v, want %v (no build output)", got, want)
 			}
-			if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/jig") {
-				t.Fatalf("build's build_outputs_touched = %v, want bin/jig", paths)
+			if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/") {
+				t.Fatalf("build's build_outputs_touched = %v, want the collapsed bin/", paths)
 			}
 			paths, roles := outputsTouched(t, sink, "check")
-			if !contains(paths, "bin/check") || !contains(roles, "checker") {
-				t.Fatalf("check's build_outputs_touched = %v by %v, want bin/check by checker", paths, roles)
+			if !contains(paths, "bin/") || !contains(roles, "checker") {
+				t.Fatalf("check's build_outputs_touched = %v by %v, want bin/ by checker", paths, roles)
 			}
 			if sink.has(protocol.EventError, "write_boundary_breach") {
 				t.Fatal("a declared build output raised a write_boundary_breach")
@@ -2354,6 +2371,7 @@ acceptance: [all_phases_passed]
 func TestBuildOutputsTouchedIsTracedOnFailedAndCancelledExits(t *testing.T) {
 	t.Run("gate exhaustion", func(t *testing.T) {
 		repo := initRepo(t)
+		ignoreBin(t, repo)
 		claim := envelope(map[string]any{"status": "success", "summary": "wrote out.txt",
 			"artifacts": []any{"out.txt"}})
 		fake := enginetest.New(
@@ -2377,12 +2395,13 @@ phases:
 		if strings.Contains(outcome.Error, "outside its write allowlist") {
 			t.Fatalf("error %q reports a breach for a declared build output", outcome.Error)
 		}
-		if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/jig") {
-			t.Fatalf("build_outputs_touched = %v on the failure exit, want bin/jig", paths)
+		if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/") {
+			t.Fatalf("build_outputs_touched = %v on the failure exit, want the collapsed bin/", paths)
 		}
 	})
 	t.Run("cancellation", func(t *testing.T) {
 		repo := initRepo(t)
+		ignoreBin(t, repo)
 		fake := enginetest.New(enginetest.Step{Files: map[string]string{"bin/jig": "binary"}, Hang: true})
 		cancelled := make(chan struct{})
 		go func() {
@@ -2401,8 +2420,8 @@ phases:
 		if outcome.State != protocol.AttemptCancelled {
 			t.Fatalf("state = %q (%s), want cancelled", outcome.State, outcome.Error)
 		}
-		if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/jig") {
-			t.Fatalf("build_outputs_touched = %v on the cancellation exit, want bin/jig", paths)
+		if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/") {
+			t.Fatalf("build_outputs_touched = %v on the cancellation exit, want the collapsed bin/", paths)
 		}
 	})
 }
@@ -2411,6 +2430,7 @@ phases:
 // would push, so it ends the repair (resume.go's no-change rule).
 func TestAnOutputOnlyCIRepairRoundEndsNoChange(t *testing.T) {
 	f := newRepairFixture(t, ciRepairSnapshot+buildOutputsLine, nil, chainSteps()...)
+	ignoreBin(t, f.repo)
 	continuation := f.execute(t).Continuation
 	if continuation == nil {
 		t.Fatal("the chain kept no continuation")
@@ -2422,7 +2442,7 @@ func TestAnOutputOnlyCIRepairRoundEndsNoChange(t *testing.T) {
 	if round.State != protocol.AttemptAcceptedUnpublished || !strings.Contains(round.Error, "ci_repair_no_change") {
 		t.Fatalf("round = %+v, want accepted with ci_repair_no_change", round)
 	}
-	if paths, _ := outputsTouched(t, f.sink, "build"); !contains(paths, "bin/jig") {
-		t.Fatalf("build_outputs_touched = %v in the round, want bin/jig", paths)
+	if paths, _ := outputsTouched(t, f.sink, "build"); !contains(paths, "bin/") {
+		t.Fatalf("build_outputs_touched = %v in the round, want the collapsed bin/", paths)
 	}
 }
