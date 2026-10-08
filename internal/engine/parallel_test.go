@@ -912,6 +912,148 @@ func contains(items []string, want string) bool {
 	return false
 }
 
+// groupEventPayload decodes the payload of the first group-level (phaseless)
+// event of the given type and name.
+func groupEventPayload(t *testing.T, sink *recordingSink, eventType, name string) map[string]any {
+	t.Helper()
+	for _, event := range sink.all() {
+		if event.Type == eventType && event.Name == name && event.Phase == "" {
+			var payload map[string]any
+			if err := json.Unmarshal(event.Payload, &payload); err != nil {
+				t.Fatalf("%s payload does not parse: %v", name, err)
+			}
+			return payload
+		}
+	}
+	t.Fatalf("no group-level %s event", name)
+	return nil
+}
+
+func payloadStrings(payload map[string]any, key string) []string {
+	items, _ := payload[key].([]any)
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		if value, ok := item.(string); ok {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+// Members are read-only apart from the definition's declared build outputs.
+// The group takes one snapshot, so the outputs it reports carry the group,
+// never a role.
+func TestAMemberMayWriteDeclaredBuildOutputsAndNothingElse(t *testing.T) {
+	t.Run("only an output", func(t *testing.T) {
+		f := newRepairFixture(t, panelSnapshot(nil, panelGroup)+buildOutputsLine, nil)
+		reviewer := approve("correct", nil)
+		reviewer.Files = map[string]string{"bin/jig": "a reviewer ran the build"}
+		f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+		f.fake.Route(correctnessRole, reviewer)
+		f.fake.Route(securityRole, approve("secure", nil))
+		f.fake.Route(maintainabilityRole, approve("maintainable", nil))
+		f.fake.Route(closerRole, success("wrapped up", nil))
+
+		outcome := executeWithin(t, f, 20*time.Second)
+		if outcome.State != protocol.AttemptAcceptedUnpublished {
+			t.Fatalf("outcome = %s (%s), want accepted", outcome.State, outcome.Error)
+		}
+		payload := groupEventPayload(t, f.sink, protocol.EventLog, "build_outputs_touched")
+		if _, hasGroup := payload["parallel_group"]; !hasGroup {
+			t.Fatalf("payload = %v, want parallel_group", payload)
+		}
+		if _, hasRole := payload["role"]; hasRole {
+			t.Fatalf("payload = %v, want no role: one snapshot cannot attribute a write", payload)
+		}
+		if paths := payloadStrings(payload, "paths"); !contains(paths, "bin/jig") {
+			t.Fatalf("paths = %v, want bin/jig", paths)
+		}
+		if _, err := os.Stat(filepath.Join(f.repo, "bin/jig")); err != nil {
+			t.Fatalf("the build output did not survive the group: %v", err)
+		}
+	})
+	t.Run("an output and a stray write", func(t *testing.T) {
+		f := newRepairFixture(t, panelSnapshot(nil, panelGroup)+buildOutputsLine, nil)
+		sneaky := approve("correct", nil)
+		sneaky.Files = map[string]string{"bin/jig": "a reviewer ran the build", "notes.txt": "scratch"}
+		f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+		f.fake.Route(correctnessRole, sneaky)
+		f.fake.Route(securityRole, approve("secure", nil))
+		f.fake.Route(maintainabilityRole, approve("maintainable", nil))
+
+		outcome := executeWithin(t, f, 20*time.Second)
+		if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "notes.txt") {
+			t.Fatalf("outcome = %s (%s), want failed on a breach naming notes.txt", outcome.State, outcome.Error)
+		}
+		if strings.Contains(outcome.Error, "bin/") {
+			t.Fatalf("error %q names the declared build output as a breach", outcome.Error)
+		}
+		payload := groupEventPayload(t, f.sink, protocol.EventError, "write_boundary_breach")
+		if outputs := payloadStrings(payload, "build_outputs"); !contains(outputs, "bin/jig") {
+			t.Fatalf("breach payload build_outputs = %v, want bin/jig", outputs)
+		}
+	})
+}
+
+// Outputs a dead member wrote survive the group: a member's death rolls
+// nothing back, and the group's one enforcement passes declared outputs.
+func TestADeadMembersBuildOutputsSurviveTheGroup(t *testing.T) {
+	f := newRepairFixture(t, panelSnapshot(nil, panelGroup)+buildOutputsLine, nil)
+	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+	f.fake.Route(correctnessRole,
+		enginetest.Step{Crash: true, Files: map[string]string{"bin/x": "half a build"}},
+		approve("correct", nil))
+	f.fake.Route(securityRole, approve("secure", nil))
+	f.fake.Route(maintainabilityRole, approve("maintainable", nil))
+	f.fake.Route(closerRole, success("wrapped up", nil))
+
+	outcome := executeWithin(t, f, 20*time.Second)
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("outcome = %s (%s), want accepted", outcome.State, outcome.Error)
+	}
+	if _, err := os.Stat(filepath.Join(f.repo, "bin/x")); err != nil {
+		t.Fatalf("the dead member's build output did not survive: %v", err)
+	}
+	if f.sink.has(protocol.EventError, "write_boundary_breach") {
+		t.Fatal("a dead member's declared build output raised a breach")
+	}
+}
+
+func TestAPanickingGroupReportsBuildOutputsBesideBreaches(t *testing.T) {
+	f := newRepairFixture(t, panelSnapshot(nil, twoMemberGroup)+buildOutputsLine, nil)
+	correctnessStarted := make(chan struct{})
+	f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built the app"))
+	f.fake.Route(correctnessRole, enginetest.Step{Hang: true, Started: correctnessStarted,
+		Files: map[string]string{"planted.txt": "written before the crash", "bin/jig": "binary"}})
+	f.fake.Route(securityRole, enginetest.Step{Do: func(enginetest.Call) {
+		<-correctnessStarted
+		panic("runtime blew up")
+	}})
+
+	recovered := func() (value any) {
+		defer func() { value = recover() }()
+		f.runner.Execute(context.Background(), f.attempt)
+		return nil
+	}()
+	if recovered != "runtime blew up" {
+		t.Fatalf("Execute recovered %v, want the member's panic re-raised", recovered)
+	}
+	payload := groupEventPayload(t, f.sink, protocol.EventError, "parallel_group_panic")
+	if outputs := payloadStrings(payload, "build_outputs"); !contains(outputs, "bin/jig") {
+		t.Fatalf("panic payload build_outputs = %v, want bin/jig", outputs)
+	}
+	breaches, _ := payload["breaches"].([]any)
+	found := false
+	for _, item := range breaches {
+		if entry, ok := item.(map[string]any); ok && entry["path"] == "planted.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("panic payload breaches = %v, want planted.txt", breaches)
+	}
+}
+
 // A member HOME that cannot be wiped keeps the chain from being handed to
 // a round, exactly as the chain's own HOME does.
 func TestAnUnwipeableMemberHomeIsNeverHandedToARound(t *testing.T) {

@@ -29,6 +29,15 @@
 // git invocations, which run here with hooks, fsmonitor, and the ext
 // transport switched off under an explicit environment.
 //
+// A definition's `build_outputs` names directories every role may write —
+// read-only reviewers included — so a role can run the repository's own
+// check command without breaching on `bin/`. A changed path is a build
+// output iff a grant matches it AND it is not tracked in HEAD; outputs are
+// classified before the allowlist for every role, so they never become
+// touched paths and jig never stages one. The grant is a separate parameter,
+// never folded into `writes` (whose nil means unrestricted), and it is never
+// consulted for git metadata, which stays outside every allowlist.
+//
 // A breach is not a gate violation: gates are for work an agent can be asked
 // to redo, while a breached write already happened. Out-of-allowlist changes
 // the agent introduced are rolled back, then the ATTEMPT aborts — never
@@ -440,18 +449,75 @@ func rollBackGitMeta(path string, before fingerprint) string {
 	return "deleted"
 }
 
+// headPaths is the set of every path tracked in HEAD, read once per
+// enforcement rather than one `cat-file` per changed path.
+func headPaths(ctx context.Context, dir string) (map[string]bool, error) {
+	listing, err := runGit(ctx, dir, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+	if err != nil {
+		return nil, fmt.Errorf("list HEAD paths: %w", err)
+	}
+	paths := make(map[string]bool)
+	for _, path := range splitNUL(listing) {
+		paths[path] = true
+	}
+	return paths, nil
+}
+
+// isBuildOutput reports whether a changed path falls under a declared
+// build-output grant and is not tracked in HEAD. A collapsed ignored
+// directory (`bin/`) counts as tracked when HEAD holds anything beneath it
+// or a file of that name: a grant must never reach repository content.
+func isBuildOutput(path string, patterns []string, head map[string]bool) bool {
+	matched := false
+	for _, pattern := range patterns {
+		if matchesPattern(path, pattern) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	if !strings.HasSuffix(path, "/") {
+		return !head[path]
+	}
+	if head[strings.TrimSuffix(path, "/")] {
+		return false
+	}
+	for tracked := range head {
+		if strings.HasPrefix(tracked, path) {
+			return false
+		}
+	}
+	return true
+}
+
 // enforceBoundary compares the tree against the pre-phase snapshot. It
-// returns the paths the agent legitimately changed; when the agent
-// overstepped, everything it introduced outside the allowlist is rolled
-// back first and the breaches are returned for the abort path.
+// returns the paths the agent legitimately changed and, separately, the
+// declared build outputs it wrote; when the agent overstepped, everything
+// it introduced outside the allowlist is rolled back first and the breaches
+// are returned for the abort path.
 func enforceBoundary(
-	ctx context.Context, dir string, before treeSnapshot, writes []string,
-) (touched []string, breaches []breach, err error) {
+	ctx context.Context, dir string, before treeSnapshot, writes, buildOutputs []string,
+) (touched, outputs []string, breaches []breach, err error) {
 	after, err := snapshotTree(ctx, dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	var head map[string]bool
+	if len(buildOutputs) > 0 {
+		if head, err = headPaths(ctx, dir); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	for _, path := range changedPaths(before.paths, after.paths) {
+		// Outputs first, for every role: the builder and the reviewer get
+		// the same answer, and an output never enters touched — so never
+		// changed_paths, so never jig's own staging.
+		if len(buildOutputs) > 0 && isBuildOutput(path, buildOutputs, head) {
+			outputs = append(outputs, path)
+			continue
+		}
 		if writePermitted(path, writes) {
 			touched = append(touched, path)
 			continue
@@ -471,7 +537,7 @@ func enforceBoundary(
 			Outcome: rollBackGitMeta(path, before.gitMeta),
 		})
 	}
-	return touched, breaches, nil
+	return touched, outputs, breaches, nil
 }
 
 // restoreSnapshot rolls the worktree back to a pre-phase snapshot after a

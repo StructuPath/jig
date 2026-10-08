@@ -84,15 +84,36 @@ type DefinitionSpec struct {
 	Parallel   ParallelGroup       `yaml:"parallel"`
 	Acceptance []string            `yaml:"acceptance"`
 	Publish    *PublishSpec        `yaml:"publish"`
+
+	// BuildOutputs names the directories any role — `writes: []` reviewers
+	// and parallel-group members included — may write without breaching the
+	// write boundary, so a read-only role can run the repository's own check
+	// command (`go build -o bin/...`). Every entry is a directory grant:
+	// `<dir>/**` (glob characters allowed before the `/**`) or a literal
+	// `<dir>/`. A path is a build output only while it is NOT tracked in
+	// HEAD; tracked files and git metadata are never covered.
+	//
+	// Scope: the grant governs how the write boundary classifies untracked
+	// paths and, through it, the engine-computed changed paths jig stages
+	// at publish — an output is never one of them, so jig never stages it.
+	// It does not inspect commits: publish pushes HEAD as it stands, so an
+	// output a role commits itself is published under that role's `writes`
+	// authority, and thereafter it is tracked repository content. nil and
+	// an empty list are the same: no grant. It is never merged into `writes`.
+	BuildOutputs []string `yaml:"build_outputs"`
 }
 
 // ParallelGroup is the one opt-in parallel construct: the names of two or
 // more consecutive agent phases, in chain order, that run concurrently as
-// one step of the chain. Every member is a read-only role (`writes: []`)
-// with its own owner, and no member's `if:` guard reads a field a sibling
-// reports, because every member is judged against the envelope and field
-// view that preceded the group. Members' results merge in declared order,
-// and the phase after the group receives the last member's envelope.
+// one step of the chain. Every member is a read-only role (`writes: []`,
+// apart from the definition's declared `build_outputs`) with its own owner,
+// and no member's `if:` guard reads a field a sibling reports, because
+// every member is judged against the envelope and field view that preceded
+// the group. Members' results merge in declared order, and the phase after
+// the group receives the last member's envelope. Build outputs written
+// during the group survive it whatever happened to the member that wrote
+// them: the group takes one snapshot and enforces once, so there is no
+// per-member attribution and no per-member rollback.
 //
 // It reopens v1's "no parallel phases" non-goal (V1:KTD2) for exactly this
 // shape and no other: reviewers that read the same tree and report
@@ -364,6 +385,9 @@ func (spec *DefinitionSpec) Validate() error {
 	if err := spec.validateRuntime(); err != nil {
 		return err
 	}
+	if err := spec.validateBuildOutputs(); err != nil {
+		return err
+	}
 	phasesByName := make(map[string]PhaseSpec, len(spec.Phases))
 	for _, phase := range spec.Phases {
 		if strings.TrimSpace(phase.Name) == "" {
@@ -452,7 +476,8 @@ func (spec *DefinitionSpec) validateParallel(phases map[string]PhaseSpec) error 
 		}
 		if writes := spec.Roster[phase.Owner].Writes; writes == nil || len(writes) > 0 {
 			return fmt.Errorf("parallel: member %q runs role %q, which may write; "+
-				"every member's role must declare writes: []", name, phase.Owner)
+				"every member's role must declare writes: [] (apart from declared build_outputs, "+
+				"members are read-only)", name, phase.Owner)
 		}
 		if other, shared := owners[phase.Owner]; shared {
 			return fmt.Errorf("parallel: members %q and %q share owner role %q; "+
@@ -833,6 +858,63 @@ func validateGateAllow(gate GateSpec) error {
 		}
 	}
 	return nil
+}
+
+// validateBuildOutputs checks the build_outputs grant at save time. Every
+// entry must be a DIRECTORY grant, because the write boundary sees a
+// wholly-ignored directory as one collapsed `dir/` entry: a file-level
+// pattern (`bin/*.o`) could never match that entry for an ignored file while
+// matching the same file unignored, so ignored and unignored would disagree.
+// A directory grant ends in `/**` (glob characters allowed before it) or is
+// a literal `dir/` with no glob character — a trailing-slash pattern is a
+// literal prefix, never a wildcard. Whether a path is tracked in HEAD is
+// decided at enforcement time, not here.
+func (spec *DefinitionSpec) validateBuildOutputs() error {
+	for _, raw := range spec.BuildOutputs {
+		pattern := strings.TrimSpace(raw)
+		if pattern == "" {
+			return fmt.Errorf("build_outputs: %q: entries must be non-empty directory patterns", raw)
+		}
+		if err := validateBuildOutput(pattern); err != nil {
+			return fmt.Errorf("build_outputs: %q: %w", raw, err)
+		}
+	}
+	return nil
+}
+
+func validateBuildOutput(pattern string) error {
+	if strings.ContainsAny(pattern, "\x00\n\r") {
+		return fmt.Errorf("must not contain NUL or a line break")
+	}
+	if strings.HasPrefix(pattern, "/") {
+		return fmt.Errorf("must be repository-relative, not absolute")
+	}
+	if strings.HasPrefix(pattern, "-") || strings.HasPrefix(pattern, ":") {
+		return fmt.Errorf("must not start with %q", pattern[:1])
+	}
+	for _, segment := range strings.Split(pattern, "/") {
+		switch segment {
+		case "..":
+			return fmt.Errorf("must not contain a `..` segment")
+		case ".git":
+			return fmt.Errorf("must not name a `.git` directory; git metadata is never a build output")
+		}
+	}
+	if strings.Trim(pattern, "*?/") == "" {
+		return fmt.Errorf("must name at least one literal character; a pattern of only globs grants everything")
+	}
+	switch {
+	case strings.HasSuffix(pattern, "/**"):
+		return nil
+	case strings.HasSuffix(pattern, "/"):
+		if strings.ContainsAny(pattern, "*?") {
+			return fmt.Errorf("a trailing-slash pattern is a literal directory prefix; " +
+				"use `<dir>/**` for a wildcard directory")
+		}
+		return nil
+	default:
+		return fmt.Errorf("must be a directory grant ending in `/**` or `/`; file-level patterns are refused")
+	}
 }
 
 func builtinGateNames() []string {

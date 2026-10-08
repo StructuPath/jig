@@ -2263,3 +2263,166 @@ acceptance: [all_phases_passed]
 		}
 	}
 }
+
+// ---- scenario: build outputs -----------------------------------------------
+
+const buildOutputsLine = "build_outputs: [\"bin/**\"]\n"
+
+// outputsTouched returns the paths of every build_outputs_touched event the
+// phase emitted, and whether each carried the role that wrote them.
+func outputsTouched(t *testing.T, sink *recordingSink, phase string) (paths []string, roles []string) {
+	t.Helper()
+	for _, event := range sink.all() {
+		if event.Type != protocol.EventLog || event.Name != "build_outputs_touched" || event.Phase != phase {
+			continue
+		}
+		var payload struct {
+			Role  string   `json:"role"`
+			Paths []string `json:"paths"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatalf("build_outputs_touched payload does not parse: %v", err)
+		}
+		paths = append(paths, payload.Paths...)
+		roles = append(roles, payload.Role)
+	}
+	return paths, roles
+}
+
+// Outputs are classified before the allowlist for every role, so the
+// builder with an unrestricted allowlist and the read-only reviewer get the
+// same answer: bin/ never enters changed_paths, the path jig stages.
+func TestBuildOutputsAreExcludedFromChangedPathsForEveryAllowlist(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		writesLine string
+		legitimate bool
+	}{
+		{"read-only", "    writes: []\n", false},
+		{"unrestricted glob", "    writes: [\"**\"]\n", true},
+		{"writes omitted", "", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			repo := initRepo(t)
+			checkFiles := map[string]string{"bin/check": "check build"}
+			want := []string{"src/app.txt"}
+			if c.legitimate {
+				checkFiles["notes.md"] = "the role's own write"
+				want = []string{"notes.md", "src/app.txt"}
+			}
+			fake := enginetest.New(
+				enginetest.Step{Files: map[string]string{"src/app.txt": "app", "bin/jig": "binary"},
+					Text: envelope(map[string]any{"status": "success", "summary": "built"})},
+				enginetest.Step{Files: checkFiles,
+					Text: envelope(map[string]any{"status": "success", "summary": "checked"})},
+			)
+			sink := &recordingSink{}
+			runner := newTestRunner(t, fake, sink, nil)
+			snapshot := "name: t\n" + repairRoster + `
+  checker:
+    model: test-model
+    system_prompt: Check.
+    user_prompt: "Run the checks."
+` + c.writesLine + `phases:
+  - {name: build, kind: agent, owner: builder}
+  - {name: check, kind: agent, owner: checker}
+acceptance: [all_phases_passed]
+` + buildOutputsLine
+			outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+			if outcome.State != protocol.AttemptAcceptedUnpublished {
+				t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
+			}
+			if got := changedPaths(t, outcome.Result); strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("changed_paths = %v, want %v (no build output)", got, want)
+			}
+			if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/jig") {
+				t.Fatalf("build's build_outputs_touched = %v, want bin/jig", paths)
+			}
+			paths, roles := outputsTouched(t, sink, "check")
+			if !contains(paths, "bin/check") || !contains(roles, "checker") {
+				t.Fatalf("check's build_outputs_touched = %v by %v, want bin/check by checker", paths, roles)
+			}
+			if sink.has(protocol.EventError, "write_boundary_breach") {
+				t.Fatal("a declared build output raised a write_boundary_breach")
+			}
+		})
+	}
+}
+
+// The failure and cancellation exits enforce the boundary too, so they trace
+// the outputs their agent wrote exactly as the success exit does.
+func TestBuildOutputsTouchedIsTracedOnFailedAndCancelledExits(t *testing.T) {
+	t.Run("gate exhaustion", func(t *testing.T) {
+		repo := initRepo(t)
+		claim := envelope(map[string]any{"status": "success", "summary": "wrote out.txt",
+			"artifacts": []any{"out.txt"}})
+		fake := enginetest.New(
+			enginetest.Step{Files: map[string]string{"out.txt": "", "bin/jig": "binary"}, Text: claim},
+			enginetest.Step{Text: claim},
+		)
+		sink := &recordingSink{}
+		runner := newTestRunner(t, fake, sink, nil)
+		snapshot := "name: t\n" + oneWriterRoster + `
+phases:
+  - name: build
+    kind: agent
+    owner: writer
+    gates:
+      - {name: files_non_empty, budget: 1}
+` + buildOutputsLine
+		outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+		if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "failed gates") {
+			t.Fatalf("outcome = %q (%s), want failed on gate exhaustion", outcome.State, outcome.Error)
+		}
+		if strings.Contains(outcome.Error, "outside its write allowlist") {
+			t.Fatalf("error %q reports a breach for a declared build output", outcome.Error)
+		}
+		if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/jig") {
+			t.Fatalf("build_outputs_touched = %v on the failure exit, want bin/jig", paths)
+		}
+	})
+	t.Run("cancellation", func(t *testing.T) {
+		repo := initRepo(t)
+		fake := enginetest.New(enginetest.Step{Files: map[string]string{"bin/jig": "binary"}, Hang: true})
+		cancelled := make(chan struct{})
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			close(cancelled)
+		}()
+		sink := &recordingSink{}
+		runner := newTestRunner(t, fake, sink, nil)
+		snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+` + buildOutputsLine
+		attempt := testAttempt(snapshot, nil, repo)
+		attempt.Cancelled = cancelled
+		outcome := runner.Execute(context.Background(), attempt)
+		if outcome.State != protocol.AttemptCancelled {
+			t.Fatalf("state = %q (%s), want cancelled", outcome.State, outcome.Error)
+		}
+		if paths, _ := outputsTouched(t, sink, "build"); !contains(paths, "bin/jig") {
+			t.Fatalf("build_outputs_touched = %v on the cancellation exit, want bin/jig", paths)
+		}
+	})
+}
+
+// A CI repair round whose only writes are build outputs changed nothing jig
+// would push, so it ends the repair (resume.go's no-change rule).
+func TestAnOutputOnlyCIRepairRoundEndsNoChange(t *testing.T) {
+	f := newRepairFixture(t, ciRepairSnapshot+buildOutputsLine, nil, chainSteps()...)
+	continuation := f.execute(t).Continuation
+	if continuation == nil {
+		t.Fatal("the chain kept no continuation")
+	}
+	defer continuation.Release()
+	f.fake.Append(writes(map[string]string{"bin/jig": "rebuilt"}, "rebuilt the binary"),
+		success("fine", map[string]any{"approved": true}))
+	round := continuation.RepairCI(context.Background(), redLint)
+	if round.State != protocol.AttemptAcceptedUnpublished || !strings.Contains(round.Error, "ci_repair_no_change") {
+		t.Fatalf("round = %+v, want accepted with ci_repair_no_change", round)
+	}
+	if paths, _ := outputsTouched(t, f.sink, "build"); !contains(paths, "bin/jig") {
+		t.Fatalf("build_outputs_touched = %v in the round, want bin/jig", paths)
+	}
+}
