@@ -46,15 +46,8 @@ const phaseStatusSkipped = "skipped"
 // attempt. Every send is checked against it before the subprocess starts, and
 // exceeding it ends the attempt with its own terminal cause.
 //
-// TODO(protocol): WorstCaseSendCount understates the ladder. The constant in
-// internal/protocol declares gate_budget × parse_budget = 6 and is referenced
-// by no code; the ladder the engine actually walks is
-// parse(budget+1 emissions) × gate(budget+1 emissions) × crash
-// re-entries(budget+1) × repair edge(budget+1 self runs plus budget target
-// dispatches) — roughly 252 sends for a single phase at budget 3, and more
-// once several phases carry edges. Until that constant is corrected (it lives
-// in a package this pass does not own) the real bound is the one enforced
-// here.
+// This is the real upper bound on sends within one attempt; the parse, gate,
+// crash-reentry and repair-edge ladders all count against it.
 const defaultMaxAttemptSends = 64
 
 // maxPhaseEnvelopeBytes caps the envelope blob one phase result may embed in

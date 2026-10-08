@@ -77,13 +77,6 @@ const (
 	// emissions a gate violation may request before the phase fails (R7, R9).
 	DefaultPhaseRetryBudget = 2
 
-	// WorstCaseSendCount is the maximum number of prompt sends one phase can
-	// issue at the default budgets: gate_budget × parse_budget, because every
-	// gate correction opens a fresh per-emission parse budget. A definition
-	// that raises either budget raises this product; the per-attempt
-	// wall-clock ceiling bounds total cost regardless.
-	WorstCaseSendCount = DefaultPhaseRetryBudget * ParseBudgetPerEmission
-
 	// DefaultPhaseTimeout is the wall-clock ceiling for a single phase. A
 	// phase that exceeds it is killed by process group, consumes one phase
 	// retry, and restarts from the pre-phase snapshot with a fresh session
