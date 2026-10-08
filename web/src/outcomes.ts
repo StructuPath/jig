@@ -26,8 +26,8 @@ export function attemptOutcome(attempt: Attempt): { title: string; detail: strin
     if (summary?.publish_hold?.startsWith('publish.hold_when "jig_ui_delivery != publish" held') &&
       (publish === "held" || (typeof publish === "object" && publish?.state === "held"))) return {
       title: "Task complete · kept local",
-      detail: "The task passed its checks. Your result is ready, and any changes remain in the separate working folder.",
-      next: "Read the result below. For a build task, review the saved changes before applying them to your project.",
+      detail: "The task passed its checks. Any changes remain in the separate working folder on this Mac; nothing was pushed to GitHub.",
+      next: "Read the result below. For a build task, review the saved changes before applying them, or start the task again with Open a pull request.",
     };
     if (code === "publish_empty_changeset" || attempt.error?.includes("(publish_empty_changeset)")) return {
       title: "Checks passed · nothing to publish",
