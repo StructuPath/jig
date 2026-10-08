@@ -324,6 +324,47 @@ phases:
 `, `"build"`, `"tests_pass"`, "requires a command")
 }
 
+func TestTestsIntactAllowIsValidatedAtSaveTime(t *testing.T) {
+	const base = `
+name: tests-intact
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+    gates:
+`
+	spec := mustParse(t, base+`      - {name: tests_intact, allow: ["legacy/*_test.go", "e2e/[ab]*.spec.ts"]}`+"\n")
+	if got := spec.Phases[0].Gates[0].Allow; len(got) != 2 || got[0] != "legacy/*_test.go" {
+		t.Fatalf("allow = %q, want both globs kept in order", got)
+	}
+	mustParse(t, base+"      - {name: tests_intact}\n")
+	cases := []struct {
+		name string
+		gate string
+		want []string
+	}{
+		{"allow on another gate", `{name: artifacts_exist, allow: ["*_test.go"]}`,
+			[]string{`"build"`, `"artifacts_exist"`, `only meaningful on "tests_intact"`}},
+		{"an empty allow entry", `{name: tests_intact, allow: [""]}`,
+			[]string{`"tests_intact"`, "non-empty"}},
+		{"a blank allow entry", `{name: tests_intact, allow: ["  "]}`,
+			[]string{`"tests_intact"`, "non-empty"}},
+		{"an unclosed character class", `{name: tests_intact, allow: ["foo[_test.go"]}`,
+			[]string{`"foo[_test.go"`, "malformed"}},
+		{"a trailing escape", `{name: tests_intact, allow: ["foo\\"]}`,
+			[]string{"malformed"}},
+		{"a double star", `{name: tests_intact, allow: ["legacy/**"]}`,
+			[]string{`"legacy/**"`, "not supported"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mustReject(t, base+"      - "+tc.gate+"\n", tc.want...)
+		})
+	}
+}
+
 func TestUnknownYAMLFieldIsRejectedAtParseTime(t *testing.T) {
 	mustReject(t, `
 name: bad

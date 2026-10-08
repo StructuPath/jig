@@ -191,8 +191,63 @@ Rules worth knowing before you write one:
   a builder, and a verdict nobody stated must not decide that either way.
 - **Gates verify claims, they do not judge quality.** The registry is
   `artifacts_exist`, `files_non_empty`, `diff_matches_claims`,
-  `verdict_consistent`, and `tests_pass(command)`. Repo-specific
-  verification is a code phase, not a new gate.
+  `verdict_consistent`, `tests_pass(command)`, and `tests_intact`.
+  Repo-specific verification is a code phase, not a new gate.
+- **A builder cannot cheaply buy green by weakening tests.** `tests_intact`
+  is a tripwire against careless or opportunistic test tampering, not an
+  adversarially complete analysis. Every test file changed since
+  `JIG_BASE_SHA` — committed, uncommitted, or untracked, gitignored
+  included — is compared whole against its base version: both sides are
+  normalized (comments stripped by a lexer that knows strings, regex
+  literals, and Ruby heredocs and %-literals; literals blanked,
+  whitespace collapsed so a token split across lines rejoins), then tests,
+  assertions, and markers are counted. It fails when a test file is
+  deleted, ends with fewer tests (Go `Example` and `Fuzz` functions in a
+  `_test.go` file included), assertions (a Go example's `// Output:` or
+  `// Unordered output:` line included, so deleting expected output is a
+  loss), or `m.Run(` calls, or with
+  more of any marker that stops tests running: a skip or focus (`t.Skip`,
+  `test.only.each`, a vitest options object with `skip`, `only`, `fails`,
+  or `todo` set to anything but `false`, `0`, `null`, `undefined`, or
+  `""` — in any argument position, after any first argument, through
+  `.each(…)(…)`, with the key bare or quoted, as in `test("…", {skip:
+  true}, fn)` or `test(name(), fn, {"only": 1})`, `mark.skip` in any
+  form, `pytest.importorskip(`, `xit`, RSpec `skip: true` or `:focus`), a
+  `//go:build` constraint, an added
+  `TestMain` or `os.Exit(`, `pytestmark`, `__test__ = False`, an aliased
+  `mark`, or a conftest `collect_ignore` or collection hook. Commenting a
+  test out, or wrapping it in `/* */` or a string, is a loss. Counts are
+  per file and per marker kind, so renaming a test inside its file,
+  converting `test(…)` to `test.each(…)`, swapping an assertion for a
+  stronger one, or rewording a skip's message passes, and new tests always
+  do; renaming a test FILE reads as a deletion. What it cannot inspect
+  fails closed: a binary or over-4 MiB test file, a source test file with
+  a NUL byte or a UTF-16/UTF-32 byte-order mark, a comment, string, or
+  heredoc still open at end of file, a tracked test file
+  flagged assume-unchanged or skip-worktree, an embedded git repository
+  holding test files. Untracked files under `node_modules`, Go `vendor`,
+  and Python virtualenvs are skipped, as the runners skip them. Each
+  finding names `path:line` where a changed line shows it, and says what
+  to put back. It covers Go, JavaScript and TypeScript, Python, and
+  Ruby/RSpec in v1, recognizing test files the way `factory.yaml`'s risk
+  classifier does, plus `conftest.py`. When a change is meant to remove
+  tests, say so in the definition: `{name: tests_intact, allow:
+  ["legacy/*_test.go"]}` exempts matching paths. `allow` uses `path.Match`
+  globs against the repo-relative path — `*` stops at `/` and `**` is
+  refused — and is rejected on any other gate. `factory.yaml` and
+  `factory-parallel.yaml` run it on `build`. Known limits: it does not
+  catch an assertion replaced by a trivially true one, a test runner
+  neutered through configuration outside `conftest.py` (jest or pytest
+  config, `package.json`, a `Makefile`), a skip hidden in a non-test
+  helper, a skip hidden inside a JS template-literal expression or behind
+  an exotic string escape, an existing marker whose arguments are widened
+  (`skipif(False)` → `skipif(True)`, edited `collect_ignore` contents,
+  `if testing.Short()` → `if true`), arithmetic that keeps `m.Run(` but
+  discards its result, `pytest.exit(..., 0)`, vitest options passed
+  through a variable (`const opts = {skip: true}`), spread (`{...opts}`)
+  or nested in another object, or written as `{ skip }` shorthand, a
+  gutted `f.Fuzz(...)` body, or changes inside
+  submodules — the reviewers and the risk classifier are the check there.
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
   discovered at 2 a.m.
@@ -261,7 +316,8 @@ Rules worth knowing before you write one:
   heads, changed paths, and outcome in the result. The publish-only retry
   judges CI but never repairs — a continuation lives only in the process that
   ran the chain. Budget is 1–3. A fix that weakens a check instead of the
-  code is the risk to design for: `factory.yaml` scores edits to CI or lint
+  code is the risk to design for: `factory.yaml` refuses lost tests and new
+  skips at the build with `tests_intact`, and scores edits to CI or lint
   configuration, and test files that lose more lines than they gain, as not
   low, so such a "fix" is held for a person.
 - **A flaky Actions job can be re-run before a round is spent.**

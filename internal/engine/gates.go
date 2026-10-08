@@ -24,6 +24,12 @@ type gateContext struct {
 	worktree string
 	envelope parsedEnvelope
 	command  string // tests_pass only
+	// baseSHA is the commit the attempt was pinned to — the JIG_BASE_SHA a
+	// code phase sees — so a gate can judge the whole change since then,
+	// committed or not, without guessing a base from history the agents
+	// wrote. allow is tests_intact's exemption list, from the frozen spec.
+	baseSHA string
+	allow   []string
 	// env is the complete subprocess environment a gate command runs with:
 	// the owning role's allowlist plus the attempt's ephemeral HOME (KTD10,
 	// KTD11). A gate command runs in the worktree the agent just wrote — a
@@ -39,6 +45,7 @@ type gateContext struct {
 // integrity failure, reported as a failed check rather than a panic.
 func runGate(gc gateContext, spec protocol.GateSpec) protocol.GateReport {
 	gc.command = spec.Command
+	gc.allow = spec.Allow
 	switch spec.Name {
 	case protocol.GateArtifactsExist:
 		return gateArtifactsExist(gc)
@@ -50,6 +57,8 @@ func runGate(gc gateContext, spec protocol.GateSpec) protocol.GateReport {
 		return gateVerdictConsistent(gc)
 	case protocol.GateTestsPass:
 		return gateTestsPass(gc)
+	case protocol.GateTestsIntact:
+		return gateTestsIntact(gc)
 	}
 	var report protocol.GateReport
 	report.Check(spec.Name, false, "gate is not in the built-in registry")
