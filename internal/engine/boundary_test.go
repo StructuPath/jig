@@ -16,7 +16,7 @@ import (
 
 func gitIn(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	command := exec.Command("git", args...)
+	command := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
 	command.Dir = dir
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, output)

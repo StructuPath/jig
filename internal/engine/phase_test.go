@@ -29,7 +29,7 @@ func initRepo(t *testing.T) string {
 	dir := t.TempDir()
 	git := func(args ...string) {
 		t.Helper()
-		command := exec.Command("git", args...)
+		command := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
 		command.Dir = dir
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, output)
@@ -1571,7 +1571,7 @@ func TestTestsIntactJudgesTheChangeSinceThePinnedBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{{"add", "src"}, {"commit", "--quiet", "-m", "tests"}} {
-		command := exec.Command("git", args...)
+		command := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
 		command.Dir = repo
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, output)
