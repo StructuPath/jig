@@ -10,7 +10,9 @@
 # review-maintainability]` runs the three reviewers at once, each in its own
 # ephemeral HOME and session. A group may hold only consecutive agent phases
 # whose roles are read-only (`writes: []`) and distinct; any change to the
-# worktree while the panel runs aborts the attempt. What changes against the
+# worktree while the panel runs, apart from the declared `build_outputs`,
+# aborts the attempt. Outputs written during the panel survive it whatever
+# happened to the reviewer that wrote them. What changes against the
 # sequential panel:
 #
 #   - Prompts. Every reviewer is handed the envelope from before the panel
@@ -62,6 +64,19 @@
 # once, on the same head, before a repair round is spent: a job that passes
 # on re-run publishes, reported as flaky; one still red goes to repair.
 #
+# THE WRITE BOUNDARY AND BUILD OUTPUTS. Every role's `writes` allowlist is
+# checked after each phase; the reviewers are read-only (`writes: []`). A
+# reviewer that runs the repository's own check command still writes its
+# build output, so `build_outputs` names the directories ANY role may write
+# without breaching: `bin/**` (`go build -o bin/...`) and `target/**` (Rust,
+# Maven). Each entry is a directory grant — `<dir>/**` or a literal `<dir>/`
+# — and never covers a path tracked in HEAD or git metadata. Jig never
+# stages an output: outputs are not changed paths. A role that commits one
+# itself publishes it, under its own `writes`. Declare only directories no
+# later phase EXECUTES: the `test` phase runs `npm test`, so a JavaScript
+# dependency directory is deliberately left out — granting it would let a
+# reviewer plant what `test` runs.
+#
 # THE ROSTER. Builders and reviewers are `opus`; the planner and the extra
 # high-risk reviewer are `sonnet`. `effort` is medium for building to a plan
 # and high for reviewers hunting what the build missed. `budget_usd` caps what
@@ -70,9 +85,11 @@
 #
 # EDIT BEFORE USE: the test command (it detects common entry points and
 # fails loudly when it finds none), the builder's `writes` allowlist (`**` is
-# the weakest boundary jig can enforce — narrow it, R10), and the risk
-# classifier's path pattern and line threshold, which should name what is
-# dangerous in YOUR repository.
+# the weakest boundary jig can enforce — narrow it, R10), the
+# `build_outputs` list (declare only directories your build writes and no
+# later phase executes; a role that commits an output itself publishes it),
+# and the risk classifier's path pattern and line threshold, which should
+# name what is dangerous in YOUR repository.
 name: factory-parallel
 runtime: claude-code
 roster:
@@ -413,3 +430,4 @@ publish:
     rerun: {budget: 1}
     on_fail: {run: build, budget: 2}
     timeout: 30m
+build_outputs: ["bin/**", "target/**"]

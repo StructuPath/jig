@@ -147,6 +147,7 @@ roster:                      # one entry per agent role
       Task: {{prompt}}       # the invocation's prompt, frozen at admission
     env: [PATH]              # env allowlist — the ONLY variables it receives
     writes: ["src/**"]       # write allowlist; [] is read-only, omitted is unrestricted
+                             # (build output directories go in build_outputs, below)
 phases:
   - name: build
     kind: agent              # agent | code
@@ -174,6 +175,7 @@ acceptance: [all_phases_passed, diff_matches_claims]
 publish:
   hold_when: "risk == high"  # accepted but held for a person; publish retry releases it
   ci: {wait: true, timeout: 30m}  # accepted only once CI on the PR head is green
+build_outputs: ["bin/**"]    # directories ANY role may write, read-only roles included
 ```
 
 Rules worth knowing before you write one:
@@ -262,6 +264,24 @@ Rules worth knowing before you write one:
   send by that role may cost; Claude Code enforces it as `--max-budget-usd`.
   Codex has no such flag, and a cap it cannot enforce fails the send rather
   than run uncapped — the same posture as a `tools` allowlist there.
+- **Build outputs are a grant, not an allowlist entry.** A read-only
+  reviewer that runs the repository's own check command still writes what
+  it builds, and `writes: []` would breach on it. `build_outputs:
+  ["bin/**"]` names the directories every role — read-only reviewers and
+  parallel-group members included — may write without breaching. Each
+  entry must be directory-shaped: `<dir>/**` (glob characters may precede
+  it, as in `**/__pycache__/**`; `**` is supported inside a pattern, the
+  bare `**` is refused) or a literal `<dir>/`; file-level patterns such as
+  `bin/*.o` are refused at save time, because git reports a wholly ignored
+  directory as one entry. A path tracked in HEAD is never an output, and
+  git metadata never is. Outputs are not changed paths, so jig never
+  stages or publishes one; a role that commits an output itself publishes
+  it under its own `writes`, and from then on it is tracked content. Outputs
+  written during a parallel group survive the group whatever happened to the
+  member that wrote them, and the trace attributes them to the group, not a
+  role. A crashed sequential phase is still rolled back to its snapshot,
+  its new outputs included. Declare only directories no later phase
+  executes: a reviewer could otherwise plant what a test phase runs.
 - **Code phases can report.** A code phase with `reports_fields: true`
   prints a JSON object as its last output line, and those fields join the
   envelope view that `if:` guards and `publish.hold_when` read. It is how a
@@ -353,11 +373,12 @@ Rules worth knowing before you write one:
   [review-correctness, review-security, review-maintainability]` runs those
   phases at once, as one step of the chain. It is opt-in and narrow: one
   group per definition, two or more consecutive agent phases, each with its
-  own role, every role `writes: []`, and no member's `if:` guard reading a
-  field a sibling reports. Each member runs in its own ephemeral HOME and
-  session and is handed the envelope from BEFORE the group, never a
+  own role, every role `writes: []` (declared `build_outputs` excepted;
+  outputs written during the group survive it), and no member's `if:` guard
+  reading a field a sibling reports. Each member runs in its own ephemeral
+  HOME and session and is handed the envelope from BEFORE the group, never a
   sibling's; results merge in declared order, and the next phase gets the
-  last member's envelope. Any worktree change while the group runs —
+  last member's envelope. Any other worktree change while the group runs —
   including one a crashed member left — rolls back and aborts the attempt.
   Rejections resolve after every member finishes: the first member in
   declared order that rejected with budget left dispatches its repair target
