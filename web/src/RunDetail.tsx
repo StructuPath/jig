@@ -196,6 +196,7 @@ export function JobPanel({
       {compact && latest && isTerminalAttempt(latest.state) && <section className="next-action">
         <h3>What next?</h3>
         <p>{taskMode === "ask" ? "Turn a recommendation into work. Write one clear change you want Codex to make." : "Review the result and saved working folder above. You can also give Codex a new directive."}</p>
+        <p><Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=build&continue=${encodeURIComponent(data.run_id)}`}>Continue from this result →</Link> <span className="subtle">Passes this task's directive and result to the next one.</span></p>
         <Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=build`}>Make changes to this project →</Link>
         <span> · </span><Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=ask`}>Ask another question →</Link>
         <p><Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=auto`}>Let agents choose the next improvement →</Link></p>
@@ -213,7 +214,7 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode }: { att
   const recordedPhases = parseAttemptSummary(attempt.result)?.phases ?? [];
   const steps = taskMode ? taskSteps[taskMode] : [...new Set(lane.phases.map((phase) => phase.phase))];
   const timeline = <SwimLane lane={lane} nowMs={nowMs} onSelectPhase={setOpenPhase} />;
-  const activity = events.filter((event) => event.phase !== "keep-local" && (event.type === "tool_call" || (event.type === "log" && ["agent_text", "repair_edge", "repair_exhausted"].includes(event.name ?? "")) || ["phase_start", "phase_end", "gate_fail", "error"].includes(event.type))).slice(-6);
+  const activity = events.filter((event) => !["keep-local", "deliver"].includes(event.phase ?? "") && (event.type === "tool_call" || (event.type === "log" && ["agent_text", "repair_edge", "repair_exhausted"].includes(event.name ?? "")) || ["phase_start", "phase_end", "gate_fail", "error"].includes(event.type))).slice(-6);
   const lastEvent = events.at(-1);
   const planHandoff = events.slice().reverse().find((event) => event.type === "handoff" && event.phase === "plan");
   const planSummary = planHandoff?.payload && typeof planHandoff.payload === "object" && "summary" in planHandoff.payload && typeof planHandoff.payload.summary === "string" ? planHandoff.payload.summary : null;
