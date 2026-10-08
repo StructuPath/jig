@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -191,4 +192,95 @@ func TestTheParallelFactoryIsTheStockFactoryWithItsPanelGrouped(t *testing.T) {
 	if !reflect.DeepEqual(parallel, stock) {
 		t.Fatal("factory-parallel.yaml differs from factory.yaml beyond its name and its parallel group")
 	}
+}
+
+// factoryFixture is a repository whose `make test` passes, optionally with
+// a .gitignore listing bin/ so the stock build_outputs grant covers it.
+func factoryFixture(t *testing.T, ignoreBin bool) string {
+	t.Helper()
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Skip("make is not installed; the stock test command detects it first")
+	}
+	repo := initRepo(t)
+	writeFile(t, repo, "Makefile", "test:\n\t@true\n")
+	if ignoreBin {
+		writeFile(t, repo, ".gitignore", "bin/\n")
+	}
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "--quiet", "-m", "fixture")
+	return repo
+}
+
+// scriptedFactory is the stock factory exactly as written minus its runtime
+// pin: the scripted runtime advertises itself as `scripted`, and a worker
+// never claims a definition pinned to a runtime it does not run.
+func scriptedFactory(t *testing.T) string {
+	t.Helper()
+	source, err := os.ReadFile(stockDefinition("factory.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const pinned = "\nruntime: claude-code\n"
+	if strings.Count(string(source), pinned) != 1 {
+		t.Fatalf("factory.yaml does not pin %q exactly once", strings.TrimSpace(pinned))
+	}
+	path := filepath.Join(t.TempDir(), "factory.yaml")
+	writeFile(t, filepath.Dir(path), filepath.Base(path),
+		strings.Replace(string(source), pinned, "\n", 1))
+	return path
+}
+
+func factoryBuildStep(t *testing.T, files map[string]any) map[string]any {
+	t.Helper()
+	files["work.txt"] = "the work\n"
+	files["~/commit-message"] = "Write the work\n"
+	return map[string]any{
+		"files": files,
+		"text": envelopeJSON(t, map[string]any{
+			"status": "success", "summary": "wrote work.txt",
+			"artifacts": []any{"work.txt"}, "changed_files": []any{"work.txt"},
+		}),
+	}
+}
+
+// The stock commit phases stage with `git add -A`, which never stages a
+// gitignored path — so a declared build output never reaches a commit, and
+// a reviewer's output that is NOT gitignored is a breach that says why.
+func TestStockCommitBuildNeverCommitsAGitignoredBuildOutput(t *testing.T) {
+	t.Run("gitignored output stays out of HEAD", func(t *testing.T) {
+		repo := factoryFixture(t, true)
+		scriptRuntime(t, planStep(t),
+			factoryBuildStep(t, map[string]any{"bin/jig": "binary"}),
+			reviewStep(t, true), reviewStep(t, true), reviewStep(t, true))
+
+		code, report, stderr := runJigJSON(t, "--def", scriptedFactory(t),
+			"--data", t.TempDir(), repo, "write the work")
+		if code != exitAccepted {
+			t.Fatalf("exit = %d (%s), want %d (stderr: %s)", code, report.Error, exitAccepted, stderr)
+		}
+		tree := strings.Split(gitIn(t, repo, "ls-tree", "-r", "--name-only", "HEAD"), "\n")
+		if !slices.Contains(tree, "work.txt") || slices.Contains(tree, "bin/jig") {
+			t.Fatalf("HEAD tree = %v, want work.txt and not bin/jig", tree)
+		}
+		if _, err := os.Stat(filepath.Join(repo, "bin/jig")); err != nil {
+			t.Fatalf("the build output did not survive on disk: %v", err)
+		}
+	})
+	t.Run("non-ignored reviewer output is a breach", func(t *testing.T) {
+		repo := factoryFixture(t, false)
+		reviewer := reviewStep(t, true)
+		reviewer["files"] = map[string]any{"bin/x": "a reviewer ran the build"}
+		scriptRuntime(t, planStep(t), factoryBuildStep(t, map[string]any{}), reviewer)
+
+		code, report, stderr := runJigJSON(t, "--def", scriptedFactory(t),
+			"--data", t.TempDir(), repo, "write the work")
+		if code == exitAccepted || !strings.Contains(report.Error, "not gitignored") {
+			t.Fatalf("exit = %d (%s), want an abort naming a non-gitignored output (stderr: %s)",
+				code, report.Error, stderr)
+		}
+		tree := strings.Split(gitIn(t, repo, "ls-tree", "-r", "--name-only", "HEAD"), "\n")
+		if slices.Contains(tree, "bin/x") {
+			t.Fatalf("HEAD tree = %v, want no bin/x", tree)
+		}
+	})
 }

@@ -1096,21 +1096,27 @@ func (e *execution) failInfra(phase, detail string) phaseRun {
 // failure when the comparison itself broke, or the abort when the role
 // overstepped — the phase result is recorded here in that case, so callers
 // must not record their own. Every exit from an agent phase entry that had a
-// live subprocess goes through this, success and failure alike.
+// live subprocess goes through this, success and failure alike — which is
+// why the build_outputs_touched trace is emitted here and nowhere else.
 func (e *execution) enforceWriteBoundary(
 	ctx context.Context, phase protocol.PhaseSpec, entry int, started time.Time,
 	before treeSnapshot, writes []string,
 ) (touched []string, terminal *phaseRun) {
-	touched, breaches, err := enforceBoundary(ctx, e.attempt.WorktreePath, before, writes)
+	touched, outputs, breaches, err := enforceBoundary(
+		ctx, e.attempt.WorktreePath, before, writes, e.spec.BuildOutputs)
 	if err != nil {
 		run := e.failInfra(phase.Name, "write-boundary enforcement: "+err.Error())
 		return nil, &run
+	}
+	if len(outputs) > 0 {
+		e.emit.emit(protocol.EventLog, phase.Name, "build_outputs_touched",
+			map[string]any{"role": phase.Owner, "paths": outputs})
 	}
 	if len(breaches) == 0 {
 		return touched, nil
 	}
 	e.emit.emit(protocol.EventError, phase.Name, "write_boundary_breach", map[string]any{
-		"role": phase.Owner, "writes": writes, "breaches": breaches,
+		"role": phase.Owner, "writes": writes, "breaches": breaches, "build_outputs": outputs,
 	})
 	e.recordResult(protocol.PhaseResult{
 		Phase: phase.Name, Kind: phase.Kind, Status: protocol.EnvelopeFail,

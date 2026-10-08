@@ -51,7 +51,8 @@ UI (from `web/`):
 - **Definition changes are validated at save time.** A new definition field
   or rule goes in `internal/protocol/definition.go` with a test, and the stock
   definitions must still pass `just definitions`.
-- **Parallel-group members are read-only and concurrent.** Anything that
+- **Parallel-group members are read-only (apart from declared
+  `build_outputs`) and concurrent.** Anything that
   dispatches or replays phases must not run a member outside the group.
 - Work on a branch in a sibling worktree, open a PR, never push to `main`.
 - `gofmt` everything; match the surrounding comment style, which explains

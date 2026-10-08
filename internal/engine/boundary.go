@@ -29,6 +29,20 @@
 // git invocations, which run here with hooks, fsmonitor, and the ext
 // transport switched off under an explicit environment.
 //
+// A definition's `build_outputs` names directories every role may write —
+// read-only reviewers included — so a role can run the repository's own
+// check command without breaching on `bin/`. A changed path is a build
+// output iff it is GITIGNORED (enumerated by the ignored pass before or
+// after the phase), a grant matches it as git enumerated it, AND it is not
+// tracked in HEAD; outputs are classified before the allowlist for every
+// role, so they never become touched paths and jig never stages one — and
+// `git add -A` in a commit phase never stages an ignored path either. A
+// non-ignored path under a grant is ordinary content judged by `writes`;
+// when that makes it a breach, the outcome says the grant needed a
+// .gitignore entry. The grant is a separate parameter, never folded into
+// `writes` (whose nil means unrestricted), and it is never consulted for
+// git metadata, which stays outside every allowlist.
+//
 // A breach is not a gate violation: gates are for work an agent can be asked
 // to redo, while a breached write already happened. Out-of-allowlist changes
 // the agent introduced are rolled back, then the ATTEMPT aborts — never
@@ -71,13 +85,19 @@ type treeSnapshot struct {
 	// pointer itself, `config`/`config.worktree`, and every hook — for the
 	// worktree's git dir and, when it differs, the shared common dir.
 	gitMeta fingerprint
+	// ignored records which paths came from the ignored-but-present pass,
+	// keyed exactly as git enumerated them (a wholly-ignored directory is
+	// one `dir/` entry). Only these can be build outputs.
+	ignored map[string]bool
 }
 
 // snapshotTree fingerprints every path the worktree differs on relative to
 // HEAD, every untracked or ignored path present in it, and the repository
 // metadata that can make jig's own git commands execute code.
 func snapshotTree(ctx context.Context, dir string) (treeSnapshot, error) {
-	snapshot := treeSnapshot{paths: make(fingerprint), gitMeta: make(fingerprint)}
+	snapshot := treeSnapshot{
+		paths: make(fingerprint), gitMeta: make(fingerprint), ignored: make(map[string]bool),
+	}
 
 	// Tracked paths differing from HEAD. `--no-renames` so a rename is a
 	// delete plus an add — two literal paths — and `-z` so a path containing
@@ -112,6 +132,7 @@ func snapshotTree(ctx context.Context, dir string) (treeSnapshot, error) {
 	}
 	for _, path := range splitNUL(ignored) {
 		snapshot.paths[path] = fingerprintWorktreePath(dir, path)
+		snapshot.ignored[path] = true
 	}
 
 	if err := snapshotGitMeta(ctx, dir, snapshot.gitMeta); err != nil {
@@ -440,26 +461,110 @@ func rollBackGitMeta(path string, before fingerprint) string {
 	return "deleted"
 }
 
+// headPaths is the set of every path tracked in HEAD, read once per
+// enforcement rather than one `cat-file` per changed path.
+func headPaths(ctx context.Context, dir string) (map[string]bool, error) {
+	listing, err := runGit(ctx, dir, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+	if err != nil {
+		return nil, fmt.Errorf("list HEAD paths: %w", err)
+	}
+	paths := make(map[string]bool)
+	for _, path := range splitNUL(listing) {
+		paths[path] = true
+	}
+	return paths, nil
+}
+
+// grantMatches reports whether a build-output grant matches a path as git
+// enumerated it. A `**/<dir>/**` grant is also tried without its leading
+// `**/`: compileGlob turns `**/` into `.*/`, which demands a separator and
+// would miss a root-level `__pycache__/`. The retry is for build outputs
+// only; `writes` semantics are unchanged.
+func grantMatches(path string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matchesPattern(path, pattern) {
+			return true
+		}
+		if rest, ok := strings.CutPrefix(pattern, "**/"); ok && matchesPattern(path, rest) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBuildOutput reports whether a changed path is a declared build output:
+// it came from the ignored pass of either snapshot (so an output deleted by
+// `make clean` still counts), a grant matches it, and it is not tracked in
+// HEAD. A collapsed ignored directory (`bin/`) counts as tracked when HEAD
+// holds anything beneath it or a file of that name: a grant must never
+// reach repository content.
+func isBuildOutput(path string, patterns []string, head, ignored map[string]bool) bool {
+	return ignored[path] && grantMatches(path, patterns) && !trackedInHEAD(path, head)
+}
+
+// trackedInHEAD reports whether HEAD holds the path, or — for a collapsed
+// `dir/` entry — a file of that name or anything beneath it.
+func trackedInHEAD(path string, head map[string]bool) bool {
+	if !strings.HasSuffix(path, "/") {
+		return head[path]
+	}
+	if head[strings.TrimSuffix(path, "/")] {
+		return true
+	}
+	for tracked := range head {
+		if strings.HasPrefix(tracked, path) {
+			return true
+		}
+	}
+	return false
+}
+
 // enforceBoundary compares the tree against the pre-phase snapshot. It
-// returns the paths the agent legitimately changed; when the agent
-// overstepped, everything it introduced outside the allowlist is rolled
-// back first and the breaches are returned for the abort path.
+// returns the paths the agent legitimately changed and, separately, the
+// declared build outputs it wrote; when the agent overstepped, everything
+// it introduced outside the allowlist is rolled back first and the breaches
+// are returned for the abort path.
 func enforceBoundary(
-	ctx context.Context, dir string, before treeSnapshot, writes []string,
-) (touched []string, breaches []breach, err error) {
+	ctx context.Context, dir string, before treeSnapshot, writes, buildOutputs []string,
+) (touched, outputs []string, breaches []breach, err error) {
 	after, err := snapshotTree(ctx, dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	var head map[string]bool
+	ignored := make(map[string]bool, len(before.ignored)+len(after.ignored))
+	if len(buildOutputs) > 0 {
+		if head, err = headPaths(ctx, dir); err != nil {
+			return nil, nil, nil, err
+		}
+		for path := range before.ignored {
+			ignored[path] = true
+		}
+		for path := range after.ignored {
+			ignored[path] = true
+		}
 	}
 	for _, path := range changedPaths(before.paths, after.paths) {
+		// Outputs first, for every role: the builder and the reviewer get
+		// the same answer, and an output never enters touched — so never
+		// changed_paths, so never jig's own staging.
+		if len(buildOutputs) > 0 && isBuildOutput(path, buildOutputs, head, ignored) {
+			outputs = append(outputs, path)
+			continue
+		}
 		if writePermitted(path, writes) {
 			touched = append(touched, path)
 			continue
 		}
-		breaches = append(breaches, breach{
-			Path:    path,
-			Outcome: rollBackPath(ctx, dir, path, before.paths, after.paths),
-		})
+		outcome := rollBackPath(ctx, dir, path, before.paths, after.paths)
+		// A grant only covers gitignored paths; for an untracked one it
+		// missed, say so, because the operator's fix is a .gitignore line,
+		// not a wider allowlist. A tracked path is never an output at all.
+		if len(buildOutputs) > 0 && !ignored[path] && !trackedInHEAD(path, head) &&
+			grantMatches(path, buildOutputs) {
+			outcome = "declared build output is not gitignored — " + outcome
+		}
+		breaches = append(breaches, breach{Path: path, Outcome: outcome})
 	}
 	// Repository metadata is outside every allowlist by construction:
 	// `writes` names repository CONTENT, and no definition may hand a role
@@ -471,13 +576,15 @@ func enforceBoundary(
 			Outcome: rollBackGitMeta(path, before.gitMeta),
 		})
 	}
-	return touched, breaches, nil
+	return touched, outputs, breaches, nil
 }
 
 // restoreSnapshot rolls the worktree back to a pre-phase snapshot after a
 // crash or watchdog kill (R11): everything the dead phase introduced is
-// undone the same way a breach is. Pre-existing dirt stays; what cannot be
-// restored is reported, never silently accepted.
+// undone the same way a breach is, build outputs included. A path already
+// dirty before the phase — a pre-existing collapsed `bin/`, a modified
+// tracked file — is left as-is in its post-agent state SILENTLY: only
+// `could not…` and `reverted-by-agent` outcomes are returned as failures.
 func restoreSnapshot(ctx context.Context, dir string, before treeSnapshot) error {
 	after, err := snapshotTree(ctx, dir)
 	if err != nil {

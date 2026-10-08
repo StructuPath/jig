@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -365,6 +366,57 @@ phases:
 	}
 }
 
+const buildOutputsBase = `
+name: outputs
+roster:
+  reviewer: {model: opus, system_prompt: s, user_prompt: u, writes: []}
+phases:
+  - {name: review, kind: agent, owner: reviewer}
+`
+
+func TestBuildOutputsAreParsedAndRetained(t *testing.T) {
+	spec := mustParse(t, buildOutputsBase+`build_outputs: ["bin/**", "out/"]`+"\n")
+	if got := spec.BuildOutputs; len(got) != 2 || got[0] != "bin/**" || got[1] != "out/" {
+		t.Fatalf("build_outputs = %q, want [bin/** out/] in order", got)
+	}
+	if got := mustParse(t, buildOutputsBase).BuildOutputs; got != nil {
+		t.Fatalf("absent build_outputs = %q, want nil", got)
+	}
+	// An empty list is the same as none: no grant, and never folded into
+	// `writes`, whose nil means unrestricted.
+	empty := mustParse(t, buildOutputsBase+"build_outputs: []\n")
+	if empty.BuildOutputs == nil || len(empty.BuildOutputs) != 0 {
+		t.Fatalf("build_outputs: [] = %#v, want an empty list", empty.BuildOutputs)
+	}
+	if writes := empty.Roster["reviewer"].Writes; writes == nil || len(writes) != 0 {
+		t.Fatalf("reviewer writes = %#v, want the declared read-only []", writes)
+	}
+}
+
+func TestBuildOutputsAreValidatedAtSaveTime(t *testing.T) {
+	for _, accepted := range []string{"bin/**", "out/", "**/__pycache__/**", "a/b/**"} {
+		t.Run("accepts "+accepted, func(t *testing.T) {
+			mustParse(t, buildOutputsBase+fmt.Sprintf("build_outputs: [%q]\n", accepted))
+		})
+	}
+	for _, rejected := range []string{
+		"", "   ", " bin/**", "bin/** ", "bin\x00/**", "bin\n/**", "/abs/**", "../x/**", "a/../b/**",
+		"-x/**", ":x/**", ".git/**", "x/.git/**", "**", "*", "**/*", "*/", "bin/*.o", "**/*.o",
+		"bin/*/", "*/bin/**", "a/*/b/**", "b?n/**", "bin",
+	} {
+		t.Run(fmt.Sprintf("rejects %q", rejected), func(t *testing.T) {
+			// JSON string syntax is a valid YAML double-quoted scalar, so
+			// NUL and newline survive into the parsed value.
+			quoted, err := json.Marshal(rejected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustReject(t, buildOutputsBase+"build_outputs: ["+string(quoted)+"]\n",
+				"build_outputs", fmt.Sprintf("%q", rejected))
+		})
+	}
+}
+
 func TestUnknownYAMLFieldIsRejectedAtParseTime(t *testing.T) {
 	mustReject(t, `
 name: bad
@@ -705,6 +757,13 @@ func TestAParallelGroupOfConsecutiveReadOnlyReviewersValidates(t *testing.T) {
 	if _, _, ok := mustParse(t, parallelPanel("", panelPhases, "")).ParallelRange(); ok {
 		t.Fatal("a definition without a group reports one")
 	}
+	// Declared build outputs are the one thing members may write: a group
+	// beside them still validates.
+	spec = mustParse(t, parallelPanel("", panelPhases,
+		"parallel: [review-a, review-b, review-c]\nbuild_outputs: [\"bin/**\"]\n"))
+	if _, _, ok := spec.ParallelRange(); !ok || len(spec.BuildOutputs) != 1 {
+		t.Fatalf("group or build_outputs lost: parallel=%v build_outputs=%v", spec.Parallel, spec.BuildOutputs)
+	}
 }
 
 // A parallel panel and the CI re-run and repair policies are independent:
@@ -736,6 +795,9 @@ func TestAParallelGroupIsRejectedUnlessItsMembersAreConcurrentSafe(t *testing.T)
 	}{
 		{"a writing member", parallelPanel("", panelPhases, "parallel: [build, review-a]\n"),
 			[]string{`"build"`, `"builder"`, "writes: []"}},
+		{"a writing member beside declared build outputs", parallelPanel("", panelPhases,
+			"parallel: [build, review-a]\nbuild_outputs: [\"bin/**\"]\n"),
+			[]string{`"build"`, `"builder"`, "writes: []", "build_outputs"}},
 		{"a member whose role omits writes, which is unrestricted", parallelPanel(unrestricted,
 			panelPhases+"  - {name: review-d, kind: agent, owner: d}\n  - {name: review-e, kind: agent, owner: a}\n",
 			"parallel: [review-d, review-e]\n"),

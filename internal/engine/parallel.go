@@ -303,24 +303,31 @@ func (e *execution) runMembers(
 		// Execute's deferred cleanup still runs. Siblings kept running until
 		// the stop, so the worktree is enforced first: a sibling's write
 		// must not outlive the attempt just because another member crashed.
-		_, breaches, err := enforceBoundary(
-			context.WithoutCancel(ctx), e.attempt.WorktreePath, before, []string{})
+		_, outputs, breaches, err := enforceBoundary(
+			context.WithoutCancel(ctx), e.attempt.WorktreePath, before, []string{}, e.spec.BuildOutputs)
 		e.emit.emit(protocol.EventError, "", "parallel_group_panic", map[string]any{
 			"parallel_group": names, "panic": fmt.Sprint(panicValue),
-			"breaches": breaches, "enforcement_error": errorText(err),
+			"breaches": breaches, "build_outputs": outputs, "enforcement_error": errorText(err),
 		})
 		panic(panicValue)
 	}
 
 	// The one enforcement, detached from the caller's context: cancellation
 	// is one of the exits it guards, and on a dead context every git command
-	// would fail.
-	_, breaches, err := enforceBoundary(context.WithoutCancel(ctx), e.attempt.WorktreePath, before, []string{})
+	// would fail. Declared build outputs pass whatever happened to the member
+	// that wrote them — one snapshot means no per-member attribution, so the
+	// trace names the group, never a role.
+	_, outputs, breaches, err := enforceBoundary(
+		context.WithoutCancel(ctx), e.attempt.WorktreePath, before, []string{}, e.spec.BuildOutputs)
 	if err != nil {
 		return e.groupInfra(names, "write-boundary enforcement: "+err.Error())
 	}
+	if len(outputs) > 0 {
+		e.emit.emit(protocol.EventLog, "", "build_outputs_touched",
+			map[string]any{"parallel_group": names, "paths": outputs})
+	}
 	if len(breaches) > 0 {
-		return e.groupBreach(members, active, runs, names, breaches)
+		return e.groupBreach(members, active, runs, names, breaches, outputs)
 	}
 	if len(terminals) > 0 {
 		return groupTerminalEnd(terminals)
@@ -373,9 +380,10 @@ func groupTerminalEnd(terminals []memberTerminal) *chainEnd {
 // be pinned on one of them.
 func (e *execution) groupBreach(
 	members []protocol.PhaseSpec, active []int, runs []memberRun, names []string, breaches []breach,
+	outputs []string,
 ) *chainEnd {
 	e.emit.emit(protocol.EventError, "", "write_boundary_breach", map[string]any{
-		"parallel_group": names, "writes": []string{}, "breaches": breaches,
+		"parallel_group": names, "writes": []string{}, "breaches": breaches, "build_outputs": outputs,
 	})
 	for _, i := range active {
 		entry := 0
@@ -392,7 +400,7 @@ func (e *execution) groupBreach(
 		paths = append(paths, item.Path+" — "+item.Outcome)
 	}
 	return &chainEnd{endAborted, fmt.Sprintf(
-		"parallel group [%s]: members are read-only, but %d path(s) changed during the group: %s",
+		"parallel group [%s]: members may write only declared build outputs, but %d path(s) changed during the group: %s",
 		strings.Join(names, ", "), len(breaches), strings.Join(paths, "; "))}
 }
 
