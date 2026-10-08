@@ -69,9 +69,12 @@
 # reviewer that runs the repository's own check command still writes its
 # build output, so `build_outputs` names the directories ANY role may write
 # without breaching: `bin/**` (`go build -o bin/...`) and `target/**` (Rust,
-# Maven). Each entry is a directory grant — `<dir>/**` or a literal `<dir>/`
-# — and never covers a path tracked in HEAD or git metadata. Jig never
-# stages an output: outputs are not changed paths. A role that commits one
+# Maven). A grant is honoured only for gitignored paths — add the directory
+# to `.gitignore`, or a read-only role's write there is a breach that says
+# so. Each entry is exactly `<dir>/**`, `**/<dir>/**`, or a literal `<dir>/`
+# naming the directory git ignores, and never covers a path tracked in HEAD
+# or git metadata. Jig never stages an output: outputs are not changed
+# paths. A role that commits one
 # itself publishes it, under its own `writes`. Declare only directories no
 # later phase EXECUTES: the `test` phase runs `npm test`, so a JavaScript
 # dependency directory is deliberately left out — granting it would let a
@@ -87,7 +90,9 @@
 # fails loudly when it finds none), the builder's `writes` allowlist (`**` is
 # the weakest boundary jig can enforce — narrow it, R10), the
 # `build_outputs` list (declare only directories your build writes and no
-# later phase executes; a role that commits an output itself publishes it),
+# later phase executes; a grant is honoured only for gitignored paths — add
+# the directory to `.gitignore`, or a read-only role's write there is a
+# breach that says so; a role that commits an output itself publishes it),
 # and the risk classifier's path pattern and line threshold, which should
 # name what is dangerous in YOUR repository.
 name: factory-parallel
@@ -300,7 +305,10 @@ phases:
   # The commit phases stage with `git add -A` deliberately: by the time a
   # code phase runs, the write boundary has already verified every path the
   # agent changed against its allowlist and rolled back anything else (R10),
-  # so what is left in the worktree is exactly the authorized work.
+  # so what is left in the worktree is exactly the authorized work. `git add
+  # -A` never stages gitignored paths, so declared build outputs never reach
+  # these commits; a non-ignored path under a grant is ordinary content the
+  # boundary has already judged under `writes`.
   - name: commit-build
     kind: code
     owner: builder

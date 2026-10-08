@@ -175,7 +175,7 @@ acceptance: [all_phases_passed, diff_matches_claims]
 publish:
   hold_when: "risk == high"  # accepted but held for a person; publish retry releases it
   ci: {wait: true, timeout: 30m}  # accepted only once CI on the PR head is green
-build_outputs: ["bin/**"]    # directories ANY role may write, read-only roles included
+build_outputs: ["bin/**"]    # gitignored directories ANY role may write, read-only roles included
 ```
 
 Rules worth knowing before you write one:
@@ -268,15 +268,23 @@ Rules worth knowing before you write one:
   reviewer that runs the repository's own check command still writes what
   it builds, and `writes: []` would breach on it. `build_outputs:
   ["bin/**"]` names the directories every role — read-only reviewers and
-  parallel-group members included — may write without breaching. Each
-  entry must be directory-shaped: `<dir>/**` (glob characters may precede
-  it, as in `**/__pycache__/**`; `**` is supported inside a pattern, the
-  bare `**` is refused) or a literal `<dir>/`; file-level patterns such as
-  `bin/*.o` are refused at save time, because git reports a wholly ignored
-  directory as one entry. A path tracked in HEAD is never an output, and
-  git metadata never is. Outputs are not changed paths, so jig never
-  stages or publishes one; a role that commits an output itself publishes
-  it under its own `writes`, and from then on it is tracked content. Outputs
+  parallel-group members included — may write without breaching. A grant
+  covers **gitignored** paths only: a path under a grant that git does not
+  ignore is ordinary content judged by `writes` — a breach for a read-only
+  role, whose message says `declared build output is not gitignored`, and a
+  changed path (committed like any other) for a writing one. Each entry is
+  exactly one of `<dir>/**`, `**/<dir>/**`, or `<dir>/`, with `<dir>`
+  literal; anything else (`bin/*.o`, `*/bin/**`, `b?n/**`, the bare `**`)
+  is refused at save time, and leading or trailing whitespace is refused,
+  not trimmed. Git reports a wholly ignored directory as one entry and a
+  grant matches paths as git enumerates them, so declare the directory git
+  ignores: with `cache/` ignored, `cache/**` covers `cache/bin/x` but
+  `cache/bin/**` does not. `**/<dir>/**` matches the directory at the root
+  and nested. A path tracked in HEAD is never an output, and git metadata
+  never is. Outputs are not changed paths, so jig never stages or publishes
+  one, and `git add -A` in a commit phase never stages an ignored path; a
+  role that commits an output itself (`git add -f`) publishes it under its
+  own `writes`, and from then on it is tracked content. Outputs
   written during a parallel group survive the group whatever happened to the
   member that wrote them, and the trace attributes them to the group, not a
   role. A crashed sequential phase is still rolled back to its snapshot,
