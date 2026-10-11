@@ -39,6 +39,37 @@ UI (from `web/`):
 | `npm test` | vitest |
 | `npm run build` | Rebuilds `web/dist/` |
 
+## Workflow
+
+Project slash commands live in `.claude/skills/`. A change moves left to
+right; each stage hands its output to the next.
+
+```
+ DEFINE          PLAN           BUILD          VERIFY         REVIEW          SHIP
+ ┌──────┐      ┌──────┐      ┌──────┐      ┌──────┐      ┌──────┐      ┌──────┐
+ │ Idea │ ───▶ │ Spec │ ───▶ │ Code │ ───▶ │ Test │ ───▶ │  QA  │ ───▶ │  Go  │
+ │Refine│      │  PRD │      │ Impl │      │Debug │      │ Gate │      │ Live │
+ └──────┘      └──────┘      └──────┘      └──────┘      └──────┘      └──────┘
+  /spec          /plan          /build        /test         /review       /ship
+```
+
+| Command | Does | Key principle |
+|---|---|---|
+| `/spec` | Starts a `docs/plans/` record: problem frame, `R` requirements, scope | Spec before code |
+| `/plan` | Adds `KTD` decisions, `U` units, risks, verification to that record | Small, atomic tasks |
+| `/build` | Builds one `U` test-first and commits it citing its IDs | One slice at a time |
+| `/test` | Maps every `R` to a test that can fail, fills gaps, runs the CI suite | Tests are proof |
+| `/review` | Blocking vs optional findings with evidence, against jig's invariants | Improve code health |
+| `/ship` | CI-equivalent checks, push the branch, open the PR — never `main` | Faster is safer |
+
+Use these at any stage:
+
+| Command | Does | Key principle |
+|---|---|---|
+| `/constraints` | Turns a decision into a rule here plus a check that enforces it | Decide it once, enforce it everywhere |
+| `/code-simplify` | Removes duplication and dead code without changing behaviour; the tests stay green | Clarity over cleverness |
+| `/webperf` | Measures bundle size, render cost, and polling for `web/` before any optimisation | Measure before you optimize |
+
 ## Rules
 
 - **Commit the rebuilt bundle.** Any change under `web/src/` needs
