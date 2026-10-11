@@ -293,8 +293,11 @@ phases:
     owner: planner
   # tests_intact refuses a build that deletes a test file, loses tests or
   # assertions, or adds a skip/focus marker since the pinned base — the
-  # cheapest way to turn red tests or red CI green. It runs on every build,
-  # repair rounds included; name exempt paths with `allow: [<glob>]`.
+  # cheapest way to turn red tests or red CI green — or that adds a checker
+  # suppression (`//nolint`, `eslint-disable`, `@ts-ignore`, `# noqa`, …)
+  # or a "not implemented" stub to any source file, the cheapest way to turn
+  # red lint green. It runs on every build, repair rounds included; name
+  # exempt paths with `allow: [<glob>]`.
   - name: build
     kind: agent
     owner: builder

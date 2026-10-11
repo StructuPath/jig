@@ -296,8 +296,9 @@ type PhaseSpec struct {
 // GateSpec configures one built-in gate on a phase. Budget is the
 // gate-correction retry budget; zero means DefaultPhaseRetryBudget. Command
 // is required by tests_pass and meaningless to every other gate. Allow is
-// tests_intact's list of path.Match globs naming test files a definition
-// authorizes the agent to delete or weaken; it is rejected on any other gate.
+// tests_intact's list of path.Match globs naming files a definition
+// authorizes the agent to delete or weaken tests in, or to add checker
+// suppressions or stubs to; it is rejected on any other gate.
 type GateSpec struct {
 	Name    string   `yaml:"name"`
 	Command string   `yaml:"command"`

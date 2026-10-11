@@ -250,6 +250,34 @@ Rules worth knowing before you write one:
   or nested in another object, or written as `{ skip }` shorthand, a
   gutted `f.Fuzz(...)` body, or changes inside
   submodules — the reviewers and the risk classifier are the check there.
+- **Nor by silencing the checkers around them.** `tests_intact` also
+  refuses a checker suppression or a "not implemented" stub added to any
+  changed source file, test or not, in the same four languages — committed,
+  uncommitted, or untracked and not gitignored. A suppression is a comment
+  that opens with a directive: Go `//nolint`, `#nosec`, `//lint:ignore`;
+  `eslint-disable` (any form), `oxlint-disable`, `biome-ignore`,
+  `deno-lint-ignore`, `prettier-ignore`, `@ts-ignore`, `@ts-nocheck`,
+  `@ts-expect-error`, `istanbul`/`c8`/`v8 ignore`; Python `# noqa`,
+  `# type: ignore`, `# pyright: ignore`, `# pyre-ignore`/`pyre-fixme`,
+  `# mypy: ignore-errors`, `# pylint: disable`, `# pragma: no cover`,
+  `# ruff: noqa`, `# nosec`, `# fmt: off`/`skip`; Ruby
+  `# rubocop:disable`/`todo`, `# standard:disable`, `# steep:ignore`,
+  `# :nocov:`. A stub is `panic`, `errors.New`, `fmt.Errorf`, `throw`, or
+  `raise` whose message starts "not implemented", "not yet implemented",
+  "unimplemented", or "TODO". Counts are per directive, per file, and one
+  removed anywhere in the change offsets one added elsewhere, so keeping,
+  narrowing, or removing an existing suppression passes, and so does moving
+  one — within its file, or to another by a rename or a split, which
+  `--no-renames` shows as a deletion and a new file;
+  prose that mentions a directive, a directive inside a string, and an
+  abstract method's bare `raise NotImplementedError` pass too. An empty
+  `catch {}` or `except: pass` is not refused: both have legitimate uses
+  (jig's own UI swallows a disabled-storage error), so the reviewers judge
+  them. A justified suppression is refused like any other; exempt its path
+  with `allow`. Unlike a test file, a source file the gate cannot read —
+  over 4 MiB, binary, or left open at end of file by the lexer — is noted
+  as uninspected, not failed, because the builder may not be able to
+  repair a base version the lexer misreads.
 - **Repair loops must be declared and bounded.** `on_fail` is the only loop
   construct; a cycle or a missing budget is rejected at save time, not
   discovered at 2 a.m.
@@ -344,8 +372,9 @@ Rules worth knowing before you write one:
   heads, changed paths, and outcome in the result. The publish-only retry
   judges CI but never repairs — a continuation lives only in the process that
   ran the chain. Budget is 1–3. A fix that weakens a check instead of the
-  code is the risk to design for: `factory.yaml` refuses lost tests and new
-  skips at the build with `tests_intact`, and scores edits to CI or lint
+  code is the risk to design for: `factory.yaml` refuses lost tests, new
+  skips, and new checker suppressions at the build with `tests_intact`, and
+  scores edits to CI or lint
   configuration, and test files that lose more lines than they gain, as not
   low, so such a "fix" is held for a person.
 - **A flaky Actions job can be re-run before a round is spent.**

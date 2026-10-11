@@ -6,7 +6,16 @@
 // the builder is told in the same session to put the check back.
 //
 // It is a tripwire against careless or opportunistic tampering, not an
-// adversarially complete analysis. Each changed test file is compared
+// adversarially complete analysis.
+//
+// The same reasoning covers the checkers around the tests: a repair handed
+// red lint or type-check CI can add `//nolint`, `eslint-disable`,
+// `@ts-ignore`, or `# noqa` instead of fixing the code, or leave a stub that
+// only panics "not implemented". So every changed source file — test or not,
+// in the four lexed languages — may not gain a checker-suppression comment or
+// a stub (the floor pass, judgeFloor).
+//
+// Each changed test file is compared
 // whole, base against worktree: both sides are normalized (comments
 // stripped by a small string-aware lexer, string contents blanked,
 // whitespace collapsed so tokens split across lines rejoin), then tests,
@@ -61,6 +70,10 @@ type lexStyle struct {
 	// identifier's text (a quoted key), and whether it is empty. Everything
 	// else becomes `"x"`.
 	optionStrings bool
+	// directives keeps what the floor pass counts: a comment that opens with
+	// a checker suppression becomes a `\x00suppress:<kind>\x00` token, and a
+	// string saying the code is not written yet becomes `"\x00stub\x00"`.
+	directives bool
 }
 
 // markerPattern finds one thing that stops tests from running: a skip, a
@@ -89,6 +102,17 @@ type testLanguage struct {
 	// anything but a falsy literal count as that kind, so `test.skip(…)` →
 	// `test(…, {skip: true}, …)` is no change.
 	optionCalls *regexp.Regexp
+	// floor finds what lowers the bar in ANY source file, test or not: a
+	// stub that only panics or throws "not implemented". Suppression
+	// comments are found for every language by the lexer itself.
+	floor []floorPattern
+}
+
+// floorPattern finds one kind of unfinished work in the directives-normalized
+// form.
+type floorPattern struct {
+	re   *regexp.Regexp
+	kind string
 }
 
 const (
@@ -116,6 +140,7 @@ var (
 			// adding one: `//go:build linux` → `//go:build ignore`.
 			{regexp.MustCompile("\x00build:[^\x00]*\x00")},
 		},
+		floor: []floorPattern{{regexp.MustCompile(`\b(panic|errors\.New|fmt\.Errorf)\("\x00stub\x00"`), "stub"}},
 	}
 	// langGoTest is a _test.go file, where `go test` also runs examples and
 	// fuzz targets. A named func with no receiver is always top-level. An
@@ -131,6 +156,7 @@ var (
 			langGo.losses[2],
 		},
 		markers: langGo.markers,
+		floor:   langGo.floor,
 	}
 	langJS = &testLanguage{
 		lex: lexStyle{slashComments: true, backticks: true, backtickEscapes: true, regexLiterals: true},
@@ -149,6 +175,7 @@ var (
 		// vitest's options object, in any argument position:
 		// test("…", {skip: true}, fn), test("…", fn, {skip: true}).
 		optionCalls: regexp.MustCompile(`(^|[^.\w$])(describe|context|suite|it|test|specify|bench)(\.\w+)*`),
+		floor:       []floorPattern{{regexp.MustCompile(`\bthrow( new)? [\w.$]*\("\x00stub\x00"`), "stub"}},
 	}
 	langPython = &testLanguage{
 		lex: lexStyle{hashComments: true, tripleQuotes: true},
@@ -174,6 +201,7 @@ var (
 			{regexp.MustCompile(`\bdef (?P<kind>pytest_(ignore_collect|collection_modifyitems))\(`)},
 			{regexp.MustCompile(`(^|[^.\w])(?P<kind>collect_ignore(_glob)?)(:[^=]+)?(\+?=|\.(append|extend|insert)\()`)},
 		},
+		floor: []floorPattern{{regexp.MustCompile(`\braise [\w.]+\("\x00stub\x00"`), "stub"}},
 	}
 	langRuby = &testLanguage{
 		lex: lexStyle{hashComments: true, ruby: true, regexLiterals: true},
@@ -188,6 +216,7 @@ var (
 			// `:focus`) — the normalized form reads both the same way.
 			{regexp.MustCompile(`(^|[^.\w])(?P<kind>skip|pending|xit|xspecify|xexample|xdescribe|xcontext|fit|fdescribe|fcontext|focus)\b`)},
 		},
+		floor: []floorPattern{{regexp.MustCompile(`\braise( [\w:]+,)?\(?"\x00stub\x00"`), "stub"}},
 	}
 	jsExtension = regexp.MustCompile(`\.[cm]?[jt]sx?$`)
 	goDirective = regexp.MustCompile(`^//\s*(go:build|\+build)\b`)
@@ -242,6 +271,8 @@ func stripCode(src string, style lexStyle) (string, string) {
 				out = append(out, " \x00build:"+strings.Join(strings.Fields(src[i+2:end]), " ")+"\x00 "...)
 			case style.goOutput && goOutput.MatchString(src[i:end]):
 				out = append(out, " \x00output\x00 "...)
+			case style.directives:
+				out = appendSuppression(out, src[i+2:end])
 			}
 			out = append(out, ' ')
 			i = end
@@ -250,11 +281,18 @@ func stripCode(src string, style lexStyle) (string, string) {
 			if end < 0 {
 				return "", "a /* block comment"
 			}
+			if style.directives {
+				out = appendSuppression(out, src[i+2:i+2+end])
+			}
 			out = append(out, ' ')
 			i += 2 + end + 2
 		case style.hashComments && c == '#':
+			end := lineEnd(src, i)
+			if style.directives {
+				out = appendSuppression(out, src[i+1:end])
+			}
 			out = append(out, ' ')
-			i = lineEnd(src, i)
+			i = end
 		case style.ruby && lineStart && strings.HasPrefix(src[i:], "=begin"):
 			end := strings.Index(src[i:], "\n=end")
 			if end < 0 {
@@ -345,12 +383,75 @@ func stripCode(src string, style lexStyle) (string, string) {
 // text of an identifier, and `"x"` otherwise.
 func blankLiteral(content string, style lexStyle) string {
 	switch {
+	case style.directives && stubText.MatchString(content):
+		return "\"\x00stub\x00\""
 	case !style.optionStrings || content == "":
 		return `""`
 	case jsIdentifier.MatchString(content):
 		return `"` + content + `"`
 	}
 	return `"x"`
+}
+
+// suppressionDirective is a comment that tells a linter, type checker,
+// formatter, or coverage tool to look away: the cheapest way to turn red lint
+// CI green without touching the code it flagged. Only a directive that OPENS
+// the comment counts — after leading space, `*`, or `!` — which is where every
+// one of these tools requires it, so prose that merely mentions "noqa" does
+// not.
+var suppressionDirective = regexp.MustCompile(`^[\s*!]*(?i:(nolint|lint:(?:file-)?ignore|` +
+	`(?:eslint|oxlint)-disable(?:-next-line|-line)?|biome-ignore(?:-all|-start)?|deno-lint-ignore(?:-file)?|` +
+	`prettier-ignore|(?:istanbul|c8|v8) ignore|@ts-(?:ignore|nocheck|expect-error)|` +
+	`type:\s*ignore|pyright:\s*ignore|pyre-(?:ignore|fixme)|mypy:\s*ignore-errors|pylint:\s*disable|` +
+	`pragma:\s*no\s*cover|ruff:\s*noqa|noqa|#?nosec|fmt:\s*(?:off|skip)|` +
+	`rubocop:(?:disable|todo)|standard:disable|steep:ignore|:nocov:))`)
+
+// stubText is a string literal that says the code around it is not written:
+// `panic("not implemented")`, gopls's `panic("unimplemented")`,
+// `throw new Error("TODO")`.
+var stubText = regexp.MustCompile(`(?i)^\s*(not\s+(yet\s+)?implemented|unimplemented|todo)\b`)
+
+// appendSuppression adds a suppress token when comment opens with a
+// suppression directive. The kind is the directive's name, lowercased and
+// unspaced, so `# type: ignore[attr]` and `#type:ignore` are one kind.
+func appendSuppression(out []byte, comment string) []byte {
+	match := suppressionDirective.FindStringSubmatch(comment)
+	if match == nil {
+		return out
+	}
+	kind := strings.ToLower(strings.Join(strings.Fields(match[1]), ""))
+	return append(out, " \x00suppress:"+strings.TrimPrefix(kind, "#")+"\x00 "...)
+}
+
+// suppressToken finds the lexer's suppress tokens in a directives-normalized
+// form.
+var suppressToken = regexp.MustCompile("\x00suppress:([^\x00]+)\x00")
+
+// floorKinds counts what lowers the bar in src — suppressions by directive,
+// stubs — or names the construct left open at end of file.
+func (l *testLanguage) floorKinds(src string) (map[string]int, string) {
+	style := l.lex
+	style.directives = true
+	stripped, problem := stripCode(src, style)
+	if problem != "" {
+		return nil, problem
+	}
+	normalized := collapseSpace(stripped)
+	kinds := map[string]int{}
+	for _, match := range suppressToken.FindAllStringSubmatch(normalized, -1) {
+		kinds["suppression "+match[1]]++
+	}
+	for _, pattern := range l.floor {
+		kinds[pattern.kind] += len(pattern.re.FindAllStringIndex(normalized, -1))
+	}
+	return kinds, ""
+}
+
+// lineFloor counts floor kinds on one line out of context, for line numbers
+// only; a construct the line leaves open costs only the number.
+func (l *testLanguage) lineFloor(src string) map[string]int {
+	kinds, _ := l.floorKinds(src)
+	return kinds
 }
 
 // regexKeywords end an expression's left side: a `/` after one opens a regex.
@@ -779,7 +880,8 @@ func shortSHA(sha string) string {
 
 // gateTestsIntact: no test file changed since the pinned base may lose a
 // test, an assertion, or an m.Run call, or gain a skip/focus marker, and
-// none may be deleted — unless the definition's allow list names it. Counts
+// none may be deleted; no source file may gain a checker suppression or a
+// not-implemented stub — unless the definition's allow list names it. Counts
 // are whole-file, so a rename inside the file, an assertion replaced with a
 // stronger one, or a reworded skip passes; a renamed FILE is a deletion,
 // since --no-renames keeps the old path visible as gone.
@@ -789,10 +891,11 @@ func gateTestsIntact(gc gateContext) protocol.GateReport {
 		report.Check("base commit", false, "the attempt has no pinned base commit to diff against")
 		return report
 	}
-	j := &intactJudge{gc: gc, report: &report, base: shortSHA(gc.baseSHA)}
+	j := &intactJudge{gc: gc, report: &report, base: shortSHA(gc.baseSHA), floorCredit: map[string]int{}}
 	if !j.judgeTracked() || !j.judgeUntracked() || !j.judgeIndexFlags() {
 		return report
 	}
+	j.settleFloor()
 	if j.checked == 0 {
 		report.Check("tests", true, "no test file changed since base "+j.base)
 	}
@@ -804,6 +907,11 @@ type intactJudge struct {
 	report  *protocol.GateReport
 	base    string
 	checked int
+	// The floor pass: gains per file, removals anywhere that offset them,
+	// and source files read whole, which pass unless settleFloor flags them.
+	floorGains  []floorGain
+	floorCredit map[string]int
+	floorClean  []string
 }
 
 // git runs one hardened git command; a failure is a failed check, and the
@@ -849,7 +957,11 @@ func (j *intactJudge) judgeTracked() bool {
 
 // judgeDiffFile judges one file the diff shows as changed.
 func (j *intactJudge) judgeDiffFile(file *fileDiff) {
-	if !testPathPattern.MatchString(file.path) || j.exempt(file.path) {
+	if !testPathPattern.MatchString(file.path) {
+		j.judgeSource(file.path, file)
+		return
+	}
+	if j.exempt(file.path) {
 		return
 	}
 	switch {
@@ -958,32 +1070,67 @@ func runnerSkips(file string) bool {
 // judgeUntracked reads every untracked test file, gitignored ones included —
 // a .gitignore entry hides a file from git, not from the runner — as all
 // added. Embedded repositories, which git lists as one opaque directory,
-// fail when they hold test files.
+// fail when they hold test files. An untracked source file is judged for
+// suppressions and stubs only when it is not ignored: an ignored one is a
+// build output or a dependency, never committed, and no linter reads it.
 func (j *intactJudge) judgeUntracked() bool {
 	listed, ok := j.git("git ls-files", "ls-files", "-z", "--others")
 	if !ok {
 		return false
+	}
+	visible, ok := j.git("git ls-files", "ls-files", "-z", "--others", "--exclude-standard")
+	if !ok {
+		return false
+	}
+	committable := map[string]bool{}
+	for _, name := range strings.Split(visible, "\x00") {
+		committable[name] = true
 	}
 	for _, name := range strings.Split(listed, "\x00") {
 		switch {
 		case name == "":
 		case strings.HasSuffix(name, "/"):
 			j.judgeEmbedded(strings.TrimSuffix(name, "/"))
-		case !testPathPattern.MatchString(name) || runnerSkips(name) || j.exempt(name):
+		case !testPathPattern.MatchString(name):
+			j.judgeUntrackedSource(name, committable[name])
+		case runnerSkips(name) || j.exempt(name):
 		default:
 			content, problem := readTestFile(j.gc.worktree, name)
 			if problem != "" {
 				j.report.Check(name, false, "untracked test file "+problem)
 				continue
 			}
-			file := &fileDiff{path: name, created: true}
-			for i, text := range strings.Split(content, "\n") {
-				file.added = append(file.added, diffLine{i + 1, text})
-			}
-			j.compare(name, "", content, file)
+			j.compare(name, "", content, allAdded(name, content))
 		}
 	}
 	return true
+}
+
+// judgeUntrackedSource judges a new, committable source file as all added.
+func (j *intactJudge) judgeUntrackedSource(name string, committable bool) {
+	lang := testLanguageOf(name)
+	if !committable || lang == nil || runnerSkips(name) {
+		return
+	}
+	if glob := allowedBy(name, j.gc.allow); glob != "" {
+		j.report.Check(name, true, fmt.Sprintf("exempt: allowed by %q", glob))
+		return
+	}
+	content, problem := readTestFile(j.gc.worktree, name)
+	if problem != "" {
+		j.notInspected(name, problem)
+		return
+	}
+	j.judgeSourceContent(name, lang, "", content, allAdded(name, content))
+}
+
+// allAdded is a new file's diff: every line added.
+func allAdded(name, content string) *fileDiff {
+	file := &fileDiff{path: name, created: true}
+	for i, text := range strings.Split(content, "\n") {
+		file.added = append(file.added, diffLine{i + 1, text})
+	}
+	return file
 }
 
 // judgeEmbedded fails an embedded git repository holding test files: git
@@ -1110,9 +1257,163 @@ func (j *intactJudge) compare(name, before, after string, file *fileDiff) {
 				shown))
 		}
 	}
+	// compare has already failed a file left open at end, so the floor pass
+	// reads both sides whole; settleFloor reports what it finds.
+	j.judgeFloor(name, lang, before, after, file)
 	if len(j.report.Violations()) == failed {
 		j.report.Check(name, true, "no test or assertion lost, no skip added")
 	}
+}
+
+// judgeFloor records what the file gained and lost since base, per floor
+// kind; settleFloor turns the gains into findings once every file is read.
+// Counts are whole-file and per kind, like markers, so a suppression moved,
+// reworded, or narrowed within its file nets to nothing. It returns why the
+// file could not be read, if it could not.
+func (j *intactJudge) judgeFloor(name string, lang *testLanguage, before, after string, file *fileDiff) string {
+	oldKinds, problem := lang.floorKinds(before)
+	if problem != "" {
+		return "the base version has " + problem + " still open at end of file"
+	}
+	nowKinds, problem := lang.floorKinds(after)
+	if problem != "" {
+		return "the worktree version has " + problem + " still open at end of file"
+	}
+	for kind, was := range oldKinds {
+		if lost := was - nowKinds[kind]; lost > 0 {
+			j.floorCredit[kind] += lost
+		}
+	}
+	for _, kind := range sortedKeys(nowKinds) {
+		if gained := nowKinds[kind] - oldKinds[kind]; gained > 0 {
+			j.floorGains = append(j.floorGains, floorGain{name: name, lang: lang, file: file, kind: kind, count: gained})
+		}
+	}
+	return ""
+}
+
+// floorGain is one file's net gain of one floor kind.
+type floorGain struct {
+	name  string
+	lang  *testLanguage
+	file  *fileDiff
+	kind  string
+	count int
+}
+
+// creditDeleted counts a deleted source file's suppressions and stubs as
+// lost, so code moved out of it is not new.
+func (j *intactJudge) creditDeleted(name string, lang *testLanguage) {
+	before, problem := j.baseContent(name)
+	if problem != "" || uninspectableText(before) != "" {
+		return
+	}
+	if kinds, problem := lang.floorKinds(before); problem == "" {
+		for kind, n := range kinds {
+			j.floorCredit[kind] += n
+		}
+	}
+}
+
+// settleFloor fails every suppression or stub the change gained, one finding
+// per gained line, after offsetting what it removed anywhere else: the gate
+// diffs with --no-renames, so a file renamed or split carries its existing
+// suppressions into files that look new, and moving one is not adding one.
+func (j *intactJudge) settleFloor() {
+	sort.SliceStable(j.floorGains, func(a, b int) bool { return j.floorGains[a].name < j.floorGains[b].name })
+	flagged := map[string]bool{}
+	reported := map[string]bool{}
+	for _, gain := range j.floorGains {
+		credit := min(gain.count, j.floorCredit[gain.kind])
+		j.floorCredit[gain.kind] -= credit
+		lines := floorLines(gain.lang, gain.file, gain.kind)
+		for k := 0; k < gain.count; k++ {
+			shown, line := gain.kind, diffLine{}
+			if k < len(lines) {
+				line = lines[k]
+				shown = strings.TrimSpace(line.text)
+			}
+			if k < credit {
+				j.report.Check(findingItem(gain.name, line.line), true, fmt.Sprintf(
+					"moves an existing %s (%s): the change removes one elsewhere", gain.kind, shown))
+				continue
+			}
+			item := findingItem(gain.name, line.line)
+			if line.line > 0 && reported[item] {
+				continue
+			}
+			reported[item] = true
+			flagged[gain.name] = true
+			note := fmt.Sprintf("adds a checker suppression (%s); remove it and fix what the checker "+
+				"reports instead — a silenced linter, type checker, or coverage rule checks nothing", shown)
+			if gain.kind == "stub" {
+				note = fmt.Sprintf("adds a not-implemented stub (%s); implement it — code that only "+
+					"panics or throws \"not implemented\" is unfinished work, not a fix", shown)
+			}
+			j.report.Check(item, false, note)
+		}
+	}
+	for _, name := range j.floorClean {
+		if !flagged[name] {
+			j.report.Check(name, true, "no suppression or stub added")
+		}
+	}
+}
+
+// judgeSource judges a changed file that is not a test: it may not gain a
+// checker suppression or a stub. Unlike a test file, a source file the gate
+// cannot read is noted, not failed — every changed source file passes
+// through here, generated bundles and lexer edge cases included, and a
+// builder cannot repair a base version the lexer misreads. Hiding a
+// suppression that way takes a 4 MiB file or an unterminated literal, which
+// the reviewers see.
+func (j *intactJudge) judgeSource(name string, file *fileDiff) {
+	lang := testLanguageOf(name)
+	if lang == nil || runnerSkips(name) {
+		return
+	}
+	if file.deleted {
+		j.creditDeleted(name, lang)
+		return
+	}
+	if glob := allowedBy(name, j.gc.allow); glob != "" {
+		j.report.Check(name, true, fmt.Sprintf("exempt: allowed by %q", glob))
+		return
+	}
+	if file.binary {
+		j.notInspected(name, "git reports it as binary")
+		return
+	}
+	before := ""
+	if !file.created {
+		var problem string
+		if before, problem = j.baseContent(name); problem != "" {
+			j.notInspected(name, problem)
+			return
+		}
+	}
+	after, problem := readTestFile(j.gc.worktree, name)
+	if problem != "" {
+		j.notInspected(name, problem)
+		return
+	}
+	j.judgeSourceContent(name, lang, before, after, file)
+}
+
+// judgeSourceContent is judgeSource once both sides are read.
+func (j *intactJudge) judgeSourceContent(name string, lang *testLanguage, before, after string, file *fileDiff) {
+	problem := uninspectableText(before + after)
+	if problem == "" {
+		if problem = j.judgeFloor(name, lang, before, after, file); problem == "" {
+			j.floorClean = append(j.floorClean, name)
+			return
+		}
+	}
+	j.notInspected(name, problem)
+}
+
+func (j *intactJudge) notInspected(name, problem string) {
+	j.report.Check(name, true, "not inspected for suppressions or stubs: "+problem)
 }
 
 func findingItem(name string, line int) string {
@@ -1136,15 +1437,26 @@ func lineOf(lang *testLanguage, lines []diffLine, re *regexp.Regexp) int {
 // markerLines lists added lines carrying a marker of kind, preferring those
 // whose text the file did not also remove (a moved line is not the gain).
 func markerLines(lang *testLanguage, file *fileDiff, kind string) []diffLine {
+	return gainLines(file, func(text string) int { return lang.lineKinds(text)[kind] })
+}
+
+// floorLines is markerLines for a floor kind.
+func floorLines(lang *testLanguage, file *fileDiff, kind string) []diffLine {
+	return gainLines(file, func(text string) int { return lang.lineFloor(text)[kind] })
+}
+
+// gainLines lists added lines that count > 0, those whose text the file did
+// not also remove first.
+func gainLines(file *fileDiff, count func(string) int) []diffLine {
 	removed := map[string]int{}
 	for _, line := range file.removed {
-		if lang.lineKinds(line.text)[kind] > 0 {
+		if count(line.text) > 0 {
 			removed[strings.TrimSpace(line.text)]++
 		}
 	}
 	var fresh, moved []diffLine
 	for _, line := range file.added {
-		if lang.lineKinds(line.text)[kind] == 0 {
+		if count(line.text) == 0 {
 			continue
 		}
 		text := strings.TrimSpace(line.text)

@@ -251,7 +251,7 @@ func intactViolations(report protocol.GateReport) []string {
 		file, _, _ := strings.Cut(check.Item, ":")
 		kind := "?"
 		for _, candidate := range []string{"unterminated", "uninspectable", "too large", "embedded", "index flag", "m.Run",
-			"deleted", "test function", "assertion", "skip"} {
+			"suppression", "stub", "deleted", "test function", "assertion", "skip"} {
 			if strings.Contains(check.Note, candidate) {
 				kind = candidate
 				break
@@ -956,5 +956,190 @@ func TestTestsIntactReadsQuotedAndSpacedPaths(t *testing.T) {
 	want := []string{"pkg/tab\there_test.go deleted", "pkg/with space_test.go deleted"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("violations = %q, want %q", got, want)
+	}
+}
+
+// floorBase is source the floor cases start from: one suppression already
+// in place, which the change may keep, move, or narrow.
+var floorBase = map[string]string{
+	"pkg/b.go":   "package a\n\nfunc b() error {\n\treturn nil //nolint:nilerr // reviewed\n}\n",
+	"src/app.ts": "export function app(): number {\n  return 1;\n}\n",
+	"lib/a.rb":   "def a\n  1\nend\n",
+}
+
+// A builder repairing red lint or type-check CI can silence the checker
+// instead of fixing the code, or leave a stub that only panics; neither
+// loses a test. The gate refuses both in any source file, test or not, and
+// leaves alone what only looks like one.
+func TestTestsIntactFlagsSuppressionsAndStubs(t *testing.T) {
+	appendTo := func(name, text string) map[string]string {
+		base, ok := floorBase[name]
+		if !ok {
+			base = testsIntactBase[name]
+		}
+		return map[string]string{name: base + text}
+	}
+	cases := []struct {
+		name        string
+		committed   map[string]string
+		uncommitted map[string]string
+		allow       []string
+		want        []string
+	}{
+		// Suppressions, per ecosystem.
+		{name: "Go nolint", uncommitted: appendTo("pkg/a.go", "\nfunc f() { g() //nolint:errcheck\n}\n"),
+			want: []string{"pkg/a.go suppression"}},
+		{name: "Go nosec", uncommitted: appendTo("pkg/a.go", "\n// #nosec G104\nfunc f() {}\n"),
+			want: []string{"pkg/a.go suppression"}},
+		{name: "Go staticcheck ignore", uncommitted: appendTo("pkg/a.go", "\n//lint:ignore SA1019 old\nfunc f() {}\n"),
+			want: []string{"pkg/a.go suppression"}},
+		{name: "eslint line", uncommitted: appendTo("src/app.ts", "// eslint-disable-next-line no-console\nconsole.log(1);\n"),
+			want: []string{"src/app.ts suppression"}},
+		{name: "eslint block", uncommitted: appendTo("src/app.ts", "/* eslint-disable */\n"),
+			want: []string{"src/app.ts suppression"}},
+		{name: "ts-ignore", uncommitted: appendTo("src/app.ts", "// @ts-ignore\nconst n: number = \"x\";\n"),
+			want: []string{"src/app.ts suppression"}},
+		{name: "ts-expect-error in JSX", uncommitted: appendTo("src/app.ts", "const v = {/* @ts-expect-error */ x};\n"),
+			want: []string{"src/app.ts suppression"}},
+		{name: "istanbul ignore", uncommitted: appendTo("src/app.ts", "/* istanbul ignore next */\nfunction g() {}\n"),
+			want: []string{"src/app.ts suppression"}},
+		{name: "Python noqa", uncommitted: appendTo("src/helpers.py", "import os  # noqa: F401\n"),
+			want: []string{"src/helpers.py suppression"}},
+		{name: "Python type ignore", uncommitted: appendTo("src/helpers.py", "x: int = \"a\"  # type: ignore[assignment]\n"),
+			want: []string{"src/helpers.py suppression"}},
+		{name: "pylint disable", uncommitted: appendTo("src/helpers.py", "# pylint: disable=broad-except\n"),
+			want: []string{"src/helpers.py suppression"}},
+		{name: "pragma no cover", uncommitted: appendTo("src/helpers.py", "def g():  # pragma: no cover\n    return 2\n"),
+			want: []string{"src/helpers.py suppression"}},
+		{name: "rubocop disable", uncommitted: appendTo("lib/a.rb", "# rubocop:disable Metrics/AbcSize\n"),
+			want: []string{"lib/a.rb suppression"}},
+		{name: "a suppression in a test file", uncommitted: appendTo("pkg/a_test.go", "\nvar _ = 1 //nolint:gochecknoglobals\n"),
+			want: []string{"pkg/a_test.go suppression"}},
+		{name: "a committed suppression", committed: appendTo("src/app.ts", "// @ts-nocheck\n"),
+			want: []string{"src/app.ts suppression"}},
+		{name: "a suppression in a new untracked file",
+			uncommitted: map[string]string{"src/new.ts": "// eslint-disable-next-line\nexport const x = 1;\n"},
+			want:        []string{"src/new.ts suppression"}},
+		{name: "two suppressions are two findings",
+			uncommitted: appendTo("src/helpers.py", "import os  # noqa\nimport re  # noqa\n"),
+			want:        []string{"src/helpers.py suppression", "src/helpers.py suppression"}},
+		// Stubs.
+		{name: "Go panic stub", uncommitted: appendTo("pkg/a.go", "\nfunc f() { panic(\"not implemented\") }\n"),
+			want: []string{"pkg/a.go stub"}},
+		{name: "gopls unimplemented stub", uncommitted: appendTo("pkg/a.go", "\nfunc f() { panic(\"unimplemented\") }\n"),
+			want: []string{"pkg/a.go stub"}},
+		{name: "Go TODO error", uncommitted: appendTo("pkg/a.go", "\nfunc f() error { return errors.New(\"TODO: implement\") }\n"),
+			want: []string{"pkg/a.go stub"}},
+		{name: "JS throw stub", uncommitted: appendTo("src/app.ts", "export function g() { throw new Error(`Not implemented`); }\n"),
+			want: []string{"src/app.ts stub"}},
+		{name: "Python raise stub", uncommitted: appendTo("src/helpers.py", "def g():\n    raise NotImplementedError(\"not yet implemented\")\n"),
+			want: []string{"src/helpers.py stub"}},
+		{name: "Ruby raise stub", uncommitted: appendTo("lib/a.rb", "def b\n  raise NotImplementedError, \"not implemented\"\nend\n"),
+			want: []string{"lib/a.rb stub"}},
+		// Honest changes, and what only looks like a floor violation.
+		{name: "an existing suppression kept while the file grows",
+			uncommitted: appendTo("pkg/b.go", "\nfunc c() {}\n")},
+		{name: "an existing suppression narrowed",
+			uncommitted: map[string]string{"pkg/b.go": strings.Replace(floorBase["pkg/b.go"],
+				"//nolint:nilerr // reviewed", "//nolint:nilerr", 1)}},
+		{name: "an existing suppression removed",
+			uncommitted: map[string]string{"pkg/b.go": strings.Replace(floorBase["pkg/b.go"],
+				" //nolint:nilerr // reviewed", "", 1)}},
+		{name: "prose that mentions a directive",
+			uncommitted: appendTo("src/helpers.py", "# Do not add noqa here; fix the import.\n")},
+		{name: "a directive inside a string",
+			uncommitted: appendTo("src/app.ts", "const doc = \"// eslint-disable-next-line\";\n")},
+		{name: "an abstract method",
+			uncommitted: appendTo("src/helpers.py", "def g():\n    raise NotImplementedError\n\ndef h():\n    raise NotImplementedError(\"subclasses must implement h\")\n")},
+		{name: "an empty catch that documents itself",
+			uncommitted: appendTo("src/app.ts", "try { localStorage.setItem(\"k\", \"v\"); } catch { /* storage can be disabled */ }\n")},
+		{name: "a suppression in a non-source file",
+			uncommitted: map[string]string{"README.md": "Never write eslint-disable.\n<!-- eslint-disable -->\n"}},
+		{name: "a suppression in an ignored build output",
+			uncommitted: map[string]string{".gitignore": "/dist/\n", "dist/app.js": "/* eslint-disable */\n"}},
+		{name: "a suppression in an allowed path", allow: []string{"src/*.ts"},
+			uncommitted: appendTo("src/app.ts", "// @ts-ignore\n")},
+		{name: "a deleted file that held a suppression",
+			committed: map[string]string{"pkg/b.go": ""}},
+		// Moving a suppression is not adding one: --no-renames shows a renamed
+		// or split file as one deleted or shrunk and one new.
+		{name: "a file carrying a suppression renamed",
+			committed: map[string]string{"pkg/b.go": "", "pkg/renamed.go": floorBase["pkg/b.go"]}},
+		{name: "a function carrying a suppression moved to a new file",
+			uncommitted: map[string]string{
+				"pkg/b.go":     "package a\n",
+				"pkg/moved.go": floorBase["pkg/b.go"]}},
+		{name: "a suppression moved and another added",
+			uncommitted: map[string]string{
+				"pkg/b.go":     "package a\n",
+				"pkg/moved.go": floorBase["pkg/b.go"] + "\nfunc d() { g() //nolint:errcheck\n}\n"},
+			want: []string{"pkg/moved.go suppression"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, _ := testsIntactRepo(t)
+			for name, content := range floorBase {
+				writeIntactFile(t, dir, name, content)
+			}
+			commit := func() {
+				intactGit(t, dir, "add", "-A")
+				intactGit(t, dir, "-c", "user.email=test@jig.local", "-c", "user.name=jig test",
+					"commit", "--quiet", "-m", "step")
+			}
+			commit()
+			base := strings.TrimSpace(intactGit(t, dir, "rev-parse", "HEAD"))
+			if tc.committed != nil {
+				for name, content := range tc.committed {
+					if content == "" {
+						intactGit(t, dir, "rm", "--quiet", name)
+						continue
+					}
+					writeIntactFile(t, dir, name, content)
+				}
+				commit()
+			}
+			applyIntactEdit(t, dir, &intactEdit{write: tc.uncommitted})
+			report := gateTestsIntact(gateContext{ctx: context.Background(), worktree: dir,
+				baseSHA: base, allow: tc.allow})
+			got := intactViolations(report)
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("violations = %q, want %q\nchecks: %+v", got, tc.want, report.Checks)
+			}
+		})
+	}
+}
+
+// A floor finding names the added line and says what to do instead; a
+// source file the lexer cannot finish is noted, never failed, since the
+// builder may not be able to repair it.
+func TestTestsIntactFloorFindingsAndUnreadableSource(t *testing.T) {
+	dir, base := testsIntactRepo(t)
+	writeIntactFile(t, dir, "pkg/a.go", "package a\n\nfunc f() {\n\tpanic(\"not implemented\")\n}\n")
+	writeIntactFile(t, dir, "src/helpers.py", "def helper():\n    return 1  # type: ignore\n")
+	writeIntactFile(t, dir, "src/open.ts", "const s = `never closed\n// @ts-ignore\n")
+	report := gateTestsIntact(gateContext{ctx: context.Background(), worktree: dir, baseSHA: base})
+	want := map[string]string{
+		"pkg/a.go:4":       `adds a not-implemented stub (panic("not implemented")); implement it`,
+		"src/helpers.py:2": "adds a checker suppression (return 1  # type: ignore); remove it and fix what the checker reports",
+	}
+	noted := false
+	for _, check := range report.Checks {
+		if check.Item == "src/open.ts" {
+			noted = check.Ok && strings.Contains(check.Note, "not inspected for suppressions or stubs")
+		}
+		if check.Ok {
+			continue
+		}
+		note, ok := want[check.Item]
+		if !ok || !strings.Contains(check.Note, note) {
+			t.Fatalf("unexpected failed check %+v", check)
+		}
+		delete(want, check.Item)
+	}
+	if len(want) > 0 {
+		t.Fatalf("missing findings %v in %+v", want, report.Checks)
+	}
+	if !noted {
+		t.Fatalf("an unreadable source file must be noted as uninspected, not failed: %+v", report.Checks)
 	}
 }
