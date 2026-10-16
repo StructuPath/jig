@@ -11,8 +11,17 @@ export function projectName(repository: string): string {
   return repository.replace(/\/$/, "").split("/").pop() || repository;
 }
 
+// taskDelivery reads the delivery a task was started with. Runs started
+// before the choice existed carry no task_delivery and were all kept local.
+export function taskDelivery(run: Run): "local" | "publish" {
+  return run.parameters?.task_delivery === "publish" ? "publish" : "local";
+}
+
 export function taskState(run: Run): string {
-  if (run.state === "mixed" && run.targets.length === 1 && run.snapshot.includes('hold_when: "jig_ui_delivery != publish"')) {
+  // Only a deliberately local task ends "ready" while unpublished; a publish
+  // task that stopped short of its pull request keeps the run's real state.
+  if (run.state === "mixed" && run.targets.length === 1 && taskDelivery(run) === "local" &&
+    run.snapshot.includes('hold_when: "jig_ui_delivery != publish"')) {
     return run.parameters?.task_mode === "ask" ? "complete" : "ready";
   }
   return run.state;

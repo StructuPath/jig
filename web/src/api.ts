@@ -51,14 +51,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+export interface TaskOptions {
+  delivery?: "local" | "publish";
+  context?: { label: string; body: string }[];
+  ref?: string;
+  continues?: string;
+}
+
 export const api = {
   definitions: () => request<Definition[]>("/api/definitions"),
   createDefinition: (source: string) => request<Definition>("/api/definitions", {
     method: "POST", body: JSON.stringify({ source }),
   }),
-  startTask: (definitionID: string, repository: string, task: string, mode: string) => request<RunView>("/api/runs", {
+  // A continuation carries the earlier task as untrusted context (the server
+  // composes it after the trusted instructions, R2) and, when that task's
+  // branch was pushed, starts from the branch so its changes are present.
+  startTask: (definitionID: string, repository: string, task: string, mode: string,
+    { delivery = "local", context, ref, continues }: TaskOptions = {}) => request<RunView>("/api/runs", {
     method: "POST", body: JSON.stringify({ definition_id: definitionID, instructions: task,
-      parameters: { task_title: task, task_mode: mode }, targets: [{ repository }] }),
+      parameters: { task_title: task, task_mode: mode, task_delivery: delivery, ...(continues ? { task_continues: continues } : {}) },
+      ...(context?.length ? { context } : {}),
+      targets: [{ repository, ...(ref ? { ref } : {}) }] }),
   }),
   queue: () => request<QueueView>("/api/queue"),
   runs: () => request<Run[] | null>("/api/runs").then((runs) => runs ?? []),
