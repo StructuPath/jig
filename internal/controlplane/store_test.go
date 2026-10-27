@@ -477,6 +477,9 @@ func TestNMissedHeartbeatsSweepTheAttemptToLostAndAStaleCompletionIsRejected(t *
 	if job.State != protocol.JobFailed {
 		t.Fatalf("job state = %q, want failed after sweep", job.State)
 	}
+	if got := runState(t, store, claim.Job.RunID); got != protocol.RunFailed {
+		t.Fatalf("run state = %q, want failed after sweep", got)
+	}
 	// The zombie wakes and tries to complete with its stale token.
 	_, err = store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
 		LeaseToken: tokenA, State: protocol.AttemptAccepted, Result: "zombie work",

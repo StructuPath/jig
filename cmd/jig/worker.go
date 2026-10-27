@@ -322,15 +322,22 @@ func workerAttemptRunner(
 		// (which rides the heartbeat response) and the operator's Ctrl-C. The
 		// engine watches one channel, so they are merged rather than the
 		// second one being dropped.
+		cancelled, stopCancellation := anyClosed(signalCtx.Done(), prepared.Cancelled())
+		defer func() {
+			if !kept {
+				stopCancellation()
+			}
+		}()
 		outcome := runner.Execute(context.WithoutCancel(ctx), engine.Attempt{
 			Claim:        prepared.Claim,
 			WorktreePath: prepared.WorktreePath,
 			Branch:       prepared.Branch,
 			BaseSHA:      prepared.BaseSHA,
-			Cancelled:    anyClosed(signalCtx.Done(), prepared.Cancelled()),
+			Cancelled:    cancelled,
 			FreshenLease: prepared.FreshenLease,
 		})
 		kept = worker.DeferToContinuation(&outcome, func() {
+			stopCancellation()
 			closeTrace()
 			removeScratch()
 		})
@@ -339,24 +346,28 @@ func workerAttemptRunner(
 }
 
 // anyClosed merges cancellation channels: the result closes as soon as any
-// input does. It never blocks the caller and never leaks past the first
-// close, which is all the engine's one-shot cancellation signal needs.
-func anyClosed(channels ...<-chan struct{}) <-chan struct{} {
-	merged := make(chan struct{})
-	var once sync.Once
+// input does. The owner stops its waiters after normal completion too (R5).
+func anyClosed(channels ...<-chan struct{}) (<-chan struct{}, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var waiters sync.WaitGroup
 	for _, channel := range channels {
 		if channel == nil {
 			continue
 		}
+		waiters.Add(1)
 		go func(c <-chan struct{}) {
+			defer waiters.Done()
 			select {
 			case <-c:
-				once.Do(func() { close(merged) })
-			case <-merged:
+				cancel()
+			case <-ctx.Done():
 			}
 		}(channel)
 	}
-	return merged
+	return ctx.Done(), func() {
+		cancel()
+		waiters.Wait()
+	}
 }
 
 // printReconcileReport is the operator's startup picture: identity, probed

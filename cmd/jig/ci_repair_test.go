@@ -287,6 +287,11 @@ func TestReleasingTheRepairContinuationDrainsTheTraceBeforeTheAttemptCompletes(t
 		t.Fatal(err)
 	}
 	gate := &ingestGate{proxy: httputil.NewSingleHostReverseProxy(target)}
+	director := gate.proxy.Director
+	gate.proxy.Director = func(request *http.Request) {
+		director(request)
+		request.Host = target.Host
+	}
 	proxy := httptest.NewServer(gate)
 	defer proxy.Close()
 

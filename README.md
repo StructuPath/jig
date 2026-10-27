@@ -494,6 +494,11 @@ modifications, renames are decomposed into literal paths, and gitignored
 files, the `.git` directory, and hook paths are all watched, because a
 planted hook would execute during jig's own later git commands.
 
+Comparison and file rollback use the pre-phase commit, so committing an edit
+does not hide it. A read-only role that moves `HEAD` aborts even if it later
+reverts the edit. Jig retains that history for inspection rather than
+rewriting it; a crashed phase that moved `HEAD` is not retried.
+
 What follows from that: **the `writes` allowlist is the security control you
 actually configure.** `writes: ["**"]` (the stock builders' default, so the
 examples work anywhere) is the weakest boundary jig can enforce. Narrow it.
@@ -546,7 +551,11 @@ wrapper script wrong.
 
 `jig serve` binds `127.0.0.1` and refuses a non-loopback address without
 `--allow-non-loopback`. There is no authentication and no TLS: the control
-plane assumes one trusted operator on one machine. State-changing routes also
+plane assumes one trusted operator on one machine. Read routes reject untrusted
+Host headers even without an Origin header, preventing DNS-rebound names from
+reading local data. An explicitly enabled non-loopback listener accepts its own
+IP address; reverse proxies must rewrite Host to the listener's authority or
+present the UI token. State-changing routes also
 reject requests whose `Origin` is not the server's own, which is what stops a
 web page you happen to be visiting from driving your control plane through
 your browser.

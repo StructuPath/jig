@@ -63,7 +63,10 @@ export function usePolled<T>(load: () => Promise<T>, intervalMs: number, key: st
 
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
     const run = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const value = await loadRef.current();
         if (cancelled) return;
@@ -72,6 +75,7 @@ export function usePolled<T>(load: () => Promise<T>, intervalMs: number, key: st
       } catch (failure) {
         if (!cancelled) setError(failure as Error);
       } finally {
+        inFlight = false;
         if (!cancelled) setLoading(false);
       }
     };

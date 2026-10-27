@@ -78,6 +78,8 @@ type fingerprint map[string]string
 // worktree entirely) and must never be confusable with a repository path an
 // allowlist pattern could match.
 type treeSnapshot struct {
+	// head pins comparison and rollback before an agent can move HEAD (R10).
+	head string
 	// paths is worktree content keyed by repo-relative path: tracked files
 	// differing from HEAD, untracked files, and ignored-but-present paths.
 	paths fingerprint
@@ -95,14 +97,27 @@ type treeSnapshot struct {
 // HEAD, every untracked or ignored path present in it, and the repository
 // metadata that can make jig's own git commands execute code.
 func snapshotTree(ctx context.Context, dir string) (treeSnapshot, error) {
+	return snapshotTreeAt(ctx, dir, "")
+}
+
+func snapshotTreeAt(ctx context.Context, dir, base string) (treeSnapshot, error) {
+	head, err := runGit(ctx, dir, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return treeSnapshot{}, fmt.Errorf("pin boundary HEAD: %w", err)
+	}
+	head = strings.TrimSpace(head)
+	if base == "" {
+		base = head
+	}
 	snapshot := treeSnapshot{
-		paths: make(fingerprint), gitMeta: make(fingerprint), ignored: make(map[string]bool),
+		head: head, paths: make(fingerprint), gitMeta: make(fingerprint), ignored: make(map[string]bool),
 	}
 
-	// Tracked paths differing from HEAD. `--no-renames` so a rename is a
-	// delete plus an add — two literal paths — and `-z` so a path containing
+	// Compare against the pre-phase commit even after an agent commits (R10).
+	// `--no-renames` makes a rename a delete plus an add — two literal paths —
+	// and `-z` so a path containing
 	// a space, quote, or newline arrives verbatim.
-	tracked, err := runGit(ctx, dir, "diff", "HEAD", "--name-only", "-z", "--no-renames")
+	tracked, err := runGit(ctx, dir, "diff", base, "--name-only", "-z", "--no-renames")
 	if err != nil {
 		return treeSnapshot{}, fmt.Errorf("fingerprint worktree: %w", err)
 	}
@@ -396,10 +411,9 @@ type breach struct {
 // `a*b.txt` or `:weird` is a path, never a pattern, and never a magic prefix.
 func literalPathspec(path string) string { return ":(literal)" + path }
 
-// existsInHEAD reports whether HEAD knows the path — the question that
-// decides whether rolling back means "restore" or "remove".
-func existsInHEAD(ctx context.Context, dir, path string) bool {
-	_, err := runGit(ctx, dir, "cat-file", "-e", "HEAD:"+path)
+// existsAtCommit asks whether rollback means "restore" or "remove" (R10).
+func existsAtCommit(ctx context.Context, dir, commit, path string) bool {
+	_, err := runGit(ctx, dir, "cat-file", "-e", commit+":"+path)
 	return err == nil
 }
 
@@ -417,17 +431,16 @@ func stagedInIndex(ctx context.Context, dir, path string) bool {
 // an operator's uncommitted work to tidy up would be the same harm this file
 // exists to prevent. A pre-dirty path the agent reverted is named loudly;
 // the content is not ours to reconstruct.
-func rollBackPath(ctx context.Context, dir, path string, before, after fingerprint) string {
+func rollBackPath(ctx context.Context, dir, path, base string, before, after fingerprint) string {
 	if _, wasDirty := before[path]; wasDirty {
 		if _, stillDirty := after[path]; !stillDirty {
 			return "reverted-by-agent (uncommitted work lost, cannot restore)"
 		}
 		return "left as-is (was already modified)"
 	}
-	// Restore from HEAD, never from the index: `git checkout -- path` would
-	// happily restore a breach the agent had staged.
-	if existsInHEAD(ctx, dir, path) {
-		if _, err := runGit(ctx, dir, "checkout", "HEAD", "--", literalPathspec(path)); err != nil {
+	// Restore from the saved commit, never an agent-moved HEAD or index (R10).
+	if existsAtCommit(ctx, dir, base, path) {
+		if _, err := runGit(ctx, dir, "checkout", base, "--", literalPathspec(path)); err != nil {
 			return "could not roll back: " + err.Error()
 		}
 		return "rolled back"
@@ -461,10 +474,10 @@ func rollBackGitMeta(path string, before fingerprint) string {
 	return "deleted"
 }
 
-// headPaths is the set of every path tracked in HEAD, read once per
+// headPaths is the set of every path tracked in a commit, read once per
 // enforcement rather than one `cat-file` per changed path.
-func headPaths(ctx context.Context, dir string) (map[string]bool, error) {
-	listing, err := runGit(ctx, dir, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+func headPaths(ctx context.Context, dir, head string) (map[string]bool, error) {
+	listing, err := runGit(ctx, dir, "ls-tree", "-r", "-z", "--name-only", head)
 	if err != nil {
 		return nil, fmt.Errorf("list HEAD paths: %w", err)
 	}
@@ -527,15 +540,24 @@ func trackedInHEAD(path string, head map[string]bool) bool {
 func enforceBoundary(
 	ctx context.Context, dir string, before treeSnapshot, writes, buildOutputs []string,
 ) (touched, outputs []string, breaches []breach, err error) {
-	after, err := snapshotTree(ctx, dir)
+	after, err := snapshotTreeAt(ctx, dir, before.head)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	var head map[string]bool
 	ignored := make(map[string]bool, len(before.ignored)+len(after.ignored))
 	if len(buildOutputs) > 0 {
-		if head, err = headPaths(ctx, dir); err != nil {
+		if head, err = headPaths(ctx, dir, before.head); err != nil {
 			return nil, nil, nil, err
+		}
+		if before.head != after.head {
+			current, err := headPaths(ctx, dir, after.head)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			for path := range current {
+				head[path] = true
+			}
 		}
 		for path := range before.ignored {
 			ignored[path] = true
@@ -556,7 +578,7 @@ func enforceBoundary(
 			touched = append(touched, path)
 			continue
 		}
-		outcome := rollBackPath(ctx, dir, path, before.paths, after.paths)
+		outcome := rollBackPath(ctx, dir, path, before.head, before.paths, after.paths)
 		// A grant only covers gitignored paths; for an untracked one it
 		// missed, say so, because the operator's fix is a .gitignore line,
 		// not a wider allowlist. A tracked path is never an output at all.
@@ -565,6 +587,11 @@ func enforceBoundary(
 			outcome = "declared build output is not gitignored — " + outcome
 		}
 		breaches = append(breaches, breach{Path: path, Outcome: outcome})
+	}
+	if writes != nil && len(writes) == 0 && before.head != after.head {
+		// Even an empty commit or a commit followed by a revert changes history.
+		breaches = append(breaches, breach{Path: "HEAD",
+			Outcome: "read-only role moved HEAD (history retained for inspection)"})
 	}
 	// Repository metadata is outside every allowlist by construction:
 	// `writes` names repository CONTENT, and no definition may hand a role
@@ -586,13 +613,16 @@ func enforceBoundary(
 // tracked file — is left as-is in its post-agent state SILENTLY: only
 // `could not…` and `reverted-by-agent` outcomes are returned as failures.
 func restoreSnapshot(ctx context.Context, dir string, before treeSnapshot) error {
-	after, err := snapshotTree(ctx, dir)
+	after, err := snapshotTreeAt(ctx, dir, before.head)
 	if err != nil {
 		return err
 	}
 	var failures []string
+	if before.head != after.head {
+		failures = append(failures, "HEAD changed (history retained for inspection)")
+	}
 	for _, path := range changedPaths(before.paths, after.paths) {
-		outcome := rollBackPath(ctx, dir, path, before.paths, after.paths)
+		outcome := rollBackPath(ctx, dir, path, before.head, before.paths, after.paths)
 		if strings.HasPrefix(outcome, "could not") || strings.HasPrefix(outcome, "reverted-by-agent") {
 			failures = append(failures, path+": "+outcome)
 		}

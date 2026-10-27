@@ -7,6 +7,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -188,6 +189,112 @@ func TestRestoreSnapshotUndoesACrashedPhase(t *testing.T) {
 	after := snapshotOrFail(t, ctx, dir)
 	if len(changedPaths(before.paths, after.paths)) != 0 {
 		t.Error("worktree does not match the pre-phase snapshot")
+	}
+}
+
+func TestReadOnlyBoundaryDetectsCommittedChanges(t *testing.T) {
+	for _, change := range []string{"modify", "add", "delete", "empty", "revert"} {
+		t.Run(change, func(t *testing.T) {
+			ctx := context.Background()
+			dir := initBoundaryRepo(t)
+			before := snapshotOrFail(t, ctx, dir)
+			switch change {
+			case "modify", "revert":
+				write(t, dir, "tracked.txt", "agent edit\n")
+			case "add":
+				write(t, dir, "new.txt", "agent file\n")
+			case "delete":
+				if err := os.Remove(filepath.Join(dir, "tracked.txt")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gitIn(t, dir, "add", "-A")
+			gitIn(t, dir, "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "agent commit")
+			if change == "revert" {
+				gitIn(t, dir, "-c", "commit.gpgsign=false", "revert", "--no-edit", "HEAD")
+			}
+			_, _, breaches, err := enforceBoundary(ctx, dir, before, []string{}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !contains(breachPaths(breaches), "HEAD") {
+				t.Fatalf("committed %s escaped read-only enforcement: %v", change, breaches)
+			}
+			body, err := os.ReadFile(filepath.Join(dir, "tracked.txt"))
+			if err != nil || string(body) != "original\n" {
+				t.Fatalf("saved content not restored: %q, %v", body, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "new.txt")); !os.IsNotExist(err) {
+				t.Fatalf("committed addition survived: %v", err)
+			}
+		})
+	}
+}
+
+func TestBoundaryAllowsCommittedWritesOnlyInsideAllowlist(t *testing.T) {
+	ctx := context.Background()
+	dir := initBoundaryRepo(t)
+	write(t, dir, "docs/guide.md", "previous draft\n")
+	before := snapshotOrFail(t, ctx, dir)
+	write(t, dir, "src/ok.go", "package ok\n")
+	write(t, dir, "tracked.txt", "forbidden edit\n")
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "agent commit")
+	touched, _, breaches, err := enforceBoundary(ctx, dir, before, []string{"src/"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(touched) != 1 || touched[0] != "src/ok.go" || len(breaches) != 1 || breaches[0].Path != "tracked.txt" {
+		t.Fatalf("touched=%v breaches=%v", touched, breaches)
+	}
+	if body, err := os.ReadFile(filepath.Join(dir, "docs/guide.md")); err != nil || string(body) != "previous draft\n" {
+		t.Fatalf("previous draft changed: %q, %v", body, err)
+	}
+}
+
+func TestCrashRollbackUsesSavedCommitAndReportsMovedHistory(t *testing.T) {
+	ctx := context.Background()
+	dir := initBoundaryRepo(t)
+	before := snapshotOrFail(t, ctx, dir)
+	write(t, dir, "tracked.txt", "crashed agent edit\n")
+	gitIn(t, dir, "add", "tracked.txt")
+	gitIn(t, dir, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "agent commit")
+	if err := restoreSnapshot(ctx, dir, before); err == nil || !strings.Contains(err.Error(), "HEAD changed") {
+		t.Fatalf("moved history must prevent a clean retry: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(dir, "tracked.txt")); err != nil || string(body) != "original\n" {
+		t.Fatalf("rollback restored agent HEAD instead of saved commit: %q, %v", body, err)
+	}
+}
+
+func TestBuildOutputsExcludePathsTrackedBeforeOrAfterAnAgentCommit(t *testing.T) {
+	for _, trackedBefore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("trackedBefore=%t", trackedBefore), func(t *testing.T) {
+			ctx := context.Background()
+			dir := initBoundaryRepo(t)
+			write(t, dir, ".gitignore", "bin/\n")
+			write(t, dir, "bin/output.txt", "before\n")
+			gitIn(t, dir, "add", ".gitignore")
+			if trackedBefore {
+				gitIn(t, dir, "add", "-f", "bin/output.txt")
+			}
+			gitIn(t, dir, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
+			before := snapshotOrFail(t, ctx, dir)
+			if trackedBefore {
+				gitIn(t, dir, "rm", "bin/output.txt")
+			} else {
+				gitIn(t, dir, "add", "-f", "bin/output.txt")
+			}
+			gitIn(t, dir, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "agent commit")
+			write(t, dir, "bin/output.txt", "after\n")
+			_, outputs, breaches, err := enforceBoundary(ctx, dir, before, []string{}, []string{"bin/**"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(outputs) != 0 || !contains(breachPaths(breaches), "HEAD") {
+				t.Fatalf("tracked content exempted: outputs=%v breaches=%v", outputs, breaches)
+			}
+		})
 	}
 }
 
@@ -748,7 +855,7 @@ func TestRestoreSnapshotRemovesNewBuildOutputsAndReportsOnlyReverts(t *testing.T
 		write(t, dir, "docs/guide.md", "guide\n") // reverts the operator's draft
 
 		after := snapshotOrFail(t, ctx, dir)
-		if outcome := rollBackPath(ctx, dir, "bin/", before.paths, after.paths); !strings.HasPrefix(outcome, "left as-is") {
+		if outcome := rollBackPath(ctx, dir, "bin/", before.head, before.paths, after.paths); !strings.HasPrefix(outcome, "left as-is") {
 			t.Fatalf("pre-existing bin/ outcome = %q, want left as-is", outcome)
 		}
 		err := restoreSnapshot(ctx, dir, before)
