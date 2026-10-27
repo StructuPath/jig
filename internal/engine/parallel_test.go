@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -465,6 +466,42 @@ func TestADeadMembersLeftoverWriteIsABreach(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.repo, "left-behind.txt")); !os.IsNotExist(err) {
 		t.Fatalf("the dead member's write survived: %v", err)
+	}
+}
+
+func TestAParallelMemberThatCommitsAndCrashesIsNotRetried(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		name := "empty commit"
+		if changed {
+			name = "committed edit"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newRepairFixture(t, panelSnapshot(nil, panelGroup), nil)
+			f.fake.Route(buildRole, writes(map[string]string{"src/app.txt": "app"}, "built"))
+			f.fake.Route(correctnessRole, enginetest.Step{Crash: true, Do: func(enginetest.Call) {
+				if changed {
+					if err := os.WriteFile(filepath.Join(f.repo, "README.md"), []byte("reviewer edit\n"), 0o644); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+				command := exec.Command("git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "commit.gpgsign=false",
+					"commit", "--quiet", "--allow-empty", "-am", "reviewer commit")
+				command.Dir = f.repo
+				if output, err := command.CombinedOutput(); err != nil {
+					t.Errorf("reviewer commit: %v: %s", err, output)
+				}
+			}}, approve("must not retry", nil))
+			f.fake.Route(securityRole, approve("secure", nil))
+			f.fake.Route(maintainabilityRole, approve("maintainable", nil))
+			outcome := executeWithin(t, f, 20*time.Second)
+			if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "HEAD") {
+				t.Fatalf("outcome = %s (%s), want a HEAD breach", outcome.State, outcome.Error)
+			}
+			if got := len(callsFor(f.fake, correctnessRole)); got != 1 {
+				t.Fatalf("reviewer invoked %d times, want one before abort", got)
+			}
+		})
 	}
 }
 

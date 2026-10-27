@@ -698,6 +698,46 @@ acceptance: [all_phases_passed]
 	}
 }
 
+func TestCommittedReadOnlyEditAbortsWithoutRetryOnSuccessOrCrash(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		t.Run(fmt.Sprintf("crash=%t", crash), func(t *testing.T) {
+			repo := initRepo(t)
+			fake := enginetest.New(enginetest.Step{
+				Crash: crash,
+				Text:  envelope(map[string]any{"status": "success"}),
+				Do: func(call enginetest.Call) {
+					if err := os.WriteFile(filepath.Join(call.Options.WorkDir, "README.md"), []byte("agent edit\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					for _, args := range [][]string{{"add", "README.md"}, {"-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "agent commit"}} {
+						command := exec.Command("git", args...)
+						command.Dir = call.Options.WorkDir
+						if output, err := command.CombinedOutput(); err != nil {
+							t.Fatalf("git %v: %v: %s", args, err, output)
+						}
+					}
+				},
+			})
+			sink := &recordingSink{}
+			runner := newTestRunner(t, fake, sink, nil)
+			snapshot := `name: readonly
+roster:
+  reader: {model: test, system_prompt: Read., user_prompt: Read., writes: []}
+phases:
+  - {name: read, kind: agent, owner: reader}
+acceptance: [all_phases_passed]
+`
+			outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+			if outcome.State != protocol.AttemptFailed || len(fake.Calls()) != 1 {
+				t.Fatalf("state=%s calls=%d error=%s", outcome.State, len(fake.Calls()), outcome.Error)
+			}
+			if !sink.has(protocol.EventError, "write_boundary_breach") && !sink.has(protocol.EventError, "rollback_failed") {
+				t.Fatalf("no boundary or rollback diagnostic: %s", outcome.Error)
+			}
+		})
+	}
+}
+
 func TestAttemptExceedingItsCeilingTerminatesWithItsOwnTerminalEvent(t *testing.T) {
 	repo := initRepo(t)
 	fake := enginetest.New(enginetest.Step{Hang: true})

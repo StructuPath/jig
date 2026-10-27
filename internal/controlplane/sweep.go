@@ -179,6 +179,9 @@ func (s *Store) sweepAttempt(ctx context.Context, attemptID string, nowMillis in
 	`, nowMillis, value.JobID); err != nil {
 		return value, false, unavailable(err)
 	}
+	if err := applyRunAggregationForJob(ctx, tx, value.JobID, nowMillis); err != nil {
+		return value, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return value, false, unavailable(err)
 	}

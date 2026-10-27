@@ -294,6 +294,16 @@ func (e *execution) runMembers(
 		if panicked || len(terminals) > 0 {
 			break
 		}
+		if len(next) > 0 {
+			// A read-only group cannot retry against agent-moved history (R10/R11).
+			head, err := runGit(context.WithoutCancel(ctx), e.attempt.WorktreePath, "rev-parse", "--verify", "HEAD^{commit}")
+			if err != nil {
+				return e.groupInfra(names, "check HEAD before member retry: "+err.Error())
+			}
+			if strings.TrimSpace(head) != before.head {
+				break // the group's enforcement below reports and rolls back the breach
+			}
+		}
 		pending = next
 	}
 

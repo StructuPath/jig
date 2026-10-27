@@ -1,14 +1,13 @@
 // http.go — the control plane's HTTP surface (U2). JSON in, JSON out,
 // bounded request bodies, and browser-origin fencing on every state-changing
 // route (R20): a request carrying an Origin header must first present a
-// trustworthy Host authority (loopback, never a resolved name — see
-// hostAuthorityIsTrusted, which closes the DNS-rebinding hole where an
+// trustworthy Host authority (loopback or the listener's IP, never a resolved
+// name — see hostAuthorityIsTrusted, which closes the DNS-rebinding hole where an
 // attacker's domain resolves to 127.0.0.1 and Origin/Host agree with each
 // other but not with reality), then either the server's own origin or the
-// per-process UI token. Requests without an Origin header (the worker,
-// curl) pass — the check exists to stop foreign web pages from driving a
-// loopback control plane through the operator's browser, not to
-// authenticate local clients.
+// per-process UI token. Reads require a trusted Host even without Origin.
+// Originless mutations (the worker, curl) pass — the check stops foreign web
+// pages from driving the control plane, not to authenticate local clients.
 package controlplane
 
 import (
@@ -70,7 +69,17 @@ func NewHandler(store *Store, uiToken string, logger *slog.Logger) http.Handler 
 	api.registerTriggerRoutes(mux)
 	api.registerIngestRoutes(mux)
 	api.registerReportRoutes(mux)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read routes also need Host fencing: DNS rebinding can read same-origin
+		// data without sending an Origin header (R20).
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			!api.uiTokenPresented(r) && !hostAuthorityIsTrusted(r) {
+			writeError(w, &ServiceError{Code: "untrusted_host_authority",
+				Message: "requests must target a trusted listener host", Status: 403})
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
@@ -354,7 +363,7 @@ func (a *API) prepareMutation(w http.ResponseWriter, r *http.Request) bool {
 		// trusting any comparison against it.
 		if !hostAuthorityIsTrusted(r) {
 			writeError(w, &ServiceError{Code: "untrusted_host_authority",
-				Message: "state-changing requests must target a loopback host", Status: 403})
+				Message: "state-changing requests must target a trusted listener host", Status: 403})
 			return false
 		}
 		parsed, err := url.Parse(origin)
@@ -378,10 +387,10 @@ func sameAuthority(left, right string) bool {
 	return strings.EqualFold(strings.TrimSuffix(left, "."), strings.TrimSuffix(right, "."))
 }
 
-// hostAuthorityIsTrusted reports whether r.Host names loopback rather than
-// an attacker's DNS-rebound domain (R20). The hostname must be a loopback
-// IP literal (127.0.0.0/8, ::1) or "localhost" — never resolved, so a
-// rebound name can never satisfy it by any DNS trick. When Host carries a
+// hostAuthorityIsTrusted reports whether r.Host names loopback or the
+// listener's own IP rather than an attacker's DNS-rebound domain (R20).
+// Hostnames are never resolved, so a rebound name cannot pass by a DNS trick.
+// When Host carries a
 // port and the server's own listener port is known from the connection
 // (net/http sets LocalAddrContextKey per accepted connection; direct
 // ServeHTTP calls in tests do not), that port must match too, closing the
@@ -390,7 +399,17 @@ func sameAuthority(left, right string) bool {
 func hostAuthorityIsTrusted(r *http.Request) bool {
 	host, port, hasPort := splitHostAuthority(r.Host)
 	if !isLoopbackHostname(host) {
-		return false
+		// An explicitly enabled non-loopback listener accepts its own IP,
+		// never an arbitrary DNS name that could rebind to it (R20).
+		addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if !ok {
+			return false
+		}
+		localHost, _, err := net.SplitHostPort(addr.String())
+		ip := net.ParseIP(host)
+		if err != nil || ip == nil || !ip.Equal(net.ParseIP(localHost)) {
+			return false
+		}
 	}
 	if !hasPort {
 		return true

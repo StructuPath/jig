@@ -1213,16 +1213,18 @@ func (e *execution) runAgentPhaseAttempt(
 		e.emit.emit(protocol.EventPhaseDeath, phase.Name, phase.Owner, map[string]any{
 			"phase_attempt": entry, "error": detail,
 		})
-		if !e.grouped {
-			if rollbackErr := restoreSnapshot(ctx, e.attempt.WorktreePath, before); rollbackErr != nil {
-				e.emit.emit(protocol.EventError, phase.Name, "rollback_failed",
-					map[string]string{"error": rollbackErr.Error()})
-			}
-		}
 		e.recordResult(protocol.PhaseResult{
 			Phase: phase.Name, Kind: phase.Kind, Status: protocol.EnvelopeFail,
 			PhaseAttempt: entry, Error: detail, StartedAt: &started,
 		})
+		if !e.grouped {
+			if rollbackErr := restoreSnapshot(ctx, e.attempt.WorktreePath, before); rollbackErr != nil {
+				e.emit.emit(protocol.EventError, phase.Name, "rollback_failed",
+					map[string]string{"error": rollbackErr.Error()})
+				return phaseRun{outcome: phaseAborted,
+					failure: detail + " — rollback failed: " + rollbackErr.Error()}, false
+			}
+		}
 		return phaseRun{outcome: phaseFailed, failure: detail}, true
 	}
 	// A phase that fails on parse exhaustion, gate-budget exhaustion, or a
