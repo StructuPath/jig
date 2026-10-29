@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+  # Release calls this workflow so a tag is published only after the full
+  # suite has passed on the exact commit being released.
+  workflow_call:
 
 permissions:
   contents: read
