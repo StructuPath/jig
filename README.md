@@ -49,7 +49,8 @@ BASE=https://github.com/StructuPath/jig/releases/download/$VERSION
 curl -fsSLO "$BASE/jig_${VERSION}_${OS}_${ARCH}.tar.gz"
 curl -fsSLO "$BASE/SHA256SUMS"
 
-sha256sum -c SHA256SUMS --ignore-missing            # macOS: shasum -a 256 -c
+# macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing
 tar -xzf "jig_${VERSION}_${OS}_${ARCH}.tar.gz"
 ./jig version
 ```
