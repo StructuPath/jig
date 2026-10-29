@@ -686,7 +686,7 @@ func (s *Store) reclaimAbandonedDirectRuns(ctx context.Context, dataDir string) 
 		if err := removeDirectMarker(dataDir, value.jobID); err != nil {
 			failures = append(failures, err)
 		}
-		reclaimed = append(reclaimed, LostAttempt{AttemptID: value.attemptID, JobID: value.jobID})
+		reclaimed = append(reclaimed, LostAttempt{AttemptID: value.attemptID, JobID: value.jobID, State: protocol.AttemptLost})
 	}
 	return reclaimed, errors.Join(failures...)
 }

@@ -338,6 +338,11 @@ func (s *Store) publishRecords(ctx context.Context, where string, argument any) 
 //
 // Re-leasing supersedes any previous token on that attempt: a stalled
 // publisher that wakes up afterwards is fenced out by digest mismatch.
+//
+// The re-leased attempt is marked publish_retry, so an interrupted retry is
+// swept back to accepted_unpublished rather than lost (sweepAttempt): the
+// marker, not the stored result, is what says "this lease only publishes",
+// because an accepted_unpublished attempt may legitimately have no result.
 func (s *Store) RetryPublish(
 	ctx context.Context, jobID string, input protocol.PublishRetryRequest,
 ) (protocol.PublishRetry, error) {
@@ -363,6 +368,23 @@ func (s *Store) RetryPublish(
 		return retry, unavailable(err)
 	}
 	if jobState != protocol.JobAcceptedUnpublished {
+		var inProgress int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM attempts
+			WHERE job_id = ? AND state = 'running' AND publish_retry = 1
+		`, jobID).Scan(&inProgress); err != nil {
+			return retry, unavailable(err)
+		}
+		if inProgress > 0 {
+			// An earlier retry still holds the lease — typically one whose
+			// process died mid-publish. Taking it over here would race a
+			// publisher that may still be alive; the sweeper returns it to
+			// accepted_unpublished once the lease has expired, and the retry
+			// is available again from there.
+			return retry, conflict("publish_retry_in_progress",
+				"a previous publish-only retry of this job still holds its lease; "+
+					"retry after it expires and the sweeper returns the job to accepted_unpublished")
+		}
 		return retry, conflict("publish_retry_not_allowed",
 			"only an accepted_unpublished job has a publish-only retry")
 	}
@@ -392,7 +414,8 @@ func (s *Store) RetryPublish(
 	expiry := now.Add(protocol.LeaseDuration).UnixMilli()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE attempts
-		SET state = 'running', lease_digest = ?, lease_expires_at = ?, completed_at = NULL, error = NULL
+		SET state = 'running', lease_digest = ?, lease_expires_at = ?, completed_at = NULL, error = NULL,
+		    publish_retry = 1
 		WHERE id = ? AND state = 'accepted_unpublished'
 	`, digestToken(input.LeaseToken), expiry, attemptID)
 	if err != nil {

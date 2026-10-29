@@ -913,18 +913,22 @@ func (e *execution) phaseCorrectionBudget(phase protocol.PhaseSpec) int {
 // ALL gates, never only the failed one (R9).
 func (e *execution) runGates(
 	ctx context.Context, phase protocol.PhaseSpec, envelope parsedEnvelope, attempt int,
-) protocol.GateReport {
+) (protocol.GateReport, error) {
 	var merged protocol.GateReport
 	env := e.phaseEnv(phase)
 	for _, gate := range phase.Gates {
-		report := runGate(gateContext{
+		report, err := runGate(gateContext{
 			ctx:      ctx,
 			worktree: e.attempt.WorktreePath,
 			envelope: envelope,
 			baseSHA:  e.attempt.BaseSHA,
 			env:      env,
 			timeout:  e.timeouts,
+			record:   e.commandRecorder(),
 		}, gate)
+		if err != nil {
+			return merged, err
+		}
 		e.gateReports[gate.Name] = report
 		merged.Checks = append(merged.Checks, report.Checks...)
 		eventType := protocol.EventGatePass
@@ -937,7 +941,27 @@ func (e *execution) runGates(
 			"violations": report.Violations(),
 		})
 	}
-	return merged
+	return merged, nil
+}
+
+// commandRecorder is the record callback for jig-side commands — a code
+// phase's command and a tests_pass gate's — into the same manifest set agent
+// process groups go to (U4). Nil when nothing records. A failed clear is
+// logged exactly as an agent's is; a failed start is returned, and the
+// command is killed rather than run unrecorded (runShellCommand).
+func (e *execution) commandRecorder() func(groupID int64, active bool) error {
+	if e.runner.config.RecordProcess == nil {
+		return nil
+	}
+	attemptID := e.attempt.Claim.Attempt.ID
+	return func(groupID int64, active bool) error {
+		err := e.runner.config.RecordProcess(attemptID, groupID, active)
+		if err != nil {
+			e.runner.config.Logger.Warn("process_group_record_failed",
+				"attempt_id", attemptID, "process_group_id", groupID, "active", active, "error", err)
+		}
+		return err
+	}
 }
 
 // phaseEnv composes the environment for everything this phase runs jig-side:
@@ -1011,10 +1035,16 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 		case <-commandCtx.Done():
 		}
 	}()
-	result := runShellCommand(commandCtx, e.attempt.WorktreePath, phase.Command, env, e.timeouts.phase)
+	result := runShellCommand(commandCtx, e.attempt.WorktreePath, phase.Command, env, e.timeouts.phase,
+		e.commandRecorder())
 	stopCommand()
 	if e.cancelled() {
 		return phaseRun{outcome: phaseCancelled, failure: "cancelled during phase " + phase.Name}
+	}
+	if result.RecordError != "" {
+		// Not the command's failure: it was stopped before it could earn a
+		// verdict, so no repair edge may treat it as a failing test.
+		return e.failInfra(phase.Name, "record the command's process group: "+result.RecordError)
 	}
 	var reported map[string]any
 	if phase.ReportsFields && result.Passed() {
@@ -1036,7 +1066,10 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 	// Gates verify the adapter envelope's claims too; there is no session to
 	// correct, so a violation is a phase failure that the repair edge (if
 	// declared) routes like any other code-phase failure.
-	report := e.runGates(ctx, phase, envelope, entry)
+	report, gateErr := e.runGates(ctx, phase, envelope, entry)
+	if gateErr != nil {
+		return e.failInfra(phase.Name, gateErr.Error())
+	}
 	passed := result.Passed() && report.Passed()
 	status := protocol.EnvelopeFail
 	if passed {
@@ -1318,7 +1351,12 @@ func (e *execution) runAgentPhaseAttempt(
 			return fail(parseDetail)
 		}
 
-		report := e.runGates(ctx, phase, envelope, gateAttempt)
+		report, gateErr := e.runGates(ctx, phase, envelope, gateAttempt)
+		if gateErr != nil {
+			// jig could not run the gate: there is nothing for the agent to
+			// correct, so this ends the phase without a correction send.
+			return fail(gateErr.Error())
+		}
 		if report.Passed() {
 			break
 		}
