@@ -1248,7 +1248,26 @@ func (e *execution) runAgentPhaseAttempt(
 
 	// death wraps up one dead entry: roll the worktree back to the pre-phase
 	// snapshot and emit the envelope-less terminal trace event (R11).
+	//
+	// The boundary comes first. restoreSnapshot leaves a path that was dirty
+	// before the phase in its post-agent state, so a read-only role that
+	// edits a builder's uncommitted file and then crashes would otherwise
+	// hand that edit to the retry as its baseline — and git metadata it
+	// changed would be "restored" only as far as deleting what is new. A
+	// breach ends the attempt here, unretried (R10). Detached for the same
+	// reason as terminalExit: a death can coincide with cancellation.
 	death := func(detail string) (phaseRun, bool) {
+		if !e.grouped {
+			if _, terminal := e.enforceWriteBoundary(
+				context.WithoutCancel(ctx), phase, entry, started, before, role.Writes); terminal != nil {
+				terminal.failure = detail + " — and " + terminal.failure
+				agentEnd(terminal.agentOutcome())
+				e.emit.emit(protocol.EventPhaseDeath, phase.Name, phase.Owner, map[string]any{
+					"phase_attempt": entry, "error": detail,
+				})
+				return *terminal, false
+			}
+		}
 		agentEnd(protocol.AgentDied)
 		e.emit.emit(protocol.EventPhaseDeath, phase.Name, phase.Owner, map[string]any{
 			"phase_attempt": entry, "error": detail,

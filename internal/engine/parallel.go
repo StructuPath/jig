@@ -224,7 +224,8 @@ func (e *execution) runGroupOnce(
 // concurrently; a member that died re-enters alone in the next wave, after
 // its siblings finished, until its death budget is spent. The first result
 // that ends the attempt stops every sibling — their sends are killed — and
-// the runner waits for all of them before it enforces the boundary once.
+// the runner waits for all of them before it enforces the boundary: ahead of
+// every retry wave, and once at the end.
 func (e *execution) runMembers(
 	ctx context.Context, members []protocol.PhaseSpec, active []int, runs []memberRun,
 	previous *parsedEnvelope, names []string, before treeSnapshot,
@@ -295,13 +296,20 @@ func (e *execution) runMembers(
 			break
 		}
 		if len(next) > 0 {
-			// A read-only group cannot retry against agent-moved history (R10/R11).
-			head, err := runGit(context.WithoutCancel(ctx), e.attempt.WorktreePath, "rev-parse", "--verify", "HEAD^{commit}")
+			// Every member has joined, so the tree is quiet: enforce the group
+			// boundary before another wave runs (R10/R11). A dead member's
+			// write is otherwise the retry's baseline — an edit to a file
+			// that was already dirty, or a planted hook, that the retry
+			// reverts leaves the final enforcement nothing to see. Declared
+			// build outputs pass, so a member that died mid-build still
+			// re-enters.
+			_, outputs, breaches, err := enforceBoundary(
+				context.WithoutCancel(ctx), e.attempt.WorktreePath, before, []string{}, e.spec.BuildOutputs)
 			if err != nil {
-				return e.groupInfra(names, "check HEAD before member retry: "+err.Error())
+				return e.groupInfra(names, "write-boundary enforcement before member retry: "+err.Error())
 			}
-			if strings.TrimSpace(head) != before.head {
-				break // the group's enforcement below reports and rolls back the breach
+			if len(breaches) > 0 {
+				return e.groupBreach(members, active, runs, names, breaches, outputs)
 			}
 		}
 		pending = next

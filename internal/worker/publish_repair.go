@@ -203,6 +203,9 @@ func (w *Worker) authorizeRound(ctx context.Context, target publishTarget, round
 // paths get the same check from commitChangedPaths; this is its twin for
 // what the round committed itself.
 func (w *Worker) requireRoundCommitsDeclared(ctx context.Context, target publishTarget, red string, declared []string) error {
+	if err := w.checkWorktreeMetadata(ctx, target.repository, target.worktreePath, target.branch); err != nil {
+		return publishFailure("publish_worktree_unsafe", "%s", err.Error())
+	}
 	committed, err := runGit(ctx, target.worktreePath, "diff", "--name-only", "-z", red, "HEAD")
 	if err != nil {
 		return publishFailure("publish_staging_unreadable", "%s", err.Error())

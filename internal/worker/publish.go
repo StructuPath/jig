@@ -603,6 +603,9 @@ func (w *Worker) pushAttemptBranch(
 		return "", publishFailure("publish_worktree_missing",
 			"the attempt worktree at %s is unavailable: %s", target.worktreePath, err)
 	}
+	if err := w.checkWorktreeMetadata(ctx, target.repository, target.worktreePath, target.branch); err != nil {
+		return "", publishFailure("publish_worktree_unsafe", "%s", err.Error())
+	}
 	head, err := w.commitChangedPaths(ctx, options, target, changedPaths)
 	if err != nil {
 		return "", err
