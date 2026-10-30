@@ -154,6 +154,9 @@ func (w *Worker) cleanupEligible(ctx context.Context, manifest attemptManifest) 
 	}
 	entry.mutex.Lock()
 	defer entry.mutex.Unlock()
+	if err := entry.validateWorktree(manifest.WorktreePath, manifest.Branch); err != nil {
+		return err
+	}
 	status, err := runGit(ctx, manifest.WorktreePath, "--no-optional-locks", "status", "--porcelain=v1")
 	if err != nil {
 		return fmt.Errorf("worktree status unavailable: %w", err)

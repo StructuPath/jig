@@ -538,6 +538,33 @@ func TestRewritingGitConfigIsABreachThatCannotBeRestored(t *testing.T) {
 	}
 }
 
+// A linked worktree's commondir names the shared repository every later git
+// command resolves config and hooks through. A rewrite is a breach by name,
+// even one that still resolves somewhere git accepts.
+func TestRewritingALinkedWorktreesCommondirIsABreach(t *testing.T) {
+	ctx := context.Background()
+	repo := initBoundaryRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitIn(t, repo, "worktree", "add", "--quiet", "-b", "linked", linked)
+	common, err := filepath.EvalSymlinks(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotOrFail(t, ctx, linked)
+
+	commondir := filepath.Join(common, "worktrees", "linked", "commondir")
+	if err := os.WriteFile(commondir, []byte(common+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, breaches, err := enforceBoundary(ctx, linked, before, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(breachPaths(breaches), commondir) {
+		t.Fatalf("breaches = %+v, want the rewritten commondir", breaches)
+	}
+}
+
 // ---- build outputs ---------------------------------------------------------
 
 // initOutputRepo is the boundary repo with `bin/` optionally gitignored —

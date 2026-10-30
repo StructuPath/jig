@@ -16,8 +16,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/StructuPath/jig/internal/protocol"
 )
@@ -77,13 +79,21 @@ func (c *repoCache) entry(ctx context.Context, repository string) (*repoEntry, e
 
 	entry.mutex.Lock()
 	defer entry.mutex.Unlock()
-	if entry.ready {
-		return entry, nil
+	if !entry.ready {
+		if err := c.materializeLocked(ctx, entry, repository); err != nil {
+			return nil, err
+		}
+		entry.ready = true
 	}
-	if err := c.materializeLocked(ctx, entry, repository); err != nil {
+	// Every use, not only the first: agents run git in worktrees whose
+	// metadata IS this entry, so a ready entry can have been rewritten since —
+	// including its origin URL, which the push and the proof read both use.
+	if err := entry.validateMetadata(ctx); err != nil {
 		return nil, err
 	}
-	entry.ready = true
+	if err := entry.validateOrigin(ctx); err != nil {
+		return nil, err
+	}
 	return entry, nil
 }
 
@@ -95,8 +105,12 @@ func (c *repoCache) materializeLocked(ctx context.Context, entry *repoEntry, rep
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return errors.New("repository cache entry must be a real directory")
 		}
-		// Reused entry from an earlier process: the origin must still match
-		// the registered identity before anything trusts it.
+		// Reused entry from an earlier process: its metadata must be inert and
+		// its origin must still match the registered identity before anything
+		// trusts it.
+		if err := entry.validateMetadata(ctx); err != nil {
+			return err
+		}
 		return entry.validateOrigin(ctx)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect repository cache entry: %w", err)
@@ -120,8 +134,10 @@ func (c *repoCache) materializeLocked(ctx context.Context, entry *repoEntry, rep
 		_ = os.RemoveAll(temporary)
 	}()
 	buildDir := filepath.Join(temporary, "repository")
+	// No template: an operator's init.templateDir hooks would be active hooks
+	// in a jig-managed entry, which validateMetadata refuses.
 	steps := [][]string{
-		{"init", "--bare", buildDir},
+		{"init", "--bare", "--template=", buildDir},
 		{"-C", buildDir, "remote", "add", "origin", source},
 		{"-C", buildDir, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"},
 		{"-C", buildDir, "fetch", "--no-tags", "origin"},
@@ -200,14 +216,60 @@ func (e *repoEntry) validateOrigin(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("revalidate repository origin: %w", err)
 	}
-	identity, err := normalizeRepositoryIdentity(strings.TrimSpace(stdout))
+	// get-url prints the URL and one newline. Normalization trims the rest,
+	// but git does not: a quoted `url = "/path/origin "` names a different
+	// local repository — whose hooks a push runs — than the registered
+	// /path/origin it would normalize to. A URL edged with whitespace is
+	// nothing jig's clone writes, so it is refused before normalization.
+	raw := strings.TrimSuffix(stdout, "\n")
+	if !plainMetadataValue(raw) || strings.ContainsFunc(raw, unicode.IsControl) {
+		return errors.New("revalidate repository origin: origin URL contains padding or control characters")
+	}
+	// Normalization reads any scheme as host/path, but git hands a scheme it
+	// does not implement — and any `<helper>::<address>` — to git-remote-<name>
+	// from PATH, which protocol.ext.allow does not cover. Only the transports
+	// git implements itself are admitted, before the identity comparison.
+	if !nativeOriginTransport(raw) {
+		return errors.New("revalidate repository origin: origin URL uses an unsupported transport")
+	}
+	// Neither the URL nor the normalization error is quoted: an origin can
+	// carry credentials.
+	identity, err := normalizeRepositoryIdentity(raw)
 	if err != nil {
-		return fmt.Errorf("revalidate repository origin: %w", err)
+		return errors.New("revalidate repository origin: origin URL is not a recognized repository form")
 	}
 	if !sameRemoteIdentity(identity, e.identity) {
 		return errors.New("repository origin no longer matches the registered identity")
 	}
 	return nil
+}
+
+// nativeOriginTransports are the URL schemes git implements itself (remote
+// curl ships as git-remote-http/https in git's own exec path).
+var nativeOriginTransports = []string{"https", "http", "ssh", "git", "file"}
+
+// nativeOriginTransport reports whether an origin URL is one git transports
+// without dispatching a remote helper: an absolute local path, a URL in a
+// native scheme, or scp-style user@host:path. An absolute path is checked
+// first, so `::` or `://` in its bytes is not read as helper or scheme syntax
+// (git itself refuses a path holding `://`, with no helper), and a native
+// URL may hold `::` in an IPv6 host or its path, so only what is left
+// is refused for helper syntax; `helper::https://` fails as an unknown
+// scheme. Scheme case is not folded — git would look up git-remote-HTTPS —
+// and anything else, relative paths included, is refused rather than
+// interpreted.
+func nativeOriginTransport(raw string) bool {
+	if filepath.IsAbs(raw) {
+		return true
+	}
+	if scheme, _, found := strings.Cut(raw, "://"); found {
+		return slices.Contains(nativeOriginTransports, scheme)
+	}
+	if strings.Contains(raw, "::") {
+		return false
+	}
+	prefix, _, found := strings.Cut(raw, ":")
+	return found && strings.Contains(prefix, "@") && !strings.Contains(prefix, "/")
 }
 
 // fetch updates remote-tracking refs, with origin revalidation before and
@@ -286,12 +348,30 @@ func cacheDirectoryName(identityKey string) string {
 
 // ---- git command runner ----------------------------------------------------
 
-// runGit runs one git command with a bounded timeout and no terminal
-// prompting, returning stdout. Failures carry a stderr excerpt.
+// workerGitHardening is prepended to every worker git command. Cleanup,
+// staging, and publish run git inside worktrees agents wrote, against cache
+// entries those worktrees share: a `core.fsmonitor` command, a hook, or an
+// `ext::` remote left there would otherwise run worker-side. It is the
+// engine's switch set minus core.quotepath, whose output change no worker
+// caller expects. The environment is deliberately NOT the engine's
+// sanitized one: push and fetch need the operator's global credential
+// helpers, and repository-local config that could subvert those is refused
+// by validateMetadata before git ever reads it.
+var workerGitHardening = []string{
+	"-c", "core.hooksPath=/dev/null",
+	"-c", "core.fsmonitor=",
+	"-c", "protocol.ext.allow=never",
+	"-c", "gc.auto=0",
+	"-c", "maintenance.auto=false",
+}
+
+// runGit runs one hardened git command with a bounded timeout and no
+// terminal prompting, returning stdout. Failures carry a stderr excerpt.
 func runGit(ctx context.Context, dir string, arguments ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, protocol.GitCommandTimeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, "git", arguments...)
+	command := exec.CommandContext(ctx, "git",
+		append(append([]string(nil), workerGitHardening...), arguments...)...)
 	if dir != "" {
 		command.Dir = dir
 	}

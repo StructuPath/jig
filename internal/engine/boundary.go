@@ -169,8 +169,10 @@ func splitNUL(output string) []string {
 
 // gitMetaFiles are the metadata names a write to which changes what jig's own
 // git commands DO: `config` carries core.hooksPath / core.fsmonitor, the
-// hooks directory carries the scripts themselves.
-var gitMetaFiles = []string{"config", "config.worktree"}
+// hooks directory carries the scripts themselves, and a linked worktree's
+// `commondir` re-points it at a different shared repository — config, hooks
+// and all — exactly as a rewritten `.git` pointer does.
+var gitMetaFiles = []string{"config", "config.worktree", "commondir"}
 
 // snapshotGitMeta fingerprints the repository metadata reachable from dir.
 // Deliberately narrow: `.git` as a whole churns on every command (index,
