@@ -34,6 +34,11 @@ type commandResult struct {
 	// reports_fields report longer than the tail still parses.
 	LastLine         string
 	LastLineOverflow bool
+	// RecordError is set when the command's process group could not be
+	// recorded as live. The command was killed and reaped before it could
+	// do anything worth judging, so this is an infrastructure failure, never
+	// a verdict on the command.
+	RecordError string
 }
 
 // Passed reports a clean exit.
@@ -45,6 +50,17 @@ func (r commandResult) Passed() bool {
 // the given environment and timeout. The command gets its own process group
 // so a timeout kills everything it spawned, not just the shell.
 //
+// record, when non-nil, is told the group is live right after the start and
+// no longer live once the shell has exited or been killed and reaped — the
+// same record agent sends keep (U4), so a worker that dies hard mid-command
+// leaves a manifest its restart reconciliation can stop the group from. A
+// command whose group cannot be recorded does not run on unrecorded: the
+// group is killed, reaped, and the record cleared again in case the failed
+// write half-landed. Only the group is tracked, through its leader: a
+// background process the command leaves running after a normal exit is
+// left alone exactly as before, and once its leader is gone reconciliation
+// cannot verify the group as ours, so it is not signalled.
+//
 // env is REQUIRED. A nil env means Go hands the child jig's own os.Environ()
 // — every API key the operator exported, and their real HOME — which is
 // exactly the containment KTD10 and KTD11 exist to remove. Commands run in
@@ -52,6 +68,7 @@ func (r commandResult) Passed() bool {
 // code), so inheritance must fail loudly rather than silently return.
 func runShellCommand(
 	ctx context.Context, dir, command string, env []string, timeout time.Duration,
+	record func(groupID int64, active bool) error,
 ) commandResult {
 	if env == nil {
 		return commandResult{ExitCode: -1, StartError: "refusing to run a command with an " +
@@ -71,6 +88,19 @@ func runShellCommand(
 	shell.Stderr = output
 	if err := shell.Start(); err != nil {
 		return commandResult{ExitCode: -1, StartError: err.Error()}
+	}
+	// Nothing reaps the shell until its group is recorded: an unreaped
+	// leader keeps its pid, so the group id cannot be reused by a stranger
+	// before the kill below — however early the command exits.
+	groupID := int64(shell.Process.Pid)
+	if record != nil {
+		if err := record(groupID, true); err != nil {
+			_ = syscall.Kill(-shell.Process.Pid, syscall.SIGKILL)
+			_ = shell.Wait()
+			_ = record(groupID, false)
+			return commandResult{ExitCode: -1, RecordError: err.Error()}
+		}
+		defer func() { _ = record(groupID, false) }()
 	}
 	done := make(chan error, 1)
 	go func() { done <- shell.Wait() }()

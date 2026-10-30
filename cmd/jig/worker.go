@@ -41,10 +41,15 @@ import (
 )
 
 const workerUsage = `Usage: jig worker [--server <url>] [--data <dir>] [--runtime <name>] [--capacity <n>]
+       jig worker publish-retry [flags] <job-id>
 
 Run the worker host: register with the control plane, claim queued work,
 execute each attempt's phase chain in an isolated worktree, publish accepted
-work, and reconcile retained worktrees at start.
+work, and reconcile retained worktrees at start. The data directory is
+locked while the worker runs: one directory, one worker process.
+
+publish-retry finishes an accepted_unpublished job's publish as this
+worker, without re-running any phase; see jig worker publish-retry --help.
 
 Flags:
   --server <url>         control plane base URL (default http://127.0.0.1:8383)
@@ -77,15 +82,14 @@ Exit codes:
 const workerDrainGrace = 2 * time.Minute
 
 func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "publish-retry" {
+		return workerPublishRetryCommand(ctx, args[1:], stdout, stderr)
+	}
 	flags := flag.NewFlagSet("jig worker", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, workerUsage) }
 	serverURL := flags.String("server", "http://"+defaultServerAuthority, "control plane URL")
-	defaultWorkerData := ""
-	if base := defaultDataDir(); base != "" {
-		defaultWorkerData = filepath.Join(base, "worker")
-	}
-	dataDir := flags.String("data", defaultWorkerData, "worker data directory")
+	dataDir := flags.String("data", defaultWorkerDataDir(), "worker data directory")
 	runtimeName := flags.String("runtime", runtimeClaudeCode, "agent CLI runtime")
 	capacity := flags.Int("capacity", 1, "concurrent attempt slots")
 	name := flags.String("name", "local", "worker name")
@@ -109,6 +113,15 @@ func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "jig worker: %v\n", err)
 		return exitInfraFailed
 	}
+	// Held before the identity is read or anything is probed, until the
+	// worker returns: a second worker or a publish-only retry on the same
+	// directory would race this one's manifests and worktrees.
+	lock, err := lockWorkerData(*dataDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "jig worker: %v\n", err)
+		return exitInfraFailed
+	}
+	defer lock.release()
 	selected, err := selectRuntime(ctx, *runtimeName, !*noSeedAuth)
 	if err != nil {
 		fmt.Fprintf(stderr, "jig worker: %v\n", err)
@@ -132,7 +145,7 @@ func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var host *worker.Worker
 	engineRunner := workerAttemptRunner(ctx, *dataDir, selected, logger,
 		func() *worker.Worker { return host })
-	publisher := worker.NewPublishingRunner(engineRunner, worker.NewGitHubCLIGateway(),
+	publisher := worker.NewPublishingRunner(engineRunner, newPublishGateway(),
 		worker.PublishOptions{
 			CommitAuthorName:  *authorName,
 			CommitAuthorEmail: *authorEmail,

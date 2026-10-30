@@ -38,31 +38,37 @@ type gateContext struct {
 	// environment and the operator's real HOME.
 	env     []string
 	timeout timeoutConfig
+	// record reports a gate command's process group live and gone, as the
+	// code phase does (runShellCommand). Nil records nothing.
+	record func(groupID int64, active bool) error
 }
 
 // runGate dispatches one configured gate by registry name. Names were
 // resolved at save time (R1); an unknown name here is a frozen-snapshot
 // integrity failure, reported as a failed check rather than a panic.
-func runGate(gc gateContext, spec protocol.GateSpec) protocol.GateReport {
+//
+// The error is jig's own failure to run the gate, not the gate's verdict: it
+// is no claim the agent made, so it must never become a correction prompt.
+func runGate(gc gateContext, spec protocol.GateSpec) (protocol.GateReport, error) {
 	gc.command = spec.Command
 	gc.allow = spec.Allow
 	switch spec.Name {
 	case protocol.GateArtifactsExist:
-		return gateArtifactsExist(gc)
+		return gateArtifactsExist(gc), nil
 	case protocol.GateFilesNonEmpty:
-		return gateFilesNonEmpty(gc)
+		return gateFilesNonEmpty(gc), nil
 	case protocol.GateDiffMatchesClaims:
-		return gateDiffMatchesClaims(gc)
+		return gateDiffMatchesClaims(gc), nil
 	case protocol.GateVerdictConsistent:
-		return gateVerdictConsistent(gc)
+		return gateVerdictConsistent(gc), nil
 	case protocol.GateTestsPass:
 		return gateTestsPass(gc)
 	case protocol.GateTestsIntact:
-		return gateTestsIntact(gc)
+		return gateTestsIntact(gc), nil
 	}
 	var report protocol.GateReport
 	report.Check(spec.Name, false, "gate is not in the built-in registry")
-	return report
+	return report, nil
 }
 
 // artifactPath resolves a claimed artifact against the worktree, rejecting
@@ -236,9 +242,13 @@ func gateVerdictConsistent(gc gateContext) protocol.GateReport {
 // gateTestsPass: the configured command must exit 0 in the worktree. The
 // note carries the exit status and, on failure, a bounded output tail as
 // evidence the agent can act on.
-func gateTestsPass(gc gateContext) protocol.GateReport {
+func gateTestsPass(gc gateContext) (protocol.GateReport, error) {
 	var report protocol.GateReport
-	result := runShellCommand(gc.ctx, gc.worktree, gc.command, gc.env, gc.timeout.phase)
+	result := runShellCommand(gc.ctx, gc.worktree, gc.command, gc.env, gc.timeout.phase, gc.record)
+	if result.RecordError != "" {
+		return report, fmt.Errorf("gate %s: record the command's process group: %s",
+			protocol.GateTestsPass, result.RecordError)
+	}
 	note := fmt.Sprintf("exit %d", result.ExitCode)
 	if result.TimedOut {
 		note = "timed out"
@@ -247,5 +257,5 @@ func gateTestsPass(gc gateContext) protocol.GateReport {
 		note += "\n" + result.OutputTail
 	}
 	report.Check(gc.command, result.Passed(), note)
-	return report
+	return report, nil
 }

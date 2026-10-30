@@ -424,6 +424,35 @@ on branch `jig/<job-id>/<attempt>`, and accepted work is published there:
 push, find-or-create the pull request by head ref, then verify the **remote**
 ref as proof.
 
+An `accepted_unpublished` job — held, its pull request not opened, or CI
+red — is finished by the publish-only retry, run as the worker that ran it:
+
+```sh
+# stop the worker that ran the job (Ctrl-C), then, as that worker:
+jig worker publish-retry --data ~/.jig/worker <job-id>
+```
+
+Use the same `--data` directory and the same `--commit-author-name`,
+`--commit-author-email`, and `--base-branch` that worker runs with. The
+retry runs no agent and spends no inference — it needs no runtime CLI at
+all — and re-leases the SAME attempt: same branch, same pull request, CI
+judged on the branch's current head, never repaired or re-run. It exits 0
+when the job is `accepted`, 3 when publish still did not finish (the job
+stays `accepted_unpublished`; retry again), and 1 when it could not run.
+The data directory is locked while a worker or a retry holds it, so stop the
+worker first. A retry that is interrupted mid-publish is returned to
+`accepted_unpublished` by the control plane once its lease expires and the
+sweeper notices (about a minute); retry again after that. There is no retry button in
+the UI.
+
+One data directory is one worker: `jig worker` holds `<data>/worker.lock`
+for as long as it runs, and a second worker or a retry on the same
+directory is refused. A worker that dies hard leaves its agents' and its
+code and gate commands' process groups in the attempt manifests, and the
+next start on that directory stops them before reconciling anything else —
+as long as the group's leader is still alive; a background process whose
+leader already exited cannot be verified as jig's and is left alone.
+
 Two things a worker prints at startup deserve reading: orphan worktrees
 (reported, never deleted) and stray publish branches — attempt-scoped
 branches on a remote that no fenced push record explains, which is the

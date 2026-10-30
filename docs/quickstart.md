@@ -234,6 +234,27 @@ failing checks and every round in its result; push a fix to the
 `jig/<job-id>/<attempt>` branch yourself and the publish retry re-checks CI on
 the new head (it never repairs).
 
+The publish retry, for a held release or a red-CI job alike, runs as the
+worker that ran the job:
+
+```sh
+# stop the worker that ran the job (Ctrl-C), then, as that worker:
+./bin/jig worker publish-retry --data ~/.jig/worker <job-id>
+```
+
+Use the same `--data` directory and the same `--commit-author-name`,
+`--commit-author-email`, and `--base-branch` that worker runs with. The
+retry runs no agent and spends no inference — it needs no runtime CLI at
+all — and re-leases the SAME attempt: same branch, same pull request, CI
+judged on the branch's current head, never repaired or re-run. It exits 0
+when the job is `accepted`, 3 when publish still did not finish (the job
+stays `accepted_unpublished`; retry again), and 1 when it could not run.
+The data directory is locked while a worker or a retry holds it, so stop the
+worker first. A retry that is interrupted mid-publish is returned to
+`accepted_unpublished` by the control plane once its lease expires and the
+sweeper notices (about a minute); retry again after that. There is no retry button in
+the UI.
+
 `Ctrl-C` stops the worker in order: no new claims, in-flight attempts
 cancelled, terminal states recorded, ephemeral scratch destroyed.
 

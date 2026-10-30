@@ -574,7 +574,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE attempts SET state = ?, result = ?, error = ?, completed_at = ?
+		UPDATE attempts SET state = ?, result = ?, error = ?, completed_at = ?, publish_retry = 0
 		WHERE id = ? AND state IN ('preparing', 'running')
 	`, input.State, nullString(input.Result), nullString(input.Error), now, attemptID); err != nil {
 		return protocol.Attempt{}, unavailable(err)

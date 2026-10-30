@@ -20,10 +20,13 @@ import (
 	"github.com/StructuPath/jig/internal/protocol"
 )
 
-// LostAttempt names one attempt the sweeper marked lost and its job.
+// LostAttempt names one attempt the sweeper marked lost and its job. State is
+// the state the sweep left it in: `lost`, or `accepted_unpublished` for an
+// interrupted publish-only retry, which keeps its attempt.
 type LostAttempt struct {
 	AttemptID string
 	JobID     string
+	State     string
 }
 
 // Sweeper owns the missed-heartbeat bookkeeping. It is not persistent by
@@ -62,7 +65,7 @@ func (sw *Sweeper) Run(ctx context.Context, logger *slog.Logger) {
 			for _, value := range lost {
 				logger.Info("state_change",
 					"resource_type", "attempt", "resource_id", value.AttemptID,
-					"job_id", value.JobID, "new_state", "lost")
+					"job_id", value.JobID, "new_state", value.State)
 			}
 		}
 	}
@@ -146,21 +149,32 @@ func (sw *Sweeper) Tick(ctx context.Context) ([]LostAttempt, error) {
 // The guarded UPDATE re-checks state and expiry inside the transaction, so a
 // heartbeat that renewed the lease between our read and this write wins and
 // the sweep is a no-op (KTD3).
+//
+// An expired publish-only retry is the exception: it ran no phase, so there
+// is nothing lost but the publish, and the attempt goes back to
+// accepted_unpublished — same attempt, branch, and publish records — where
+// the retry is available again (R14). Its lease digest is cleared, so the
+// interrupted publisher, should it wake, can neither heartbeat, record, nor
+// complete.
 func (s *Store) sweepAttempt(ctx context.Context, attemptID string, nowMillis int64) (LostAttempt, bool, error) {
-	value := LostAttempt{AttemptID: attemptID}
+	value := LostAttempt{AttemptID: attemptID, State: protocol.AttemptLost}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return value, false, unavailable(err)
 	}
 	defer tx.Rollback()
+	var publishRetry bool
 	if err := tx.QueryRowContext(ctx, `
-		SELECT job_id FROM attempts WHERE id = ?
-	`, attemptID).Scan(&value.JobID); err != nil {
+		SELECT job_id, publish_retry FROM attempts WHERE id = ?
+	`, attemptID).Scan(&value.JobID, &publishRetry); err != nil {
 		return value, false, unavailable(err)
+	}
+	if publishRetry {
+		return s.returnInterruptedPublishRetry(ctx, tx, value, nowMillis)
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE attempts SET state = 'lost', error = 'lease expired: consecutive heartbeats missed', completed_at = ?
-		WHERE id = ? AND state IN ('preparing', 'running') AND lease_expires_at <= ?
+		WHERE id = ? AND state IN ('preparing', 'running') AND publish_retry = 0 AND lease_expires_at <= ?
 	`, nowMillis, attemptID, nowMillis)
 	if err != nil {
 		return value, false, unavailable(err)
@@ -176,6 +190,42 @@ func (s *Store) sweepAttempt(ctx context.Context, attemptID string, nowMillis in
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET state = 'failed', updated_at = ? WHERE id = ? AND state = 'active'
+	`, nowMillis, value.JobID); err != nil {
+		return value, false, unavailable(err)
+	}
+	if err := applyRunAggregationForJob(ctx, tx, value.JobID, nowMillis); err != nil {
+		return value, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return value, false, unavailable(err)
+	}
+	return value, true, nil
+}
+
+// returnInterruptedPublishRetry is sweepAttempt's publish-retry half, inside
+// the same transaction and under the same guard: a renewal or completion
+// that landed first wins and the sweep is a no-op.
+func (s *Store) returnInterruptedPublishRetry(
+	ctx context.Context, tx *sql.Tx, value LostAttempt, nowMillis int64,
+) (LostAttempt, bool, error) {
+	value.State = protocol.AttemptAcceptedUnpublished
+	result, err := tx.ExecContext(ctx, `
+		UPDATE attempts
+		SET state = 'accepted_unpublished', publish_retry = 0, lease_digest = NULL, completed_at = ?,
+		    error = 'publish retry interrupted: lease expired; the publish-only retry is available again'
+		WHERE id = ? AND state = 'running' AND publish_retry = 1 AND lease_expires_at <= ?
+	`, nowMillis, value.AttemptID, nowMillis)
+	if err != nil {
+		return value, false, unavailable(err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		if err := tx.Commit(); err != nil {
+			return value, false, unavailable(err)
+		}
+		return value, false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = 'accepted_unpublished', updated_at = ? WHERE id = ? AND state = 'active'
 	`, nowMillis, value.JobID); err != nil {
 		return value, false, unavailable(err)
 	}
