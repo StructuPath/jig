@@ -399,3 +399,47 @@ func mustGetwd(t *testing.T) string {
 	}
 	return dir
 }
+
+// A worker.lock that is a symbolic or hard link to some other file is
+// refused before anything is written through it: the pid note would
+// otherwise truncate the other file. A dangling symlink is refused too, where
+// O_CREAT would create its target. The link and its target stay as they are.
+func TestALinkedWorkerLockIsRefusedAndItsTargetLeftIntact(t *testing.T) {
+	for name, link := range map[string]func(target, lock string) error{
+		"symlink":          os.Symlink,
+		"hard link":        os.Link,
+		"dangling symlink": func(target, lock string) error { return os.Symlink(target+".missing", lock) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			target := filepath.Join(t.TempDir(), "precious.txt")
+			const precious = "operator data, not a lock\n"
+			if err := os.WriteFile(target, []byte(precious), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			lockPath := filepath.Join(dataDir, "worker.lock")
+			if err := link(target, lockPath); err != nil {
+				t.Fatal(err)
+			}
+
+			lock, err := lockWorkerData(dataDir)
+			if err == nil {
+				lock.release()
+				t.Fatal("a linked worker.lock was locked and written through")
+			}
+			if !strings.Contains(err.Error(), lockPath) || !strings.Contains(err.Error(), "remove it") {
+				t.Fatalf("refusal %q does not name the lock file and what to do", err)
+			}
+			code, _, stderr := publishRetry(t, "--server", "http://127.0.0.1:1", "--data", dataDir, "job-1")
+			if code != exitInfraFailed || !strings.Contains(stderr, "worker.lock") {
+				t.Fatalf("retry over a linked lock: exit %d, want %d naming worker.lock", code, exitInfraFailed)
+			}
+			if body, err := os.ReadFile(target); err != nil || string(body) != precious {
+				t.Fatalf("the link's target changed: %q (%v)", body, err)
+			}
+			if _, err := os.Stat(target + ".missing"); !os.IsNotExist(err) {
+				t.Fatalf("a dangling symlink's target was created (stat: %v)", err)
+			}
+		})
+	}
+}

@@ -31,8 +31,10 @@ func TestARestartedWorkerStopsTheCodePhaseGroupAHardKilledWorkerLeftRunning(t *t
 	defer stopServe()
 
 	pidFile, heartbeat := filepath.Join(scratch, "pid"), filepath.Join(scratch, "heartbeat")
+	release := filepath.Join(scratch, "release")
 	source := "name: crash-fixture\nphases:\n  - name: loop\n    kind: code\n    command: |\n" +
-		"      echo $$ > '" + pidFile + "'; while :; do echo beat >> '" + heartbeat + "'; sleep 0.05; done\n" +
+		"      echo $$ > '" + pidFile + "'; while [ -d '" + scratch + "' ] && [ ! -e '" + release + "' ]; do " +
+		"echo beat >> '" + heartbeat + "'; sleep 0.05; done\n" +
 		"acceptance: [all_phases_passed]\n"
 	var definition protocol.Definition
 	if err := apiCall(context.Background(), base, "POST", "/api/definitions",
@@ -45,16 +47,13 @@ func TestARestartedWorkerStopsTheCodePhaseGroupAHardKilledWorkerLeftRunning(t *t
 		t.Fatal(err)
 	}
 
+	// Defensive cleanup releases the loop through its own file rather than
+	// signalling a cached group id, which the OS may have reused by then.
+	// Registered before the worker starts so an early failure releases it too.
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
 	child, _ := startHelper(t, "jig", "JIG_TEST_HELPER_ARGS="+strings.Join(
 		[]string{"worker", "--server", base, "--data", workerData}, "\x1f"))
 	group := awaitCommandGroup(t, pidFile)
-	// Defensive cleanup of THIS test's group only: the id came from the
-	// shell this test's definition started, and it is never 0, 1, or ours.
-	t.Cleanup(func() {
-		if group > 1 && group != int64(syscall.Getpgrp()) {
-			_ = syscall.Kill(-int(group), syscall.SIGKILL)
-		}
-	})
 	awaitManifestGroup(t, workerData, group)
 
 	if err := child.Process.Signal(syscall.SIGKILL); err != nil {

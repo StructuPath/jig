@@ -89,18 +89,21 @@ func runShellCommand(
 	if err := shell.Start(); err != nil {
 		return commandResult{ExitCode: -1, StartError: err.Error()}
 	}
-	done := make(chan error, 1)
-	go func() { done <- shell.Wait() }()
+	// Nothing reaps the shell until its group is recorded: an unreaped
+	// leader keeps its pid, so the group id cannot be reused by a stranger
+	// before the kill below — however early the command exits.
 	groupID := int64(shell.Process.Pid)
 	if record != nil {
 		if err := record(groupID, true); err != nil {
 			_ = syscall.Kill(-shell.Process.Pid, syscall.SIGKILL)
-			<-done
+			_ = shell.Wait()
 			_ = record(groupID, false)
 			return commandResult{ExitCode: -1, RecordError: err.Error()}
 		}
 		defer func() { _ = record(groupID, false) }()
 	}
+	done := make(chan error, 1)
+	go func() { done <- shell.Wait() }()
 	select {
 	case err := <-done:
 		last, overflow := lines.Last()

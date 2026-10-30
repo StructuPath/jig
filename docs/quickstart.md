@@ -239,7 +239,7 @@ worker that ran the job:
 
 ```sh
 # stop the worker that ran the job (Ctrl-C), then, as that worker:
-jig worker publish-retry --data ~/.jig/worker <job-id>
+./bin/jig worker publish-retry --data ~/.jig/worker <job-id>
 ```
 
 Use the same `--data` directory and the same `--commit-author-name`,

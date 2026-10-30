@@ -946,9 +946,13 @@ func (e *execution) runGates(
 
 // commandRecorder is the record callback for jig-side commands — a code
 // phase's command and a tests_pass gate's — into the same manifest set agent
-// process groups go to (U4). Nil when nothing records. A failed clear is
-// logged exactly as an agent's is; a failed start is returned, and the
-// command is killed rather than run unrecorded (runShellCommand).
+// process groups go to (U4). Nil when nothing records. A failed start is
+// returned, and the command is killed rather than run unrecorded
+// (runShellCommand). A failed clear is tried once more at once: a group left
+// recorded after its command exited is one a later restart re-examines, and
+// a transient write failure should not leave it there. A clear that still
+// fails is logged exactly as an agent's is, and the command's own outcome
+// stands — it already ran.
 func (e *execution) commandRecorder() func(groupID int64, active bool) error {
 	if e.runner.config.RecordProcess == nil {
 		return nil
@@ -956,6 +960,9 @@ func (e *execution) commandRecorder() func(groupID int64, active bool) error {
 	attemptID := e.attempt.Claim.Attempt.ID
 	return func(groupID int64, active bool) error {
 		err := e.runner.config.RecordProcess(attemptID, groupID, active)
+		if err != nil && !active {
+			err = e.runner.config.RecordProcess(attemptID, groupID, active)
+		}
 		if err != nil {
 			e.runner.config.Logger.Warn("process_group_record_failed",
 				"attempt_id", attemptID, "process_group_id", groupID, "active", active, "error", err)

@@ -193,9 +193,24 @@ type workerDataLock struct{ file *os.File }
 
 func lockWorkerData(dataDir string) (*workerDataLock, error) {
 	path := filepath.Join(dataDir, "worker.lock")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	// The lock file is written (the pid note below), so it must be the data
+	// directory's own: a worker.lock that is a symlink or a hard link to some
+	// other file would have that file truncated. O_NOFOLLOW refuses a symlink
+	// at open — a dangling one included, which O_CREAT would otherwise create
+	// the target of — and the link count, read from the open file, refuses a
+	// hard link. Both are refused, never repaired: the operator decides.
+	fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if errors.Is(err, syscall.ELOOP) {
+		return nil, fmt.Errorf("worker data lock %s is a symbolic link; jig refuses to follow it — "+
+			"remove it and jig will create the lock file again", path)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open worker data lock: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if err := requireOwnLockFile(file, path); err != nil {
+		file.Close()
+		return nil, err
 	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
@@ -210,6 +225,23 @@ func lockWorkerData(dataDir string) (*workerDataLock, error) {
 		_, _ = file.WriteString(strconv.Itoa(os.Getpid()) + "\n")
 	}
 	return &workerDataLock{file: file}, nil
+}
+
+// requireOwnLockFile checks the OPEN file, so what is checked is what gets
+// locked and written: a regular file with exactly one name.
+func requireOwnLockFile(file *os.File, path string) error {
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect worker data lock: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("worker data lock %s is not a regular file; remove it and jig will create it again", path)
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Nlink != 1 {
+		return fmt.Errorf("worker data lock %s has more than one name (a hard link); jig refuses to write "+
+			"through it — remove it and jig will create the lock file again", path)
+	}
+	return nil
 }
 
 // release drops the lock. The file stays: removing it would let a racing

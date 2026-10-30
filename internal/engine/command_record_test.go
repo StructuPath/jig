@@ -10,12 +10,12 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -25,13 +25,14 @@ import (
 	"github.com/StructuPath/jig/internal/worker"
 )
 
-// groupRecorder is a RecordProcess fake: the live set per attempt, and an
-// optional failure for every active record.
+// groupRecorder is a RecordProcess fake: the live set per attempt, an
+// optional failure for every active record, and a number of clears to fail.
 type groupRecorder struct {
-	mutex   sync.Mutex
-	live    map[int64]bool
-	calls   []string
-	failure error
+	mutex         sync.Mutex
+	live          map[int64]bool
+	calls         []string
+	failure       error
+	clearFailures int
 }
 
 func (r *groupRecorder) record(attemptID string, groupID int64, active bool) error {
@@ -46,6 +47,10 @@ func (r *groupRecorder) record(attemptID string, groupID int64, active bool) err
 		// either way, so only a clear afterwards leaves the set honest.
 		r.live[groupID] = true
 		return r.failure
+	}
+	if r.clearFailures > 0 {
+		r.clearFailures--
+		return errors.New("manifest clear failed")
 	}
 	delete(r.live, groupID)
 	return nil
@@ -63,6 +68,14 @@ func (r *groupRecorder) liveCount() int {
 	return len(r.live)
 }
 
+// callLog is a copy of every record call so far, safe to read while the
+// engine may still be recording.
+func (r *groupRecorder) callLog() []string {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
 // heldCommand is a shell command that writes its own process id — its
 // group's id, since it leads its group — and then waits for release.
 func heldCommand(t *testing.T) (command, pidFile, release string) {
@@ -71,20 +84,30 @@ func heldCommand(t *testing.T) (command, pidFile, release string) {
 	pidFile = filepath.Join(dir, "pid")
 	release = filepath.Join(dir, "release")
 	command = "echo $$ > '" + pidFile + "'; while [ ! -f '" + release + "' ]; do sleep 0.05; done"
-	// A failing assertion must not leave the loop running: release it, and
-	// stop THIS command's own group — never 0, 1, or the test's own.
+	return command, pidFile, release
+}
+
+// executeHeld runs the attempt in the background. Whatever the test does,
+// cleanup releases the held command and joins the execution, so the loop
+// ends by its own exit and the engine reaps it: no group id is ever
+// signalled from here, so a recycled pid can never be hit.
+func executeHeld(t *testing.T, runner *engine.Runner, attempt engine.Attempt, release string) <-chan worker.Outcome {
+	t.Helper()
+	outcomes := make(chan worker.Outcome, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		outcomes <- runner.Execute(context.Background(), attempt)
+	}()
 	t.Cleanup(func() {
 		_ = os.WriteFile(release, nil, 0o644)
-		body, err := os.ReadFile(pidFile)
-		if err != nil {
-			return
-		}
-		if group, err := strconv.Atoi(strings.TrimSpace(string(body))); err == nil &&
-			group > 1 && group != syscall.Getpgrp() {
-			_ = syscall.Kill(-group, syscall.SIGKILL)
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Error("the held command's attempt did not finish after release")
 		}
 	})
-	return command, pidFile, release
+	return outcomes
 }
 
 func awaitPID(t *testing.T, pidFile string) int64 {
@@ -102,6 +125,19 @@ func awaitPID(t *testing.T, pidFile string) int64 {
 	}
 	t.Fatal("the command never started")
 	return 0
+}
+
+// awaitLive waits, bounded, for the group to be recorded: the shell may write
+// its pid a moment before the engine's record call lands.
+func awaitLive(t *testing.T, recorder *groupRecorder, group int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !recorder.isLive(group) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the running command's group %d was never recorded live (calls %v)", group, recorder.callLog())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // Both jig-side command sites record their group live while it runs and
@@ -126,12 +162,8 @@ func TestCodeAndGateCommandsAreRecordedLiveWhileTheyRun(t *testing.T) {
 			command, pidFile, release := heldCommand(t)
 			snapshot := "name: t\n" + oneWriterRoster + "phases:\n" + phases(command) + "acceptance: [all_phases_passed]\n"
 
-			outcomes := make(chan worker.Outcome, 1)
-			go func() { outcomes <- runner.Execute(context.Background(), testAttempt(snapshot, nil, repo)) }()
-			pid := awaitPID(t, pidFile)
-			if !recorder.isLive(pid) {
-				t.Fatalf("the running command's group %d is not recorded live (calls %v)", pid, recorder.calls)
-			}
+			outcomes := executeHeld(t, runner, testAttempt(snapshot, nil, repo), release)
+			awaitLive(t, recorder, awaitPID(t, pidFile))
 			if err := os.WriteFile(release, nil, 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -140,7 +172,72 @@ func TestCodeAndGateCommandsAreRecordedLiveWhileTheyRun(t *testing.T) {
 				t.Fatalf("state = %q (%s), want accepted_unpublished", outcome.State, outcome.Error)
 			}
 			if recorder.liveCount() != 0 {
-				t.Fatalf("groups still recorded live after the command exited: calls %v", recorder.calls)
+				t.Fatalf("groups still recorded live after the command exited: calls %v", recorder.callLog())
+			}
+		})
+	}
+}
+
+// lockedBuffer is a log sink the engine may write from several goroutines.
+type lockedBuffer struct {
+	mutex sync.Mutex
+	text  strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return b.text.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return b.text.String()
+}
+
+// A clear that fails is tried once more at once. A transient failure is
+// absorbed — the group is cleared and nothing is logged — and a persistent
+// one stops after that second try, leaves the group recorded, and is logged;
+// either way the command already ran, and its outcome stands.
+func TestAFailedClearIsRetriedOnceAndNeverChangesTheOutcome(t *testing.T) {
+	for name, tc := range map[string]struct {
+		clearFailures int
+		calls         int // record calls: one active, then the clears
+		stillLive     bool
+		warned        bool
+	}{
+		"transient":  {clearFailures: 1, calls: 3, stillLive: false, warned: false},
+		"persistent": {clearFailures: 5, calls: 3, stillLive: true, warned: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo := initRepo(t)
+			recorder := &groupRecorder{live: map[int64]bool{}, clearFailures: tc.clearFailures}
+			logs := &lockedBuffer{}
+			fake := enginetest.New()
+			runner := newTestRunner(t, fake, &recordingSink{}, func(config *engine.Config) {
+				config.RecordProcess = recorder.record
+				config.Logger = slog.New(slog.NewTextHandler(logs, nil))
+			})
+			snapshot := "name: t\n" + oneWriterRoster + `phases:
+  - name: verify
+    kind: code
+    command: "true"
+acceptance: [all_phases_passed]
+`
+			outcome := runner.Execute(context.Background(), testAttempt(snapshot, nil, repo))
+			if outcome.State != protocol.AttemptAcceptedUnpublished {
+				t.Fatalf("state = %q (%s), want accepted_unpublished: the command ran and passed", outcome.State, outcome.Error)
+			}
+			if calls := recorder.callLog(); len(calls) != tc.calls {
+				t.Fatalf("record calls = %v, want %d: one active record and at most one retried clear", calls, tc.calls)
+			}
+			if live := recorder.liveCount() == 1; live != tc.stillLive {
+				t.Fatalf("group still recorded = %v, want %v", live, tc.stillLive)
+			}
+			warned := strings.Contains(logs.String(), "process_group_record_failed")
+			if warned != tc.warned {
+				t.Fatalf("warning logged = %v, want %v\n%s", warned, tc.warned, logs)
 			}
 		})
 	}
@@ -193,7 +290,7 @@ func TestACommandWhoseGroupCannotBeRecordedIsKilledAndFailsAsInfrastructure(t *t
 				t.Fatalf("the unrecorded command kept running and wrote its marker (stat: %v)", err)
 			}
 			if recorder.liveCount() != 0 {
-				t.Fatalf("the failed record was never cleared: calls %v", recorder.calls)
+				t.Fatalf("the failed record was never cleared: calls %v", recorder.callLog())
 			}
 		})
 	}

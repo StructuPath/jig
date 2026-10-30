@@ -370,7 +370,7 @@ worktree and the repository cache are in that worker's data directory:
 
 ```sh
 # stop the worker that ran the job (Ctrl-C), then, as that worker:
-jig worker publish-retry --data ~/.jig/worker <job-id>
+jig worker publish-retry --data ~/trial/worker <job-id>
 ```
 
 Use the same `--data` directory and the same `--commit-author-name`,
