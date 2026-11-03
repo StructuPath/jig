@@ -443,6 +443,25 @@ func TestAdmissionPinsAnExplicitRefAndRefusesOneThatDoesNotResolve(t *testing.T)
 	}
 }
 
+func TestPinningNeverReadsASourceOrRefAsAGitOption(t *testing.T) {
+	store, _ := newTestStore(t)
+	repository, _, _ := newFixtureRepository(t, "options")
+	marker := filepath.Join(t.TempDir(), "upload-pack-ran")
+	option := "--upload-pack=touch " + marker
+
+	// A file:// identity reaches CloneSourceForIdentity unnormalized here, so
+	// the source itself is the option — the case normalization alone guards.
+	if _, err := store.resolveBaseSHA(context.Background(), "file://"+option, "HEAD"); err == nil {
+		t.Fatal("a source that is a git option must fail to resolve")
+	}
+	if _, err := store.resolveBaseSHA(context.Background(), repository, option); err == nil {
+		t.Fatal("a ref that is a git option must fail to resolve")
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("git ran --upload-pack: a source or ref was read as an option")
+	}
+}
+
 // ---- repository identity (U3's note) --------------------------------------
 
 func TestAdmissionStoresTheCanonicalRepositoryIdentityOnEveryJob(t *testing.T) {
