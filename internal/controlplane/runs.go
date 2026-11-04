@@ -236,7 +236,10 @@ func (s *Store) resolveBaseSHA(ctx context.Context, identity, ref string) (strin
 	}
 	ctx, cancel := context.WithTimeout(ctx, protocol.GitCommandTimeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, "git", "ls-remote", "--exit-code", source, ref)
+	// "--" ends git's options: a source or ref that starts with "-" is a
+	// name, never a flag such as --upload-pack, which runs a command.
+	// Normalization keeps sources off "-" today; this does not rely on it.
+	command := exec.CommandContext(ctx, "git", "ls-remote", "--exit-code", "--", source, ref)
 	// The control plane's own environment, minus any chance of git stopping
 	// to ask a human for credentials: an admission must fail loudly, never
 	// block on a prompt nobody is watching.
