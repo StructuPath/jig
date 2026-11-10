@@ -64,6 +64,20 @@ case "$STUB_MODE" in
       COUNT=$((COUNT+1))
     done
     printf '{"type":"result","result":"survived the flood","is_error":false,"session_id":"%s"}\n' "$SESSION" ;;
+  exitfail)
+    # The real CLI's failed login: the cause is the agent's last text, stderr
+    # stays empty, and the process exits 1.
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]}}'
+    exit 1 ;;
+  exitmultiline)
+    LONG=yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+    LONG="$LONG$LONG$LONG$LONG$LONG$LONG"
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"line one\\nFailed:   the\\tcause %s\\n"}]}}\n' "$LONG"
+    exit 1 ;;
+  exitstderr)
+    echo 'stderr cause' >&2
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"agent said something"}]}}'
+    exit 1 ;;
   *)
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"x.txt"}},{"type":"text","text":"working on it"}]}}'
     printf '{"type":"result","result":"hello from stub","is_error":false,"total_cost_usd":%s,"session_id":"%s","usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":2}}\n' "${STUB_TOTAL_COST:-0.5}" "$SESSION"
@@ -681,5 +695,67 @@ func TestBudgetIsPassedAsMaxBudgetUSDOnlyWhenSet(t *testing.T) {
 		if want == "" && strings.Contains(argText, "--max-budget-usd") {
 			t.Errorf("an unset budget must add no flag, got:\n%s", argText)
 		}
+	}
+}
+
+func exitError(t *testing.T, mode string) error {
+	t.Helper()
+	adapter := NewWithExecutable(writeStub(t))
+	handle, err := adapter.StartOrContinue(context.Background(),
+		&runtime.Session{Key: "attempt-" + mode}, "p",
+		runtime.Options{WorkDir: t.TempDir(), Env: stubEnv(t.TempDir(), mode)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainQuietly(handle)
+	_, err = handle.Result()
+	if err == nil {
+		t.Fatalf("mode %s: a non-zero exit returned no error", mode)
+	}
+	return err
+}
+
+// A CLI that exits non-zero with empty stderr names its cause in its last
+// agent text; the exit error must carry it, or the operator sees only
+// "exit status 1: " and has to open the trace.
+func TestExitErrorNamesTheLastAgentTextWhenStderrIsEmpty(t *testing.T) {
+	err := exitError(t, "exitfail")
+	want := "claude exited: exit status 1: " +
+		"Failed to authenticate: OAuth session expired and could not be refreshed"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+}
+
+func TestExitErrorCauseIsOneBoundedLine(t *testing.T) {
+	message := exitError(t, "exitmultiline").Error()
+	if strings.ContainsAny(message, "\n\r\t") {
+		t.Fatalf("error = %q, want a single line", message)
+	}
+	if strings.Contains(message, "line one") {
+		t.Fatalf("error = %q, want only the last line", message)
+	}
+	prefix := "claude exited: exit status 1: "
+	cause, found := strings.CutPrefix(message, prefix)
+	if !found || !strings.HasPrefix(cause, "Failed: the cause yyyy") {
+		t.Fatalf("error = %q, want the collapsed last line as the cause", message)
+	}
+	if len(cause) != maxCauseBytes {
+		t.Fatalf("cause is %d bytes, want it cut to %d", len(cause), maxCauseBytes)
+	}
+}
+
+func TestExitErrorPrefersStderrOverAgentText(t *testing.T) {
+	message := exitError(t, "exitstderr").Error()
+	if !strings.Contains(message, "stderr cause") ||
+		strings.Contains(message, "agent said something") {
+		t.Fatalf("error = %q, want the stderr cause and not the agent text", message)
+	}
+}
+
+func TestLastLineCutsOnARuneBoundary(t *testing.T) {
+	line := lastLine(strings.Repeat("a", maxCauseBytes-1) + "é")
+	if line != strings.Repeat("a", maxCauseBytes-1) {
+		t.Fatalf("lastLine split a rune: %q", line)
 	}
 }

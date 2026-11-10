@@ -35,6 +35,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/StructuPath/jig/internal/protocol"
 	"github.com/StructuPath/jig/internal/runtime"
@@ -384,6 +385,11 @@ type claudeHandle struct {
 	resultSeen  bool
 	finished    bool
 	finalErr    error
+	// lastText is the last agent text the stream carried, reduced to one
+	// bounded line. A CLI that dies with empty stderr often printed its
+	// cause here instead (an expired OAuth session, for one), so Result
+	// names it in the exit error.
+	lastText string
 }
 
 func (h *claudeHandle) Events() <-chan runtime.Event { return h.events }
@@ -513,6 +519,7 @@ func (h *claudeHandle) handleLine(line []byte, truncated bool) {
 			},
 		}
 		h.resultSeen = true
+		h.recordText(event.Result)
 		h.mutex.Unlock()
 	case "assistant", "user":
 		var body messageBody
@@ -526,6 +533,9 @@ func (h *claudeHandle) handleLine(line []byte, truncated bool) {
 					Payload: boundedRaw(block.Input, protocol.MaxEventPayloadBytes)})
 			case "text":
 				if block.Text != "" {
+					h.mutex.Lock()
+					h.recordText(block.Text)
+					h.mutex.Unlock()
 					h.emit(runtime.Event{Kind: runtime.EventText,
 						Text: boundedText(block.Text, protocol.MaxEventPayloadBytes)})
 				}
@@ -534,6 +544,32 @@ func (h *claudeHandle) handleLine(line []byte, truncated bool) {
 	case "system":
 		h.emit(runtime.Event{Kind: runtime.EventLog, Name: "system:" + event.Subtype})
 	}
+}
+
+// recordText keeps the last line of text as the exit-error fallback cause.
+// The caller holds h.mutex.
+func (h *claudeHandle) recordText(text string) {
+	if line := lastLine(text); line != "" {
+		h.lastText = line
+	}
+}
+
+// maxCauseBytes bounds the agent text Result puts in an exit error.
+const maxCauseBytes = 256
+
+// lastLine returns the last non-blank line of text with its whitespace
+// collapsed, cut to maxCauseBytes on a rune boundary: one line, always.
+func lastLine(text string) string {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	line := strings.Join(strings.Fields(lines[len(lines)-1]), " ")
+	if len(line) <= maxCauseBytes {
+		return line
+	}
+	cut := maxCauseBytes
+	for cut > 0 && !utf8.RuneStart(line[cut]) {
+		cut--
+	}
+	return line[:cut]
 }
 
 func (h *claudeHandle) emit(event runtime.Event) {
@@ -576,8 +612,14 @@ func (h *claudeHandle) Result() (runtime.Result, error) {
 	case h.killed:
 		h.finalErr = runtime.ErrKilled
 	case waitErr != nil:
-		h.finalErr = fmt.Errorf("claude exited: %w: %s", waitErr,
-			boundedText(h.stderrTail.String(), 1024))
+		// Stderr names the cause when it has one; otherwise fall back to the
+		// agent's last text line, where the CLI prints failures such as an
+		// expired login before exiting non-zero.
+		detail := boundedText(h.stderrTail.String(), 1024)
+		if strings.TrimSpace(detail) == "" {
+			detail = h.lastText
+		}
+		h.finalErr = fmt.Errorf("claude exited: %w: %s", waitErr, detail)
 		h.result.ExitCode = exitCode(waitErr)
 	case h.promptError != nil:
 		h.finalErr = fmt.Errorf("send prompt to claude: %w", h.promptError)
