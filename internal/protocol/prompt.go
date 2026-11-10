@@ -25,6 +25,7 @@ package protocol
 import (
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // PromptParameter is the run parameter the composed prompt is frozen into.
@@ -49,6 +50,15 @@ const (
 	// the prompt so the agent knows its view is partial.
 	MaxUntrustedContextBytes = 48 << 10
 )
+
+// trustedHeader opens every composed prompt. TaskTitle keys on it: a prompt
+// that does not start with it was not composed here, so nothing in it is
+// known to be the operator's.
+const trustedHeader = "Trusted instructions:\n\n"
+
+// MaxTaskTitleRunes bounds a task title. 72 is the conventional subject-line
+// width; a pull request list truncates near there anyway.
+const MaxTaskTitleRunes = 72
 
 // untrustedMarker is the fence token. Any occurrence inside untrusted body
 // text is neutralized before composition (see neutralizeMarkers), so a
@@ -89,7 +99,7 @@ func ComposeInvocationPrompt(instructions string, sections []UntrustedSection) (
 	}
 
 	var builder strings.Builder
-	builder.WriteString("Trusted instructions:\n\n")
+	builder.WriteString(trustedHeader)
 	builder.WriteString(instructions)
 
 	rendered, dropped := renderUntrustedSections(sections)
@@ -110,6 +120,36 @@ func ComposeInvocationPrompt(instructions string, sections []UntrustedSection) (
 		builder.WriteString(section)
 	}
 	return builder.String(), nil
+}
+
+// TaskTitle is the one-line name of a run's task: the first line of the
+// TRUSTED half of a composed prompt, with control and format characters
+// removed, whitespace collapsed, and the length clamped. It is what a pull
+// request is titled with, so it reads only text the operator authored: the
+// trusted half always precedes the untrusted block, and its first line can
+// never reach into it. A prompt that was not composed by
+// ComposeInvocationPrompt — a caller-supplied {{prompt}} parameter, or none
+// at all — has no trusted half to read and yields "".
+func TaskTitle(prompt string) string {
+	instructions, composed := strings.CutPrefix(prompt, trustedHeader)
+	if !composed {
+		return ""
+	}
+	line, _, _ := strings.Cut(instructions, "\n")
+	line = strings.Map(func(r rune) rune {
+		// Cf covers the bidirectional overrides, which can make a title
+		// display as something other than what it says.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ' '
+		}
+		return r
+	}, line)
+	line = strings.Join(strings.Fields(line), " ")
+	runes := []rune(line)
+	if len(runes) > MaxTaskTitleRunes {
+		line = strings.TrimSpace(string(runes[:MaxTaskTitleRunes-1])) + "…"
+	}
+	return line
 }
 
 // renderUntrustedSections bounds, neutralizes, and fences each section,

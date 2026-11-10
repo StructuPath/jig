@@ -191,6 +191,11 @@ type PublishRetry struct {
 	// Snapshot is the run's frozen definition, so the retrying worker applies
 	// the same publish policy (a CI wait, say) the original attempt ran under.
 	Snapshot string `json:"snapshot"`
+	// TaskTitle is protocol.TaskTitle of the run's frozen prompt. A retry can
+	// be the first time the pull request is created, and it titles it as the
+	// original attempt would have. The prompt itself is not sent: no phase
+	// runs on a retry, so nothing else would read it.
+	TaskTitle string `json:"task_title,omitempty"`
 }
 
 // MaxCIRepairFailedChecks caps how many failed check names one CI repair

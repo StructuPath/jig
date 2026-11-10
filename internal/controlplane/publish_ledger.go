@@ -19,6 +19,7 @@ package controlplane
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -455,10 +456,17 @@ func (s *Store) RetryPublish(
 	if err != nil {
 		return retry, err
 	}
+	var parametersJSON string
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT snapshot FROM runs WHERE id = ?`, job.RunID).Scan(&retry.Snapshot); err != nil {
+		`SELECT snapshot, parameters FROM runs WHERE id = ?`, job.RunID,
+	).Scan(&retry.Snapshot, &parametersJSON); err != nil {
 		return retry, unavailable(err)
 	}
+	var parameters map[string]string
+	if err := json.Unmarshal([]byte(parametersJSON), &parameters); err != nil {
+		return retry, unavailable(err)
+	}
+	retry.TaskTitle = protocol.TaskTitle(parameters[protocol.PromptParameter])
 	retry.Attempt = attempt
 	retry.Job = job
 	retry.Records = records
