@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -85,6 +87,10 @@ func reportCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var raw json.RawMessage
 	if err := apiCall(ctx, *server, http.MethodGet, path, nil, &raw); err != nil {
 		fmt.Fprintf(stderr, "jig report: %v\n", err)
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			fmt.Fprintf(stderr, "jig report: no control plane answered at %s; `jig serve` must be running.\n",
+				strings.TrimSpace(*server))
+		}
 		return exitInfraFailed
 	}
 	if *asJSON {
