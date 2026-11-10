@@ -4,9 +4,9 @@
 import { useCallback, useState } from "react";
 import { api } from "./api";
 import { TaskBoard } from "./TaskBoard";
+import { Floor } from "./Floor";
 import { formatClock } from "./format";
-import { usePolled } from "./polling";
-import { TaskCard } from "./Tasks";
+import { useNow, usePolled } from "./polling";
 import { Empty, ErrorBanner, Link, Loading, StatusBadge } from "./ui";
 
 export function Queue() {
@@ -109,6 +109,7 @@ export function Runs() {
   const load = useCallback(() => api.runs(), []);
   const { data, error, loading } = usePolled(load, 4000, "runs");
   const [layout, setLayout] = useState(storedLayout);
+  const nowMs = useNow(1000);
   const choose = (next: Layout) => {
     setLayout(next);
     try { localStorage.setItem("jig-tasks-layout", next); } catch { /* The switch still applies for this visit. */ }
@@ -120,8 +121,8 @@ export function Runs() {
     <div className="view">
       <header className="view-header">
         <div>
-          <h1>My tasks</h1>
-          <p className="subtle">Open a task to follow its progress or read the result.</p>
+          <h1>Jobs</h1>
+          <p className="subtle">Every job, newest first. Open one to follow its stations or read the result.</p>
         </div>
         <div className="layout-switch" role="group" aria-label="Layout">
           <button type="button" aria-pressed={layout === "list"} onClick={() => choose("list")}>List</button>
@@ -134,7 +135,7 @@ export function Runs() {
       ) : layout === "board" ? (
         <TaskBoard runs={data} />
       ) : (
-        <div className="task-cards">{data.map((run) => <TaskCard key={run.id} run={run} />)}</div>
+        <Floor runs={data} nowMs={nowMs} />
       )}
     </div>
   );

@@ -41,7 +41,7 @@ export function PlantBar({ route }: { route: Route }) {
         <div><dt>Spend today</dt><dd>{data ? formatUSD(data.spend.total_usd) : "—"}</dd></div>
       </dl>
       <nav className="plant-nav" aria-label="Main navigation">
-        <Link href="/" current={route.name === "tasks"}>New job</Link>
+        <Link href="/" current={route.name === "tasks"}>Floor</Link>
         <Link href="/runs" current={["runs", "run", "job"].includes(route.name)}>Jobs</Link>
         <Link href="/queue" current={route.name === "queue"}>Queue</Link>
         <Link href="/fleet" current={route.name === "fleet"}>Workers</Link>
