@@ -105,6 +105,35 @@ export interface JobDetail {
   attempts: Attempt[] | null;
   publish: PublishRecord[] | null;
   worktree?: WorktreeLedgerEntry;
+  stations?: Station[];
+  delivery?: Delivery;
+}
+
+// Station is one phase of the run's frozen definition, in declared order.
+export interface Station {
+  name: string;
+  kind: string;
+  owner?: string;
+  model?: string;
+  if?: string;
+  gates?: string[];
+  parallel?: boolean;
+}
+
+// Delivery is the frozen publish policy the job runs under.
+export interface Delivery {
+  hold_when?: string;
+  ci_wait: boolean;
+}
+
+// Report is the slice of GET /api/report the plant bar reads. Rates are
+// fractions, and null when there was nothing to divide by.
+export interface Report {
+  jobs: { total: number; accepted: number; accepted_unpublished: number; failed: number; cancelled: number };
+  accepts: { clean: number };
+  publish: { held: number };
+  ci: { waited: number; first_pass_green: number };
+  spend: { total_usd: number; per_clean_accept_usd: number | null };
 }
 
 export interface QueueEntry {

@@ -71,6 +71,24 @@ export function formatDuration(milliseconds: number): string {
   return `${hours}h ${minutes - hours * 60}m`;
 }
 
+// formatStopwatch is a duration as a station reads it: m:ss, or h:mm:ss once
+// an hour has passed. Sub-second work reads 0:00 rather than a millisecond
+// count, because a station line compares stations, not microbenchmarks.
+export function formatStopwatch(milliseconds: number | null): string {
+  if (milliseconds === null || !Number.isFinite(milliseconds) || milliseconds < 0) return "—";
+  const seconds = Math.floor(milliseconds / 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
+}
+
+// formatUSD prints agent spend. It is an estimate the CLI reports, so cents
+// are enough; a missing figure is a dash, never $0.00.
+export function formatUSD(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? `$${value.toFixed(2)}` : "—";
+}
+
 export function formatClock(value: string | undefined | null): string {
   const time = parseTime(value);
   if (time === null) return "—";

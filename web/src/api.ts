@@ -11,6 +11,7 @@ import type {
   GateEvidence,
   JobDetail,
   QueueView,
+  Report,
   Run,
   RunView,
   WorktreeLedgerEntry,
@@ -91,6 +92,7 @@ export const api = {
       (rows) => rows ?? [],
     ),
   fleet: () => request<FleetView>("/api/workers"),
+  report: (since: string) => request<Report>(`/api/report?since=${encodeURIComponent(since)}`),
   worktrees: () =>
     request<WorktreeLedgerEntry[] | null>("/api/worktrees").then((rows) => rows ?? []),
   releaseWorktree: (attemptID: string) =>
