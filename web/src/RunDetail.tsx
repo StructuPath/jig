@@ -7,7 +7,7 @@
 // cannot interleave because they are not shared.
 import { useCallback, useMemo, useState } from "react";
 import { api, parseAttemptSummary } from "./api";
-import { formatClock, formatDateTime, formatDuration, isTerminalAttempt, projectName, shortID, taskState, taskTitle } from "./format";
+import { formatClock, formatDateTime, formatDuration, isTerminalAttempt, projectName, runtimeLabel, shortID, taskHeading, taskState, taskTitle, workflowName } from "./format";
 import { buildLane } from "./lanes";
 import { attemptOutcome } from "./outcomes";
 import { useAttemptEvents, useNow, usePolled } from "./polling";
@@ -31,7 +31,7 @@ export function RunDetail({ runID }: { runID: string }) {
       <p><Link href="/">← New task</Link> · <Link href="/runs">My tasks</Link></p>
       <header className="view-header">
         <div>
-          <h1>{data.run.targets.map((target) => projectName(target.repository)).join(", ")}</h1>
+          <h1 className="task-heading">{taskHeading(data.run)}</h1>
           <p className="subtle">
             {data.run.targets.map((target) => projectName(target.repository)).join(", ")} · {formatDateTime(data.run.created_at)}
           </p>
@@ -39,8 +39,8 @@ export function RunDetail({ runID }: { runID: string }) {
         <StatusBadge state={taskState(data.run)} />
       </header>
       <ErrorBanner error={error} />
-      <section className="panel directive"><h2>{data.run.parameters?.task_mode === "auto" ? "Agents choose the directive" : data.run.parameters?.task_mode === "build" ? "Directive · make changes" : "Question · get an answer"}</h2><details open={taskTitle(data.run).length <= 250}><summary>View your instructions</summary><p>{taskTitle(data.run)}</p></details>
-        <p className="subtle">{data.run.parameters?.task_mode === "auto" || data.run.parameters?.task_mode === "build" ? "Agents plan, build, and test automatically. Failed tests return to planning for up to three repair rounds. Changes stay in the saved working folder." : "Codex reads this project and returns an answer. This task does not implement the recommendations."}</p>
+      <section className="panel directive"><h2>{data.run.parameters?.task_mode === "auto" ? "Agents choose the directive" : data.run.parameters?.task_mode === "build" ? "Directive · make changes" : data.run.parameters?.task_mode === "ask" ? "Question · get an answer" : `Workflow · ${workflowName(data.run) ?? "saved definition"}`}</h2><details open={taskTitle(data.run).length <= 250}><summary>View your instructions</summary><p>{taskTitle(data.run)}</p></details>
+        <p className="subtle">{data.run.parameters?.task_mode === "auto" || data.run.parameters?.task_mode === "build" ? "Agents plan, build, and test automatically. Failed tests return to planning for up to three repair rounds. Changes stay in the saved working folder." : data.run.parameters?.task_mode === "ask" ? "Codex reads this project and returns an answer. This task does not implement the recommendations." : "This run follows a saved workflow. Its phases, checks, and delivery are the workflow's own; each job below shows them as they run."}</p>
       </section>
 
       {parameters.length > 0 && <details className="evidence"><summary>Task settings</summary>
@@ -241,7 +241,7 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode }: { att
           return <li key={name}><span>{name === "scout" ? "Read project" : name}{runs > 1 ? ` · round ${runs}` : ""}</span><StatusBadge state={state} /></li>;
         })}</ol>
         <details className="activity" aria-label="Recent activity" open={!isTerminalAttempt(attempt.state)}><summary>{isTerminalAttempt(attempt.state) ? "Activity history" : "Live activity"}</summary>
-          {activity.length === 0 ? <p className="subtle">Waiting for the worker's first activity. This page checks for updates automatically.</p> : <ol>{activity.map((event) => <li key={event.seq}><time>{formatClock(event.started_at)}</time><span>{event.type === "tool_call" ? `Codex used ${event.name ?? "a tool"}` : event.type === "phase_start" ? `Started ${event.phase === "scout" ? "reading the project" : event.phase}` : event.type === "phase_end" ? `Finished ${event.phase === "scout" ? "reading the project" : event.phase}` : event.name === "agent_text" ? "Codex sent a progress update" : event.name === "repair_edge" ? "Check failed → agents are repairing and retesting automatically" : event.name === "repair_exhausted" ? "Repair limit reached; see the diagnostic" : event.type === "gate_fail" ? "A check failed; inspect the workflow's repair activity" : "Worker reported an error"}</span></li>)}</ol>}
+          {activity.length === 0 ? <p className="subtle">Waiting for the worker's first activity. This page checks for updates automatically.</p> : <ol>{activity.map((event) => <li key={event.seq}><time>{formatClock(event.started_at)}</time><span>{event.type === "tool_call" ? `${runtimeLabel(attempt.runtime_name)} used ${event.name ?? "a tool"}` : event.type === "phase_start" ? `Started ${event.phase === "scout" ? "reading the project" : event.phase}` : event.type === "phase_end" ? `Finished ${event.phase === "scout" ? "reading the project" : event.phase}` : event.name === "agent_text" ? `${runtimeLabel(attempt.runtime_name)} sent a progress update` : event.name === "repair_edge" ? "Check failed → agents are repairing and retesting automatically" : event.name === "repair_exhausted" ? "Repair limit reached; see the diagnostic" : event.type === "gate_fail" ? "A check failed; inspect the workflow's repair activity" : "Worker reported an error"}</span></li>)}</ol>}
         </details>
         <details className="evidence"><summary>Technical activity</summary>{timeline}</details>
       </> : timeline}

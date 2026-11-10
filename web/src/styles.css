@@ -117,6 +117,20 @@ h1 {
   margin: 0;
 }
 
+/* A task's heading is its instruction's first line, which can be a paragraph
+   long: two lines, then an ellipsis. The full text is in the panel below. */
+h1.task-heading {
+  font-size: 30px;
+  line-height: 1.15;
+  letter-spacing: -.03em;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
 h2 {
   font-size: 20px;
   margin: 0;

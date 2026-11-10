@@ -1,10 +1,34 @@
 // format.ts — presentation helpers. Durations are the operator's main unit
 // here: a swim lane is only useful if "how long did that take" is readable at
 // a glance.
+import { automaticGoal } from "./starters";
 import type { Run } from "./types";
 
 export function taskTitle(run: Run): string {
   return run.parameters?.task_title ?? run.parameters?.prompt?.replace(/^Trusted instructions:\s*/, "").split("\n\nUntrusted context:")[0].trim() ?? "Previous task";
+}
+
+// taskHeading is the one-line name of a task: the first line of its
+// instructions, or a fixed name for the agent-led goal nobody typed.
+export function taskHeading(run: Run): string {
+  const title = taskTitle(run);
+  return title === automaticGoal ? "Agent-led improvement" : title.split("\n")[0].replace(/^>\s*/, "");
+}
+
+// workflowName reads the definition's name from the run's frozen snapshot.
+// A run started outside the task form (`jig def invoke`, a trigger) carries
+// no task_mode, and its workflow name is the only honest description of it.
+export function workflowName(run: Run): string | null {
+  const match = /^name:[ \t]*(.+?)[ \t]*$/m.exec(run.snapshot);
+  return match ? match[1].replace(/^["']|["']$/g, "") : null;
+}
+
+// runtimeLabel names the agent CLI an attempt ran on. An attempt that has
+// not been claimed yet has no runtime, so it is not called by any CLI's name.
+export function runtimeLabel(runtime: string | undefined | null): string {
+  if (runtime === "codex") return "Codex";
+  if (runtime === "claude-code") return "Claude Code";
+  return "The agent";
 }
 
 export function projectName(repository: string): string {

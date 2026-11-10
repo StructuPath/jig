@@ -28,7 +28,7 @@ export function App() {
           <Link href="/fleet" current={route.name === "fleet"}>Workers</Link>
           <Link href="/worktrees" current={route.name === "worktrees"}>Saved worktrees</Link>
         </details>
-        <div className="nav-footer"><span className="nav-caption">LOCAL BY DESIGN</span><p>Your projects.<br />Your Codex.<br />Your next move.</p></div>
+        <div className="nav-footer"><span className="nav-caption">LOCAL BY DESIGN</span><p>Your projects.<br />Your agents.<br />Your next move.</p></div>
       </nav>
       <main>
         {route.name === "tasks" && <Tasks />}

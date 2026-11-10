@@ -109,10 +109,30 @@ describe("swim lanes", () => {
       event(2, "log", 1000, { phase: "scout", name: "agent_text", payload: { text: "I am checking the installation instructions." } }),
       event(3, "tool_call", 2000, { phase: "scout", name: "command_execution" }),
     ])] } });
-    render(<AttemptLane compact taskMode="ask" attempt={attempt()} nowMs={BASE + 10000} />);
+    render(<AttemptLane compact taskMode="ask" attempt={attempt({ runtime_name: "codex" })} nowMs={BASE + 10000} />);
     expect(await screen.findByText("I am checking the installation instructions.")).toBeVisible();
     expect(screen.getByText("Codex used command_execution")).toBeVisible();
     expect(screen.getByText(/Last activity 8.0s ago/)).toBeVisible();
+  });
+
+  it("names the runtime the attempt ran on, never Codex by default", async () => {
+    const events = { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "build" }),
+      event(2, "tool_call", 1000, { phase: "build", name: "Bash" }),
+    ])] };
+    mockAPI({ events });
+    render(<AttemptLane compact attempt={attempt({ runtime_name: "claude-code" })} nowMs={BASE + 10000} />);
+    expect(await screen.findByText("Claude Code used Bash")).toBeVisible();
+    expect(screen.queryByText(/Codex/)).toBeNull();
+  });
+
+  it("credits no CLI when the attempt has no recorded runtime", async () => {
+    mockAPI({ events: { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "build" }),
+      event(2, "tool_call", 1000, { phase: "build", name: "Bash" }),
+    ])] } });
+    render(<AttemptLane compact attempt={attempt()} nowMs={BASE + 10000} />);
+    expect(await screen.findByText("The agent used Bash")).toBeVisible();
   });
 
   it("keeps the answer visible when a code check follows it", async () => {

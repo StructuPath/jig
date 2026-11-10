@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { api, ensureDefinition } from "./api";
-import { formatDateTime, projectName, taskState, taskTitle } from "./format";
+import { formatDateTime, projectName, taskHeading, taskState } from "./format";
 import { usePolled } from "./polling";
 import { navigate } from "./router";
 import { loadContinuation } from "./continuation";
@@ -120,7 +120,7 @@ export function Tasks() {
 }
 
 export function TaskCard({ run }: { run: Run }) {
-  const title = taskTitle(run) === automaticGoal ? "Agent-led improvement" : taskTitle(run).split("\n")[0].replace(/^>\s*/, "");
+  const title = taskHeading(run);
   return <article className={`panel task-card task-card-${taskState(run)}`}>
       <div className="task-card-meta"><span className="task-project">{run.targets.map((target) => projectName(target.repository)).join(", ")}</span><StatusBadge state={taskState(run)} /></div>
       <h3><Link href={`/runs/${run.id}`}>{title}</Link></h3>
