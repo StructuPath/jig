@@ -76,7 +76,7 @@ function publishState(summary: AttemptSummary | null): { state?: string; code?: 
 }
 
 /** isLocalDelivery is the task form's own hold: work kept local on purpose. */
-function isLocalDelivery(delivery: Delivery | undefined): boolean {
+export function isLocalDelivery(delivery: Delivery | undefined): boolean {
   return (delivery?.hold_when ?? "").includes("jig_ui_delivery");
 }
 

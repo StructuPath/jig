@@ -75,10 +75,15 @@ export const api = {
       targets: [{ repository, ...(ref ? { ref } : {}) }] }),
   }),
   // A saved workflow runs as itself: no task_mode, so the run page describes
-  // it by its own name, and delivery is whatever its definition declares.
-  startRun: (definitionID: string, repository: string, instructions: string) => request<RunView>("/api/runs", {
+  // it by its own name, and delivery is whatever its definition declares. A
+  // continuation reaches it the same way it reaches a task: context composed
+  // into the prompt after the instructions, and the earlier branch as base.
+  startRun: (definitionID: string, repository: string, instructions: string,
+    { context, ref, continues }: Omit<TaskOptions, "delivery"> = {}) => request<RunView>("/api/runs", {
     method: "POST", body: JSON.stringify({ definition_id: definitionID, instructions,
-      parameters: { task_title: instructions }, targets: [{ repository }] }),
+      parameters: { task_title: instructions, ...(continues ? { task_continues: continues } : {}) },
+      ...(context?.length ? { context } : {}),
+      targets: [{ repository, ...(ref ? { ref } : {}) }] }),
   }),
   queue: () => request<QueueView>("/api/queue"),
   runs: () => request<Run[] | null>("/api/runs").then((runs) => runs ?? []),

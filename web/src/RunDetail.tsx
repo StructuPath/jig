@@ -231,6 +231,9 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
     ?? stations.find((station) => station.state === "live")
     ?? stations.find((station) => station.state === "bad" || station.state === "held")
     ?? stations.slice().reverse().find((station) => station.state === "pass");
+  // A delivery station (publish, CI) is no phase: no gate row or envelope
+  // carries its name, so it must not filter the evidence down to nothing.
+  const evidencePhase = focus?.kind === "delivery" ? null : openPhase;
   const focusResult = summary?.phases?.slice().reverse().find((phase) => phase.phase === focus?.name);
   const said = useMemo(() => {
     const last = events.slice().reverse().find((event) => event.type === "log" && event.name === "agent_text" && event.phase === focus?.name);
@@ -317,7 +320,7 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
       {taskMode === "auto" && planSummary && <section className="directive"><h3>Agent's directive</h3><p>{planSummary}</p><p className="subtle">The builder receives the full plan automatically. No input is needed here.</p></section>}
       <details className="evidence"><summary>Technical activity</summary>{timeline}</details>
       <ErrorBanner error={error} />
-      <AttemptEvidence attempt={attempt} openPhase={openPhase} compact />
+      <AttemptEvidence attempt={attempt} openPhase={evidencePhase} compact />
     </div>
   );
 }

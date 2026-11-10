@@ -14,7 +14,7 @@ import { api, parseAttemptSummary } from "./api";
 import { formatDuration, isTerminalAttempt, projectName, taskHeading } from "./format";
 import { buildLane } from "./lanes";
 import { useAttemptEvents, usePolled } from "./polling";
-import { buildStations, verdictFor } from "./stations";
+import { buildStations, isLocalDelivery, verdictFor } from "./stations";
 import type { Attempt, JobDetail, Run, TraceEvent } from "./types";
 import { Link } from "./ui";
 
@@ -37,7 +37,7 @@ export function Floor({ runs, nowMs }: { runs: Run[]; nowMs: number }) {
 function FloorRow({ run, nowMs }: { run: Run; nowMs: number }) {
   const settled = SETTLED_RUNS.includes(run.state);
   const loadView = useCallback(() => api.run(run.id), [run.id]);
-  const view = usePolled(loadView, settled ? 0 : 4000, `floor:run:${run.id}:${run.state}`);
+  const view = usePolled(loadView, settled ? 0 : 4000, `floor:run:${run.id}`);
   const jobID = view.data?.jobs?.[0]?.id;
   const title = taskHeading(run);
   const project = (run.targets ?? []).map((target) => projectName(target.repository)).join(", ");
@@ -69,7 +69,7 @@ function FloorJob({ jobID, run, name, settled, nowMs }: {
   jobID: string; run: Run; name: ReactNode; settled: boolean; nowMs: number;
 }) {
   const loadJob = useCallback(() => api.job(jobID), [jobID]);
-  const job = usePolled(loadJob, settled ? 0 : 4000, `floor:job:${jobID}:${run.state}`);
+  const job = usePolled(loadJob, settled ? 0 : 4000, `floor:job:${jobID}`);
   const attempt = job.data?.attempts?.at(-1);
   if (!job.data || !attempt) return <Unlit state={job.data ? "queued" : run.state} name={name} />;
   // Only a live attempt follows its trace; a finished one is lit from its
@@ -113,7 +113,7 @@ function Cells({ detail, attempt, events, name, nowMs }: {
       <td className="floor-mono">{Number.isFinite(started) ? formatDuration(Math.max(0, ended - started)) : "—"}</td>
       <td className="floor-mono">
         {pullRequest ? <a href={pullRequest} rel="noreferrer noopener" target="_blank">PR{number ? ` #${number}` : ""}</a>
-          : publishState === "held" ? (detail.delivery?.hold_when ?? "").includes("jig_ui_delivery") ? "kept local" : "held"
+          : publishState === "held" ? isLocalDelivery(detail.delivery) ? "kept local" : "held"
           : "—"}
       </td>
     </>

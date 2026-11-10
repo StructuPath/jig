@@ -27,6 +27,13 @@ describe("startHelp", () => {
     expect(help?.commands.at(-1)).toBe("gh repo create StructuPath/new-app --private --source . --push");
   });
 
+  it("quotes a GitHub name that carries shell characters", () => {
+    const help = startHelp(refused("unresolvable_ref",
+      `cannot resolve "HEAD" in "github.com/owner/app;touch-x": remote: Repository not found.`), "github.com/owner/app;touch-x");
+    expect(help?.commands[0]).toBe("mkdir -p 'app;touch-x' && cd 'app;touch-x'");
+    expect(help?.commands.at(-1)).toBe("gh repo create 'owner/app;touch-x' --private --source . --push");
+  });
+
   it("explains a folder that does not exist, quoting a path with spaces", () => {
     const help = startHelp(refused("invalid_target",
       `target repository "/Users/v/my app": canonicalize repository path: lstat /Users/v/my app: no such file or directory`), "/Users/v/my app");

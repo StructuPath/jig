@@ -172,6 +172,24 @@ describe("swim lanes", () => {
     expect(line.getByText("if risk != low")).toBeVisible();
   });
 
+  it("keeps every gate check in the evidence when a delivery station is selected", async () => {
+    mockAPI({ gates: [{ attempt_id: "attempt-1", phase: "plan", gate: "envelope", emission: 1, item: "summary_present", ok: true, recorded_at: at(1000) }] });
+    render(<AttemptLane compact attempt={attempt({
+      state: "accepted",
+      completed_at: at(9000),
+      result: JSON.stringify({ phases: [{ phase: "plan", kind: "agent", status: "success", phase_attempt: 1 }], publish: { state: "published" } }),
+    })} nowMs={BASE + 10_000}
+      stations={[{ name: "plan", kind: "agent", model: "sonnet" }]}
+      delivery={{ hold_when: "", ci_wait: false }}
+      publish={[{ attempt_id: "attempt-1", step: "proof", branch: "b", completed_at: at(8000) }]} />);
+    const line = within(await screen.findByLabelText("Attempt 1 stations"));
+    fireEvent.click(await line.findByLabelText("station 2, publish, passed"));
+    expect(line.getByLabelText("station 2, publish, passed")).toHaveAttribute("aria-pressed", "true");
+    // No gate row carries a delivery station's name; the plan's check stays.
+    expect(await screen.findByText(/Evidence — 1 gate check/)).toBeInTheDocument();
+    expect(screen.queryByText(/Evidence · publish/)).toBeNull();
+  });
+
   it("keeps the answer visible when a code check follows it", async () => {
     mockAPI({});
     render(<AttemptLane compact taskMode="ask" attempt={attempt({

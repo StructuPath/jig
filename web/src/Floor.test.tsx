@@ -45,6 +45,19 @@ const jobs: Record<string, unknown> = {
       result: result({ publish: { state: "held", code: "publish_held" }, publish_hold: "held (risk = high)" }, "high") }],
     publish: [],
   },
+  "job-local": {
+    job: { id: "job-local", repository: "github.com/owner/repo" }, run_id: "run-local", definition: "jig-task-build-abc", stations,
+    delivery: { hold_when: "jig_ui_delivery != publish", ci_wait: false },
+    attempts: [{ id: "a-local", job_id: "job-local", attempt_number: 1, state: "accepted_unpublished", created_at: "2026-11-10T08:30:00Z",
+      started_at: "2026-11-10T08:30:00Z", completed_at: "2026-11-10T08:34:00Z",
+      result: result({ publish: { state: "held", code: "publish_held" }, publish_hold: 'publish.hold_when "jig_ui_delivery != publish" held (jig_ui_delivery = local)' }) }],
+    publish: [],
+  },
+  "job-0": {
+    job: { id: "job-0", repository: "github.com/owner/repo" }, run_id: "run-0",
+    attempts: [{ id: "a-0", result: JSON.stringify({ phases: [{ phase: "plan", status: "success", envelope: { summary: "Segment graphemes" } }] }) }],
+    publish: [{ attempt_id: "a-0", step: "push", branch: "jig/job-0/1" }],
+  },
 };
 
 let requests: string[] = [];
@@ -107,6 +120,23 @@ it("shows a held job as held on its row", async () => {
   expect(row.getByText("held")).toBeVisible();
 });
 
+it("keeps a row lit while its run changes state", async () => {
+  const view = render(<Floor runs={[run("run-done", "active", "Hint when no control plane answers")]} nowMs={NOW} />);
+  expect(await screen.findByText("Accepted")).toBeVisible();
+  // The run list's next poll moves the run on; the row must not drop to
+  // unlit while it reads the job again.
+  view.rerender(<Floor runs={[run("run-done", "accepted", "Hint when no control plane answers")]} nowMs={NOW} />);
+  expect(screen.getByText("Accepted")).toBeVisible();
+  expect(screen.getByRole("img", { name: "5 of 5 stations passed" })).toBeVisible();
+});
+
+it("labels a job the form kept local as kept local, not held", async () => {
+  render(<Floor runs={[run("run-local", "accepted", "Local change")]} nowMs={NOW} />);
+  const row = within((await screen.findByText("Ready")).closest("tr") as HTMLElement);
+  expect(row.getByText("kept local")).toBeVisible();
+  expect(row.queryByText("held")).toBeNull();
+});
+
 it("keeps a row readable when the run has no job yet", async () => {
   render(<Floor runs={[run("run-empty", "active", "Queued work")]} nowMs={NOW} />);
   const row = within((await screen.findByText("Queued work")).closest("tr") as HTMLElement);
@@ -151,6 +181,22 @@ async function fillSavedWorkflow(project: string, instructions: string) {
   await waitFor(() => expect(start).toBeEnabled());
   return start;
 }
+
+it("passes a continuation to a saved workflow: earlier result as context, earlier branch as base", async () => {
+  window.history.replaceState({}, "", "/?continue=run-0");
+  render(<Tasks />);
+  expect(await screen.findByText(/Starts from the earlier task's branch jig\/job-0\/1/)).toBeVisible();
+  fireEvent.click(await fillSavedWorkflow("github.com/owner/repo", "Keep going"));
+  await waitFor(() => expect(window.location.pathname).toBe("/runs/run-new"));
+  expect(posted).toMatchObject({
+    definition_id: "d-factory", instructions: "Keep going",
+    parameters: { task_title: "Keep going", task_continues: "run-0" },
+    targets: [{ repository: "github.com/owner/repo", ref: "jig/job-0/1" }],
+  });
+  const context = (posted as { context: { label: string; body: string }[] }).context;
+  expect(context.map((section) => section.label)).toEqual(["Previous task", "Previous result"]);
+  expect(context[1].body).toContain("Segment graphemes");
+});
 
 it("explains a refused start in plain words, with the commands, and keeps the raw error", async () => {
   refuse = true;

@@ -92,7 +92,9 @@ export function Tasks() {
     try {
       const chosen: Delivery = publishing ? "publish" : "local";
       const result = saved && workflow
-        ? await api.startRun(workflow.id, repository.trim(), task.trim())
+        ? await api.startRun(workflow.id, repository.trim(), task.trim(), {
+          context: continuation?.context, ref: continuation?.ref, continues: continuation?.runID,
+        })
         : await api.startTask((await ensureDefinition(await starterSource(mode, model, testCommand, chosen))).id, repository.trim(), task.trim() || automaticGoal, mode, {
           delivery: chosen, context: continuation?.context, ref: continuation?.ref, continues: continuation?.runID,
         });

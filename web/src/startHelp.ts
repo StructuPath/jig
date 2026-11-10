@@ -39,10 +39,11 @@ export function startHelp(error: Error | null, repository: string): StartHelp | 
   if (error.code !== "unresolvable_ref") return null;
 
   if (github) {
+    const folder = shellQuote(github[2].split("/")[1]);
     return {
       title: "GitHub has no repository with that name, or it has no commit yet",
       detail: "Create the repository and push a first commit, then start again. A private repository also needs the gh login on this Mac to have access to it.",
-      commands: [`mkdir -p ${github[2].split("/")[1]} && cd ${github[2].split("/")[1]}`, "git init -b main", 'echo "# New project" > README.md', 'git add README.md && git commit -m "Initial commit"', `gh repo create ${github[2]} --private --source . --push`],
+      commands: [`mkdir -p ${folder} && cd ${folder}`, "git init -b main", 'echo "# New project" > README.md', 'git add README.md && git commit -m "Initial commit"', `gh repo create ${shellQuote(github[2])} --private --source . --push`],
     };
   }
   if (error.message.includes("does not appear to be a git repository")) {
