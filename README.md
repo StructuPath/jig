@@ -121,7 +121,7 @@ re-runs, and spend over a time window, read from the control plane's ledger.
 
 ## Authoring a definition
 
-A definition is data, not a script. Five stock ones ship in
+A definition is data, not a script. Seven stock ones ship in
 `examples/definitions/`:
 
 | Definition | What it demonstrates |
@@ -132,6 +132,7 @@ A definition is data, not a script. Five stock ones ship in
 | `plan-build-test.yaml` | a **code-phase repair edge**: a red suite returns to planning, rebuilds, and retests |
 | `simple-sdlc.yaml` | an **agent-phase repair edge** (review → revise → re-review), a conditional retest, and per-phase commit messages |
 | `factory.yaml` | the **software factory**: plan → build → commit → test → a panel of specialist reviewers looping the builder until they approve, then a deterministic **risk gate** that holds high-risk work for a person |
+| `factory-parallel.yaml` | the **parallel review panel**: `factory.yaml` with its three specialist reviewers run at once as one opt-in `parallel:` group; the first rejecting reviewer in declared order sends the builder its blocking list, then the whole panel runs again |
 
 The shape:
 
