@@ -111,6 +111,34 @@ For scripting (or for an agent driving jig), add `--json`:
 ./bin/jig run --json --def examples/definitions/smoke.yaml . "what is this repository?" | jq .
 ```
 
+### Claude Code authenticates through environment variables
+
+Some machines authenticate Claude Code through environment variables, not
+the keychain — for example `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`
+for a local proxy. On such a machine the keychain login that jig seeds can
+be expired, and the smoke run fails with *“OAuth session expired and could
+not be refreshed”*.
+
+The fix has two parts:
+
+1. Run with `--no-seed-auth`, so jig does not seed the keychain login:
+
+   ```sh
+   ./bin/jig run --no-seed-auth --def examples/definitions/smoke.yaml . "what is this repository?"
+   ```
+
+2. Add the variable names to the `env` allowlist of each role. The stock
+   `smoke.yaml` has one role, `scout`, with `env: [PATH]`. Change it to:
+
+   ```yaml
+   roster:
+     scout:
+       env: [PATH, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN]
+   ```
+
+**CAUTION:** every role that lists a credential variable can read it. Add
+`ANTHROPIC_AUTH_TOKEN` only to the roles that run Claude Code and need it.
+
 ---
 
 ## 3. Write a definition
