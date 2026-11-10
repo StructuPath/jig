@@ -110,7 +110,10 @@ describe("swim lanes", () => {
       event(3, "tool_call", 2000, { phase: "scout", name: "command_execution" }),
     ])] } });
     render(<AttemptLane compact taskMode="ask" attempt={attempt({ runtime_name: "codex" })} nowMs={BASE + 10000} />);
-    expect(await screen.findByText("I am checking the installation instructions.")).toBeVisible();
+    // What the live station's agent last said is in the feed and, whole, in
+    // the station panel.
+    expect(await within(screen.getByLabelText("Station detail")).findByText("I am checking the installation instructions.")).toBeVisible();
+    expect(within(screen.getByLabelText("Recent activity")).getByText("I am checking the installation instructions.")).toBeVisible();
     expect(within(screen.getByLabelText("Recent activity")).getByText("command_execution")).toBeVisible();
     expect(screen.getByText(/Last activity 8.0s ago/)).toBeVisible();
     expect(screen.getByText(/Attempt 1 · Codex ·/)).toBeVisible();

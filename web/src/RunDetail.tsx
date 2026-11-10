@@ -197,7 +197,7 @@ export function JobPanel({
       )}
       {compact && latest && isTerminalAttempt(latest.state) && <section className="next-action">
         <h3>What next?</h3>
-        <p>{taskMode === "ask" ? "Turn a recommendation into work. Write one clear change you want Codex to make." : "Review the result and saved working folder above. You can also give Codex a new directive."}</p>
+        <p>{taskMode === "ask" ? "Turn a recommendation into work. Write one clear change you want made." : "Review the result above. You can also start a follow-up job on this project."}</p>
         <p><Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=build&continue=${encodeURIComponent(data.run_id)}`}>Continue from this result →</Link> <span className="subtle">Passes this task's directive and result to the next one.</span></p>
         <Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=build`}>Make changes to this project →</Link>
         <span> · </span><Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=ask`}>Ask another question →</Link>
@@ -232,6 +232,11 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
     ?? stations.find((station) => station.state === "bad" || station.state === "held")
     ?? stations.slice().reverse().find((station) => station.state === "pass");
   const focusResult = summary?.phases?.slice().reverse().find((phase) => phase.phase === focus?.name);
+  const said = useMemo(() => {
+    const last = events.slice().reverse().find((event) => event.type === "log" && event.name === "agent_text" && event.phase === focus?.name);
+    const text = last?.payload && typeof last.payload === "object" ? (last.payload as Record<string, unknown>).text : undefined;
+    return typeof text === "string" && text.trim() !== "" && !/^(```|\{)/.test(text.trim()) ? text.trim() : null;
+  }, [events, focus?.name]);
   const focusFields = focusResult?.envelope && typeof focusResult.envelope === "object" ? focusResult.envelope as Record<string, unknown> : {};
   const proof = publish.find((record) => record.attempt_id === attempt.id && record.step === "proof");
   const pullRequest = publish.find((record) => record.attempt_id === attempt.id && record.pr_url)?.pr_url;
@@ -297,7 +302,10 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
               own report is shown here only once the operator picks it. */}
           {focus && openPhase && typeof focusFields.summary === "string" && <blockquote className={`station-quote station-quote-${focus.state}`}>{focusFields.summary}</blockquote>}
           {focus && !openPhase && typeof focusFields.summary === "string" && <p className="subtle">Select a station on the line to read its report.</p>}
-          {focus && typeof focusFields.summary !== "string" && <p className="subtle">{focus.state === "live" ? "This station is running. Its report arrives when it ends." : focus.state === "wait" ? "This station has not run." : focus.kind === "delivery" ? "Delivery step. Its record is in the proof line above and in the evidence below." : "This station recorded no written report."}</p>}
+          {/* A live station has no report yet; what its agent last said is the
+              nearest thing, and it is whole here where the feed cuts it. */}
+          {focus && focus.state === "live" && said && <blockquote className="station-quote station-quote-live">{said}</blockquote>}
+          {focus && typeof focusFields.summary !== "string" && !(focus.state === "live" && said) && <p className="subtle">{focus.state === "live" ? "This station is running. Its report arrives when it ends." : focus.state === "wait" ? "This station has not run." : focus.kind === "delivery" ? "Delivery step. Its record is in the proof line above and in the evidence below." : "This station recorded no written report."}</p>}
           {focus && <ul className="station-checks">
             {(focusResult?.gates?.checks ?? []).map((check, index) => <li key={`${check.item}-${index}`} className={check.ok ? "ok" : "not-ok"}>{check.item}{check.note ? `: ${check.note}` : ""}</li>)}
             {focus.durationMs !== null && <li className="plain">{formatDuration(focus.durationMs)}{focus.rounds > 1 ? ` over ${focus.rounds} rounds` : ""}{focus.costUSD !== null ? ` · ${formatUSD(focus.costUSD)}` : ""}</li>}

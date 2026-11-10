@@ -46,9 +46,11 @@ export function stationLabel(name: string): string {
  * JSON is a feed nobody reads: the summary is what the agent said.
  */
 function agentReport(text: string): string | null {
-  if (!text.startsWith("{")) return null;
+  // Some agents wrap the envelope in a ```json fence.
+  const body = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  if (!body.startsWith("{")) return null;
   try {
-    const parsed: unknown = JSON.parse(text);
+    const parsed: unknown = JSON.parse(body);
     const summary = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>).summary : undefined;
     return typeof summary === "string" ? summary.split("\n")[0] : null;
   } catch {

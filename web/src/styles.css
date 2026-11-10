@@ -755,6 +755,12 @@ button { font: 700 12px/1 var(--cond); letter-spacing: .16em; text-transform: up
 .task-form.floor-form .start-row { margin-top: 16px; }
 .task-form.floor-form .task-intent { margin-top: 14px; padding: 10px 12px; font-size: 12px; background: var(--bg); }
 
+/* A refused start: the cause in plain words and the commands that fix it. */
+.start-help { margin: 16px 0 10px; padding: 12px 14px; border: 1px solid var(--accent); border-left-width: 6px; background: var(--bg); }
+.start-help strong { display: block; font: 700 14px/1.3 var(--cond); letter-spacing: .1em; text-transform: uppercase; color: var(--accent); }
+.start-help p { margin: 6px 0 0; font-size: 13px; line-height: 1.5; }
+.start-help pre { margin: 8px 0 0; padding: 10px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; max-height: none; }
+
 /* Tables and counters on the tool views read as instruments, not cards. */
 .table { border-radius: 0; background: transparent; }
 .table th { font: 600 10px/1.3 var(--cond); letter-spacing: .2em; text-transform: uppercase; color: var(--muted); background: transparent; }

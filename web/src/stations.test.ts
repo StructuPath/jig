@@ -164,9 +164,12 @@ describe("buildFeed", () => {
       { seq: 1, type: "log", phase: "review-security", name: "agent_text",
         payload: { text: '{"status":"success","summary":"I approve commit 1e7dfcf.\\nNo defects.","approved":true}' } },
       { seq: 2, type: "log", phase: "build", name: "agent_text", payload: { text: "{not json, just prose in braces}" } },
+      { seq: 3, type: "log", phase: "plan", name: "agent_text",
+        payload: { text: '```json\n{"status":"success","summary":"Run the suite and report."}\n```' } },
     ]);
     expect(feed.map((line) => [line.verb, line.detail])).toEqual([
       ["report", "I approve commit 1e7dfcf."], ["say", "{not json, just prose in braces}"],
+      ["report", "Run the suite and report."],
     ]);
   });
 

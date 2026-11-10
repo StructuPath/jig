@@ -7,6 +7,7 @@ import { useNow, usePolled } from "./polling";
 import { navigate } from "./router";
 import { loadContinuation } from "./continuation";
 import type { Continuation } from "./continuation";
+import { startHelp } from "./startHelp";
 import { automaticGoal, canPublish, defaultModel, starterSource } from "./starters";
 import type { Delivery, TaskMode } from "./starters";
 import type { Run } from "./types";
@@ -16,23 +17,49 @@ function storedProject(): string | null {
   try { return localStorage.getItem("jig-project"); } catch { return null; /* Browser storage can be disabled. */ }
 }
 
+// A draft is the form as it stood, kept in browser storage so a refresh or a
+// refused start does not cost the operator what they typed. It is dropped
+// once a job starts. A link that names a project, mode, or continuation is
+// an explicit request and wins over a draft.
+interface Draft {
+  repository?: string; task?: string; mode?: TaskMode; saved?: boolean; workflowID?: string;
+  delivery?: Delivery; model?: string; testCommand?: string;
+}
+const DRAFT_KEY = "jig-draft";
+
+function readDraft(): Draft {
+  const query = new URLSearchParams(window.location.search);
+  if (query.has("project") || query.has("mode") || query.has("continue")) return {};
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed as Draft : {};
+  } catch { return {}; /* Storage can be disabled, and a stale draft can be unreadable. */ }
+}
+
 export function Tasks() {
   const loadRuns = useCallback(() => api.runs(), []);
   const runs = usePolled(loadRuns, 3000, "tasks");
   const loadFleet = useCallback(() => api.fleet(), []);
   const fleet = usePolled(loadFleet, 3000, "task-workers");
-  const [repository, setRepository] = useState(() => new URLSearchParams(window.location.search).get("project") ?? storedProject() ?? "");
-  const [task, setTask] = useState("");
-  const [mode, setMode] = useState<TaskMode>(() => { const mode = new URLSearchParams(window.location.search).get("mode"); return mode === "ask" || mode === "build" ? mode : "auto"; });
-  const [model, setModel] = useState(defaultModel);
-  const [testCommand, setTestCommand] = useState("");
-  const [delivery, setDelivery] = useState<Delivery>("local");
+  const [draft] = useState(readDraft);
+  const [repository, setRepository] = useState(() => new URLSearchParams(window.location.search).get("project") ?? (typeof draft.repository === "string" ? draft.repository : null) ?? storedProject() ?? "");
+  const [task, setTask] = useState(() => typeof draft.task === "string" ? draft.task : "");
+  const [mode, setMode] = useState<TaskMode>(() => { const mode = new URLSearchParams(window.location.search).get("mode") ?? draft.mode; return mode === "ask" || mode === "build" ? mode : "auto"; });
+  const [model, setModel] = useState(() => typeof draft.model === "string" && draft.model.trim() ? draft.model : defaultModel);
+  const [testCommand, setTestCommand] = useState(() => typeof draft.testCommand === "string" ? draft.testCommand : "");
+  const [delivery, setDelivery] = useState<Delivery>(() => draft.delivery === "publish" ? "publish" : "local");
   const [continueID] = useState(() => new URLSearchParams(window.location.search).get("continue"));
   const [continuation, setContinuation] = useState<Continuation | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<Error | null>(null);
-  const [saved, setSaved] = useState(false);
-  const [workflowID, setWorkflowID] = useState("");
+  const [saved, setSaved] = useState(() => draft.saved === true);
+  const [workflowID, setWorkflowID] = useState(() => typeof draft.workflowID === "string" ? draft.workflowID : "");
+  useEffect(() => {
+    if (continueID) return;
+    try {
+      localStorage.setItem(DRAFT_KEY, JSON.stringify({ repository, task, mode, saved, workflowID, delivery, model, testCommand } satisfies Draft));
+    } catch { /* The form still works for this visit. */ }
+  }, [continueID, repository, task, mode, saved, workflowID, delivery, model, testCommand]);
   const loadDefinitions = useCallback(() => api.definitions(), []);
   const definitions = usePolled(loadDefinitions, 15000, "task-definitions");
   const publishable = !saved && mode !== "ask" && canPublish(repository);
@@ -69,7 +96,7 @@ export function Tasks() {
         : await api.startTask((await ensureDefinition(await starterSource(mode, model, testCommand, chosen))).id, repository.trim(), task.trim() || automaticGoal, mode, {
           delivery: chosen, context: continuation?.context, ref: continuation?.ref, continues: continuation?.runID,
         });
-      try { localStorage.setItem("jig-project", repository.trim()); } catch { /* Task creation succeeded even if browser storage is disabled. */ }
+      try { localStorage.setItem("jig-project", repository.trim()); localStorage.removeItem(DRAFT_KEY); } catch { /* Task creation succeeded even if browser storage is disabled. */ }
       navigate(`/runs/${result.run.id}`);
     } catch (failure) {
       setError(failure as Error);
@@ -79,6 +106,7 @@ export function Tasks() {
   };
 
   const pick = (next: TaskMode) => { setSaved(false); setMode(next); };
+  const help = startHelp(error, repository);
 
   return <div className="view floor-view">
     <section className="floor-main" aria-label="On the line">
@@ -128,6 +156,11 @@ export function Tasks() {
           <input id="model" required value={model} onChange={(event) => setModel(event.target.value)} />
           {mode !== "ask" && <><label htmlFor="test-command">Test command</label><input id="test-command" placeholder="Leave blank to detect the project's test command" value={testCommand} onChange={(event) => setTestCommand(event.target.value)} /></>}
         </details>}
+        {help && <div className="start-help" role="alert">
+          <strong>{help.title}</strong>
+          <p>{help.detail}</p>
+          {help.commands.length > 0 && <><p className="subtle">Run this in a terminal, then press Start again. Your text is kept.</p><pre>{help.commands.join("\n")}</pre></>}
+        </div>}
         <ErrorBanner error={error} />
         <ErrorBanner error={fleet.error} />
         <ErrorBanner error={definitions.error} />

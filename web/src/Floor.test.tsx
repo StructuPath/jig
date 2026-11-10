@@ -49,15 +49,28 @@ const jobs: Record<string, unknown> = {
 
 let requests: string[] = [];
 let posted: unknown = null;
+let refuse = false;
+let stored = new Map<string, string>();
 
 beforeEach(() => {
   requests = [];
   posted = null;
-  vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn() });
+  refuse = false;
+  stored = new Map();
+  window.history.replaceState({}, "", "/");
+  vi.stubGlobal("localStorage", {
+    getItem: (key: string) => stored.get(key) ?? null,
+    setItem: (key: string, value: string) => { stored.set(key, value); },
+    removeItem: (key: string) => { stored.delete(key); },
+  });
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
     requests.push(url);
     const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
-    if (url === "/api/runs" && init?.method === "POST") { posted = JSON.parse(init.body as string); return json({ run: { id: "run-new" }, jobs: [] }); }
+    if (url === "/api/runs" && init?.method === "POST") {
+      posted = JSON.parse(init.body as string);
+      if (refuse) return new Response(JSON.stringify({ error: { code: "unresolvable_ref", message: `cannot resolve "HEAD" in "file:///Users/v/dev/new": fatal: '/Users/v/dev/new' does not appear to be a git repository` } }), { status: 400, headers: { "Content-Type": "application/json" } });
+      return json({ run: { id: "run-new" }, jobs: [] });
+    }
     if (url === "/api/runs") return json([run("run-done", "accepted", "Hint when no control plane answers")]);
     if (url.startsWith("/api/runs/")) { const id = url.split("/").pop() ?? ""; return json({ run: run(id, "accepted", "x"), jobs: id === "run-empty" ? [] : [{ id: id.replace("run-", "job-") }] }); }
     if (url.startsWith("/api/jobs/")) return json(jobs[url.split("/").pop() ?? ""] ?? {});
@@ -126,4 +139,57 @@ it("starts a saved workflow as itself, on the runtime it pins", async () => {
     definition_id: "d-factory", instructions: "Add a hint",
     parameters: { task_title: "Add a hint" }, targets: [{ repository: "github.com/owner/repo" }],
   });
+});
+
+async function fillSavedWorkflow(project: string, instructions: string) {
+  const saved = await screen.findByRole("radio", { name: /Run a saved workflow/ });
+  await waitFor(() => expect(saved).toBeEnabled());
+  fireEvent.click(saved);
+  fireEvent.change(screen.getByLabelText("1. Project"), { target: { value: project } });
+  fireEvent.change(screen.getByLabelText("3. Instructions"), { target: { value: instructions } });
+  const start = screen.getByRole("button", { name: "Start job" });
+  await waitFor(() => expect(start).toBeEnabled());
+  return start;
+}
+
+it("explains a refused start in plain words, with the commands, and keeps the raw error", async () => {
+  refuse = true;
+  render(<Tasks />);
+  fireEvent.click(await fillSavedWorkflow("/Users/v/dev/new", "Build the first page"));
+  expect(await screen.findByText("This folder is not a Git project yet")).toBeVisible();
+  expect(screen.getByText(/git init -b main/)).toBeVisible();
+  expect(screen.getByText(/cd \/Users\/v\/dev\/new/)).toBeVisible();
+  // The control plane's own code and words stay on the page.
+  expect(screen.getByText("unresolvable_ref")).toBeVisible();
+  expect(screen.getByLabelText("3. Instructions")).toHaveValue("Build the first page");
+  expect(window.location.pathname).toBe("/");
+});
+
+it("keeps the form through a refresh, and drops the draft once the job starts", async () => {
+  const first = render(<Tasks />);
+  await fillSavedWorkflow("github.com/owner/repo", "Build the first page");
+  first.unmount();
+
+  // A refresh: a new form, the same browser storage.
+  render(<Tasks />);
+  expect(screen.getByLabelText("1. Project")).toHaveValue("github.com/owner/repo");
+  expect(await screen.findByLabelText("3. Instructions")).toHaveValue("Build the first page");
+  const saved = screen.getByRole("radio", { name: /Run a saved workflow/ });
+  await waitFor(() => expect(saved).toBeChecked());
+
+  const start = screen.getByRole("button", { name: "Start job" });
+  await waitFor(() => expect(start).toBeEnabled());
+  fireEvent.click(start);
+  await waitFor(() => expect(window.location.pathname).toBe("/runs/run-new"));
+  expect(stored.has("jig-draft")).toBe(false);
+  expect(stored.get("jig-project")).toBe("github.com/owner/repo");
+});
+
+it("lets a link that names a project win over a draft", async () => {
+  stored.set("jig-draft", JSON.stringify({ repository: "/old/project", task: "Old text", mode: "build" }));
+  window.history.replaceState({}, "", "/?project=%2Fnew%2Fproject&mode=ask");
+  render(<Tasks />);
+  expect(screen.getByLabelText("1. Project")).toHaveValue("/new/project");
+  expect(screen.getByLabelText("3. What should Codex do?")).toHaveValue("");
+  expect(screen.getByRole("radio", { name: /Get an answer/ })).toBeChecked();
 });
