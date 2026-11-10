@@ -370,6 +370,7 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 		branch:        prepared.Branch,
 		worktreePath:  prepared.WorktreePath,
 		baseSHA:       prepared.BaseSHA,
+		taskTitle:     protocol.TaskTitle(prepared.Claim.Parameters[protocol.PromptParameter]),
 		lease:         prepared.lease,
 	}
 	// The critical section: an uncancellable context, and the attempt's
@@ -423,7 +424,10 @@ type publishTarget struct {
 	// already disposed under remote proof. Only the push step needs it.
 	worktreePath string
 	baseSHA      string
-	lease        *attemptLease
+	// taskTitle is protocol.TaskTitle of the run's frozen prompt, or "" when
+	// the run has no composed prompt.
+	taskTitle string
+	lease     *attemptLease
 }
 
 // publish runs the three steps, skipping every one the ledger already proves.
@@ -993,16 +997,28 @@ func pathBatches(paths []string, size int) [][]string {
 // ---- commit and pull-request text ------------------------------------------
 //
 // Every line below is built from control-plane-known values — job id, attempt
-// number, base SHA, and the validated changed-path list. No agent-authored
-// prose reaches a command line or a pull request title.
+// number, base SHA, the validated changed-path list, and the task title,
+// which is the first line of the operator's own instructions
+// (protocol.TaskTitle). No agent-authored prose and no untrusted context
+// reaches a command line or a pull request title.
 
 func publishCommitMessage(target publishTarget, changedPaths []string) string {
 	return fmt.Sprintf("jig: job %s attempt %d\n\nAttempt: %s\nBase: %s\nChanged paths: %d\n",
 		target.jobID, target.attemptNumber, target.attemptID, target.baseSHA, len(changedPaths))
 }
 
+// publishTitle names the pull request after the task, so a list of them can
+// be read. A run with no composed prompt has no task line to borrow and is
+// named by its ids; the body carries the ids either way. A later attempt of
+// the same job opens its own pull request, and says which it is.
 func publishTitle(target publishTarget) string {
-	return fmt.Sprintf("jig: job %s attempt %d", target.jobID, target.attemptNumber)
+	if target.taskTitle == "" {
+		return fmt.Sprintf("jig: job %s attempt %d", target.jobID, target.attemptNumber)
+	}
+	if target.attemptNumber > 1 {
+		return fmt.Sprintf("%s (attempt %d)", target.taskTitle, target.attemptNumber)
+	}
+	return target.taskTitle
 }
 
 func publishBody(target publishTarget, head string, changedPaths []string) string {
@@ -1130,6 +1146,7 @@ func (w *Worker) RetryPublish(
 		repository:    retry.Job.Repository,
 		branch:        protocol.PublishBranch(retry.Job.ID, retry.Attempt.AttemptNumber),
 		baseSHA:       retry.Job.BaseSHA,
+		taskTitle:     retry.TaskTitle,
 		lease:         lease,
 	}
 	worktreePath := filepath.Join(w.worktreeRoot(), retry.Attempt.ID)
