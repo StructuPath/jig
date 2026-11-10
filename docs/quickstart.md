@@ -99,6 +99,18 @@ Common first-run failures:
   stock definitions name Claude Code models (`haiku`, `sonnet`, `opus`), and the value
   is passed to whichever CLI you selected.
 
+Everything the run did is in the trace file, one JSON event per line:
+
+```sh
+jq -r '[.seq, .type, .phase, .name] | @tsv' ~/.jig/traces/<attempt>.jsonl | head -20
+```
+
+For scripting (or for an agent driving jig), add `--json`:
+
+```sh
+./bin/jig run --json --def examples/definitions/smoke.yaml . "what is this repository?" | jq .
+```
+
 ### Claude Code authenticates through environment variables
 
 Some machines authenticate Claude Code through environment variables, not
@@ -126,18 +138,6 @@ The fix has two parts:
 
 **CAUTION:** every role that lists a credential variable can read it. Add
 `ANTHROPIC_AUTH_TOKEN` only to the roles that run Claude Code and need it.
-
-Everything the run did is in the trace file, one JSON event per line:
-
-```sh
-jq -r '[.seq, .type, .phase, .name] | @tsv' ~/.jig/traces/<attempt>.jsonl | head -20
-```
-
-For scripting (or for an agent driving jig), add `--json`:
-
-```sh
-./bin/jig run --json --def examples/definitions/smoke.yaml . "what is this repository?" | jq .
-```
 
 ---
 
