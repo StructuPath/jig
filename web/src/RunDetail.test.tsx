@@ -109,10 +109,85 @@ describe("swim lanes", () => {
       event(2, "log", 1000, { phase: "scout", name: "agent_text", payload: { text: "I am checking the installation instructions." } }),
       event(3, "tool_call", 2000, { phase: "scout", name: "command_execution" }),
     ])] } });
-    render(<AttemptLane compact taskMode="ask" attempt={attempt()} nowMs={BASE + 10000} />);
-    expect(await screen.findByText("I am checking the installation instructions.")).toBeVisible();
-    expect(screen.getByText("Codex used command_execution")).toBeVisible();
+    render(<AttemptLane compact taskMode="ask" attempt={attempt({ runtime_name: "codex" })} nowMs={BASE + 10000} />);
+    // What the live station's agent last said is in the feed and, whole, in
+    // the station panel.
+    expect(await within(screen.getByLabelText("Station detail")).findByText("I am checking the installation instructions.")).toBeVisible();
+    expect(within(screen.getByLabelText("Recent activity")).getByText("I am checking the installation instructions.")).toBeVisible();
+    expect(within(screen.getByLabelText("Recent activity")).getByText("command_execution")).toBeVisible();
     expect(screen.getByText(/Last activity 8.0s ago/)).toBeVisible();
+    expect(screen.getByText(/Attempt 1 · Codex ·/)).toBeVisible();
+  });
+
+  it("shows what a tool was pointed at, and names the runtime the attempt ran on", async () => {
+    mockAPI({ events: { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "build" }),
+      event(2, "tool_call", 1000, { phase: "build", name: "Bash", payload: { command: "go test ./cmd/jig\necho done", description: "Run tests" } }),
+      event(3, "tool_call", 2000, { phase: "build", name: "Read", payload: { file_path: "cmd/jig/report.go" } }),
+    ])] } });
+    render(<AttemptLane compact attempt={attempt({ runtime_name: "claude-code" })} nowMs={BASE + 10000} />);
+    const feed = within(await screen.findByLabelText("Recent activity"));
+    // The command's first line, not the tool's name alone and not its prose
+    // description: the operator reads what ran.
+    expect(await feed.findByText("go test ./cmd/jig")).toBeVisible();
+    expect(feed.getByText("cmd/jig/report.go")).toBeVisible();
+    expect(screen.getByText(/Attempt 1 · Claude Code ·/)).toBeVisible();
+    expect(screen.queryByText(/Codex/)).toBeNull();
+  });
+
+  it("credits no CLI when the attempt has no recorded runtime", async () => {
+    mockAPI({ events: { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "build" }),
+      event(2, "tool_call", 1000, { phase: "build", name: "Bash" }),
+    ])] } });
+    render(<AttemptLane compact attempt={attempt()} nowMs={BASE + 10000} />);
+    await within(await screen.findByLabelText("Recent activity")).findByText("Bash");
+    expect(screen.getByText(/Attempt 1 · Runtime not recorded ·/)).toBeVisible();
+  });
+
+  it("draws every station of the frozen chain before the first one ends", async () => {
+    mockAPI({ events: { "attempt-1": [page("attempt-1", [
+      event(1, "phase_start", 0, { phase: "plan" }),
+      event(2, "agent_end", 4000, { phase: "plan", name: "planner", payload: { cost: 0.08 } }),
+      event(3, "phase_end", 4000, { phase: "plan", payload: { status: "success" } }),
+      event(4, "phase_start", 4000, { phase: "build" }),
+    ])] } });
+    render(<AttemptLane compact attempt={attempt()} nowMs={BASE + 10000}
+      stations={[
+        { name: "plan", kind: "agent", owner: "planner", model: "sonnet" },
+        { name: "build", kind: "agent", owner: "builder", model: "opus" },
+        { name: "test", kind: "code" },
+        { name: "review-risk", kind: "agent", owner: "risk-reviewer", model: "sonnet", if: "risk != low" },
+      ]}
+      delivery={{ hold_when: "risk != low", ci_wait: true }} />);
+    const line = within(await screen.findByLabelText("Attempt 1 stations"));
+    expect(await line.findByLabelText("station 1, plan, passed")).toBeVisible();
+    expect(line.getByLabelText("station 2, build, running")).toBeVisible();
+    expect(line.getByLabelText("station 3, test, waiting")).toBeVisible();
+    expect(line.getByLabelText("station 4, risk review, waiting")).toBeVisible();
+    // The delivery steps the policy adds are stations too.
+    expect(line.getByLabelText("station 5, publish, waiting")).toBeVisible();
+    expect(line.getByLabelText("station 6, CI, waiting")).toBeVisible();
+    expect(line.getByText(/sonnet · \$0\.08/)).toBeVisible();
+    expect(line.getByText("if risk != low")).toBeVisible();
+  });
+
+  it("keeps every gate check in the evidence when a delivery station is selected", async () => {
+    mockAPI({ gates: [{ attempt_id: "attempt-1", phase: "plan", gate: "envelope", emission: 1, item: "summary_present", ok: true, recorded_at: at(1000) }] });
+    render(<AttemptLane compact attempt={attempt({
+      state: "accepted",
+      completed_at: at(9000),
+      result: JSON.stringify({ phases: [{ phase: "plan", kind: "agent", status: "success", phase_attempt: 1 }], publish: { state: "published" } }),
+    })} nowMs={BASE + 10_000}
+      stations={[{ name: "plan", kind: "agent", model: "sonnet" }]}
+      delivery={{ hold_when: "", ci_wait: false }}
+      publish={[{ attempt_id: "attempt-1", step: "proof", branch: "b", completed_at: at(8000) }]} />);
+    const line = within(await screen.findByLabelText("Attempt 1 stations"));
+    fireEvent.click(await line.findByLabelText("station 2, publish, passed"));
+    expect(line.getByLabelText("station 2, publish, passed")).toHaveAttribute("aria-pressed", "true");
+    // No gate row carries a delivery station's name; the plan's check stays.
+    expect(await screen.findByText(/Evidence — 1 gate check/)).toBeInTheDocument();
+    expect(screen.queryByText(/Evidence · publish/)).toBeNull();
   });
 
   it("keeps the answer visible when a code check follows it", async () => {

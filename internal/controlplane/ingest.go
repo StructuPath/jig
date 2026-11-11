@@ -363,6 +363,66 @@ type JobDetail struct {
 	Attempts   []protocol.Attempt            `json:"attempts"`
 	Publish    []protocol.PublishRecord      `json:"publish"`
 	Worktree   *protocol.WorktreeLedgerEntry `json:"worktree,omitempty"`
+	// Stations is the run's frozen chain, in declared order, so the UI can
+	// draw every phase before the first one starts. It is read from the
+	// snapshot the run was admitted with, never from the live definition,
+	// and is absent when that snapshot no longer parses.
+	Stations []Station `json:"stations,omitempty"`
+	// Delivery is the frozen publish policy: what stands between an accepted
+	// chain and an accepted job. Absent when Stations is.
+	Delivery *Delivery `json:"delivery,omitempty"`
+}
+
+// Station is one phase of a frozen definition as the UI needs it: enough to
+// label a step and say who runs it, and nothing an operator could mistake
+// for the prompt or the command.
+type Station struct {
+	Name  string   `json:"name"`
+	Kind  string   `json:"kind"`
+	Owner string   `json:"owner,omitempty"`
+	Model string   `json:"model,omitempty"`
+	If    string   `json:"if,omitempty"`
+	Gates []string `json:"gates,omitempty"`
+	// Parallel marks a member of the definition's one parallel group.
+	Parallel bool `json:"parallel,omitempty"`
+}
+
+// Delivery is the publish policy a job runs under.
+type Delivery struct {
+	HoldWhen string `json:"hold_when,omitempty"`
+	CIWait   bool   `json:"ci_wait"`
+}
+
+// stationsFromSnapshot reads the chain and publish policy out of a frozen
+// definition. A snapshot that does not parse yields nothing rather than an
+// error: the job detail is still worth showing without its station list.
+func stationsFromSnapshot(snapshot string) ([]Station, *Delivery) {
+	spec, err := protocol.ParseDefinition([]byte(snapshot))
+	if err != nil || spec == nil || len(spec.Phases) == 0 {
+		return nil, nil
+	}
+	parallel := make(map[string]bool, len(spec.Parallel))
+	for _, name := range spec.Parallel {
+		parallel[name] = true
+	}
+	stations := make([]Station, 0, len(spec.Phases))
+	for _, phase := range spec.Phases {
+		station := Station{Name: phase.Name, Kind: phase.Kind, If: phase.If, Parallel: parallel[phase.Name]}
+		if phase.Kind == "agent" {
+			station.Owner = phase.Owner
+			station.Model = spec.Roster[phase.Owner].Model
+		}
+		for _, gate := range phase.Gates {
+			station.Gates = append(station.Gates, gate.Name)
+		}
+		stations = append(stations, station)
+	}
+	delivery := &Delivery{}
+	if spec.Publish != nil {
+		delivery.HoldWhen = spec.Publish.HoldWhen
+		delivery.CIWait = spec.Publish.CI != nil && spec.Publish.CI.Wait
+	}
+	return stations, delivery
 }
 
 // JobDetail reads one job, its attempts, and its publish records.
@@ -379,6 +439,12 @@ func (s *Store) JobDetail(ctx context.Context, jobID string) (JobDetail, error) 
 	`, job.RunID).Scan(&detail.Definition); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return detail, unavailable(err)
 	}
+	var snapshot string
+	if err := s.db.QueryRowContext(ctx, `SELECT snapshot FROM runs WHERE id = ?`,
+		job.RunID).Scan(&snapshot); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return detail, unavailable(err)
+	}
+	detail.Stations, detail.Delivery = stationsFromSnapshot(snapshot)
 	attempts, err := s.JobAttempts(ctx, jobID)
 	if err != nil {
 		return detail, err

@@ -7,14 +7,16 @@
 // cannot interleave because they are not shared.
 import { useCallback, useMemo, useState } from "react";
 import { api, parseAttemptSummary } from "./api";
-import { formatClock, formatDateTime, formatDuration, isTerminalAttempt, projectName, shortID, taskState, taskTitle } from "./format";
+import { formatClock, formatDateTime, formatDuration, formatUSD, isTerminalAttempt, projectName, runtimeLabel, shortID, taskHeading, taskState, taskTitle, workflowName } from "./format";
 import { buildLane } from "./lanes";
 import { attemptOutcome } from "./outcomes";
 import { useAttemptEvents, useNow, usePolled } from "./polling";
+import { StationLine, TimingStrip } from "./StationLine";
+import { buildFeed, buildStations, verdictFor } from "./stations";
 import { SwimLane } from "./SwimLane";
 import { taskSteps } from "./starters";
 import type { TaskMode } from "./starters";
-import type { Attempt, PhaseResult } from "./types";
+import type { Attempt, Delivery, PhaseResult, PublishRecord, Station } from "./types";
 import { Empty, ErrorBanner, Link, Loading, StatusBadge } from "./ui";
 
 export function RunDetail({ runID }: { runID: string }) {
@@ -31,7 +33,7 @@ export function RunDetail({ runID }: { runID: string }) {
       <p><Link href="/">← New task</Link> · <Link href="/runs">My tasks</Link></p>
       <header className="view-header">
         <div>
-          <h1>{data.run.targets.map((target) => projectName(target.repository)).join(", ")}</h1>
+          <h1 className="task-heading">{taskHeading(data.run)}</h1>
           <p className="subtle">
             {data.run.targets.map((target) => projectName(target.repository)).join(", ")} · {formatDateTime(data.run.created_at)}
           </p>
@@ -39,8 +41,8 @@ export function RunDetail({ runID }: { runID: string }) {
         <StatusBadge state={taskState(data.run)} />
       </header>
       <ErrorBanner error={error} />
-      <section className="panel directive"><h2>{data.run.parameters?.task_mode === "auto" ? "Agents choose the directive" : data.run.parameters?.task_mode === "build" ? "Directive · make changes" : "Question · get an answer"}</h2><details open={taskTitle(data.run).length <= 250}><summary>View your instructions</summary><p>{taskTitle(data.run)}</p></details>
-        <p className="subtle">{data.run.parameters?.task_mode === "auto" || data.run.parameters?.task_mode === "build" ? "Agents plan, build, and test automatically. Failed tests return to planning for up to three repair rounds. Changes stay in the saved working folder." : "Codex reads this project and returns an answer. This task does not implement the recommendations."}</p>
+      <section className="panel directive"><h2>{data.run.parameters?.task_mode === "auto" ? "Agents choose the directive" : data.run.parameters?.task_mode === "build" ? "Directive · make changes" : data.run.parameters?.task_mode === "ask" ? "Question · get an answer" : `Workflow · ${workflowName(data.run) ?? "saved definition"}`}</h2><details open={taskTitle(data.run).length <= 250}><summary>View your instructions</summary><p>{taskTitle(data.run)}</p></details>
+        <p className="subtle">{data.run.parameters?.task_mode === "auto" || data.run.parameters?.task_mode === "build" ? "Agents plan, build, and test automatically. Failed tests return to planning for up to three repair rounds. Changes stay in the saved working folder." : data.run.parameters?.task_mode === "ask" ? "Codex reads this project and returns an answer. This task does not implement the recommendations." : "This run follows a saved workflow. Its phases, checks, and delivery are the workflow's own; each job below shows them as they run."}</p>
       </section>
 
       {parameters.length > 0 && <details className="evidence"><summary>Task settings</summary>
@@ -168,7 +170,7 @@ export function JobPanel({
         </p>
       )}
 
-      {(data.publish ?? []).length > 0 && (
+      {!compact && (data.publish ?? []).length > 0 && (
         <ul className="publish">
           {(data.publish ?? []).map((record) => (
             <li key={`${record.attempt_id}-${record.step}`}>
@@ -190,12 +192,12 @@ export function JobPanel({
         <Empty title="No attempts yet" detail="This job is waiting for a worker to claim it." />
       ) : (
         attempts.map((attempt) => (
-          <AttemptLane key={attempt.id} attempt={attempt} nowMs={nowMs} compact={compact} taskMode={taskMode} />
+          <AttemptLane key={attempt.id} attempt={attempt} nowMs={nowMs} compact={compact} taskMode={taskMode} stations={data.stations} delivery={data.delivery} publish={data.publish ?? []} jobID={data.job.id} />
         ))
       )}
       {compact && latest && isTerminalAttempt(latest.state) && <section className="next-action">
         <h3>What next?</h3>
-        <p>{taskMode === "ask" ? "Turn a recommendation into work. Write one clear change you want Codex to make." : "Review the result and saved working folder above. You can also give Codex a new directive."}</p>
+        <p>{taskMode === "ask" ? "Turn a recommendation into work. Write one clear change you want made." : "Review the result above. You can also start a follow-up job on this project."}</p>
         <p><Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=build&continue=${encodeURIComponent(data.run_id)}`}>Continue from this result →</Link> <span className="subtle">Passes this task's directive and result to the next one.</span></p>
         <Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=build`}>Make changes to this project →</Link>
         <span> · </span><Link href={`/?project=${encodeURIComponent(data.job.repository)}&mode=ask`}>Ask another question →</Link>
@@ -205,49 +207,120 @@ export function JobPanel({
   );
 }
 
-export function AttemptLane({ attempt, nowMs, compact = false, taskMode }: { attempt: Attempt; nowMs: number; compact?: boolean; taskMode?: TaskMode }) {
+export function AttemptLane({ attempt, nowMs, compact = false, taskMode, stations: chain, delivery, publish = [], jobID }: { attempt: Attempt; nowMs: number; compact?: boolean; taskMode?: TaskMode; stations?: Station[]; delivery?: Delivery; publish?: PublishRecord[]; jobID?: string }) {
   const { events, error } = useAttemptEvents(attempt.id, attempt.state);
   const lane = useMemo(() => buildLane(attempt, events), [attempt, events]);
   const [openPhase, setOpenPhase] = useState<string | null>(null);
   const outcome = attemptOutcome(attempt);
-  const currentPhase = !isTerminalAttempt(attempt.state) ? lane.phases.slice().reverse().find((phase) => phase.endMs === null) : undefined;
-  const recordedPhases = parseAttemptSummary(attempt.result)?.phases ?? [];
-  const steps = taskMode ? taskSteps[taskMode] : [...new Set(lane.phases.map((phase) => phase.phase))];
+  const terminal = isTerminalAttempt(attempt.state);
+  const summary = useMemo(() => parseAttemptSummary(attempt.result), [attempt.result]);
+  // The task form's starters carry bookkeeping phases (keep-local, deliver)
+  // that are not stations a person follows; a saved workflow shows its chain.
+  const visibleChain = useMemo(() => taskMode
+    ? taskSteps[taskMode].map((name) => chain?.find((station) => station.name === name) ?? { name, kind: "agent" })
+    : chain, [chain, taskMode]);
+  const stations = useMemo(() => buildStations(visibleChain, delivery, attempt, lane, events, publish, nowMs),
+    [visibleChain, delivery, attempt, lane, events, publish, nowMs]);
+  const verdict = verdictFor(attempt, stations, delivery);
+  const feed = useMemo(() => buildFeed(events), [events]);
   const timeline = <SwimLane lane={lane} nowMs={nowMs} onSelectPhase={setOpenPhase} />;
-  const activity = events.filter((event) => !["keep-local", "deliver"].includes(event.phase ?? "") && (event.type === "tool_call" || (event.type === "log" && ["agent_text", "repair_edge", "repair_exhausted"].includes(event.name ?? "")) || ["phase_start", "phase_end", "gate_fail", "error"].includes(event.type))).slice(-6);
   const lastEvent = events.at(-1);
   const planHandoff = events.slice().reverse().find((event) => event.type === "handoff" && event.phase === "plan");
   const planSummary = planHandoff?.payload && typeof planHandoff.payload === "object" && "summary" in planHandoff.payload && typeof planHandoff.payload.summary === "string" ? planHandoff.payload.summary : null;
-  const latestMessage = events.slice().reverse().find((event) => event.type === "log" && event.name === "agent_text");
-  const message = latestMessage?.payload && typeof latestMessage.payload === "object" && "text" in latestMessage.payload && typeof latestMessage.payload.text === "string" ? latestMessage.payload.text : null;
+  const focus = stations.find((station) => station.name === openPhase)
+    ?? stations.find((station) => station.state === "live")
+    ?? stations.find((station) => station.state === "bad" || station.state === "held")
+    ?? stations.slice().reverse().find((station) => station.state === "pass");
+  // A delivery station (publish, CI) is no phase: no gate row or envelope
+  // carries its name, so it must not filter the evidence down to nothing.
+  const evidencePhase = focus?.kind === "delivery" ? null : openPhase;
+  const focusResult = summary?.phases?.slice().reverse().find((phase) => phase.phase === focus?.name);
+  const said = useMemo(() => {
+    const last = events.slice().reverse().find((event) => event.type === "log" && event.name === "agent_text" && event.phase === focus?.name);
+    const text = last?.payload && typeof last.payload === "object" ? (last.payload as Record<string, unknown>).text : undefined;
+    return typeof text === "string" && text.trim() !== "" && !/^(```|\{)/.test(text.trim()) ? text.trim() : null;
+  }, [events, focus?.name]);
+  const focusFields = focusResult?.envelope && typeof focusResult.envelope === "object" ? focusResult.envelope as Record<string, unknown> : {};
+  const proof = publish.find((record) => record.attempt_id === attempt.id && record.step === "proof");
+  const pullRequest = publish.find((record) => record.attempt_id === attempt.id && record.pr_url)?.pr_url;
+  const elapsed = (attempt.completed_at ? Date.parse(attempt.completed_at) : nowMs) - Date.parse(attempt.started_at ?? attempt.created_at);
+
+  if (!compact) {
+    return (
+      <div className="attempt">
+        <section className={`outcome outcome-${attempt.state}`} aria-label={`Attempt ${attempt.attempt_number} outcome`}>
+          <h3>{outcome.title}</h3>
+          <p>{outcome.detail}</p>
+          <p><strong>Next step:</strong> {outcome.next}</p>
+          <p className="subtle">Attempt {attempt.attempt_number} · {attempt.runtime_name ?? "Runtime not recorded"} · {formatDateTime(attempt.started_at ?? attempt.created_at)}</p>
+        </section>
+        {timeline}
+        {openPhase && <button type="button" onClick={() => setOpenPhase(null)}>Clear phase filter</button>}
+        <ErrorBanner error={error} />
+        <AttemptEvidence attempt={attempt} openPhase={openPhase} />
+      </div>
+    );
+  }
 
   return (
     <div className="attempt">
-      <section className={`outcome outcome-${attempt.state}`} aria-label={`Attempt ${attempt.attempt_number} outcome`}>
-        <h3>{compact && outcome.title === "Task complete · kept local" ? taskMode === "ask" ? "Your answer is ready" : "Changes are ready to review" : outcome.title}</h3>
-        <p>{currentPhase ? `Current phase: ${currentPhase.label}. ` : ""}{outcome.detail}</p>
-        <p><strong>Next step:</strong> {outcome.next}</p>
-        <p className="subtle">Attempt {attempt.attempt_number} · {attempt.runtime_name ?? "Runtime not recorded"} · {formatDateTime(attempt.started_at ?? attempt.created_at)}</p>
-        {compact && <p className="subtle">{formatDuration((attempt.completed_at ? Date.parse(attempt.completed_at) : nowMs) - Date.parse(attempt.started_at ?? attempt.created_at))} elapsed{lastEvent?.started_at && !isTerminalAttempt(attempt.state) ? ` · Last activity ${formatDuration(Math.max(0, nowMs - Date.parse(lastEvent.started_at)))} ago` : ""}</p>}
-        {compact && !isTerminalAttempt(attempt.state) && message && <p className="agent-message">{message}</p>}
+      <section className={`jobhead outcome-${attempt.state}`} aria-label={`Attempt ${attempt.attempt_number} outcome`}>
+        <div>
+          <h3>{outcome.title === "Task complete · kept local" ? taskMode === "ask" ? "Your answer is ready" : "Changes are ready to review" : outcome.title}</h3>
+          <p>{outcome.detail}</p>
+          <p className="subtle">Attempt {attempt.attempt_number} · {attempt.runtime_name ? runtimeLabel(attempt.runtime_name) : "Runtime not recorded"} · {formatDateTime(attempt.started_at ?? attempt.created_at)}</p>
+        </div>
+        <p className={`verdict verdict-${verdict.tone}`}>
+          {verdict.word}
+          <small>{formatDuration(elapsed)} elapsed{lastEvent?.started_at && !terminal ? ` · Last activity ${formatDuration(Math.max(0, nowMs - Date.parse(lastEvent.started_at)))} ago` : ""}</small>
+        </p>
       </section>
-      {compact ? <>
-        {taskMode === "auto" && planSummary && <section className="directive"><h3>Agent's directive</h3><p>{planSummary}</p><p className="subtle">The builder receives the full plan automatically. No input is needed here.</p></section>}
-        <ol className="task-steps" aria-label="Task progress">{steps.map((name) => {
-          const traced = lane.phases.slice().reverse().find((phase) => phase.phase === name);
-          const recorded = recordedPhases.slice().reverse().find((phase) => phase.phase === name);
-          const state = recorded?.status ?? traced?.status ?? (traced?.endMs === null ? "running" : isTerminalAttempt(attempt.state) ? "not run" : "waiting");
-          const runs = lane.phases.filter((phase) => phase.phase === name).length;
-          return <li key={name}><span>{name === "scout" ? "Read project" : name}{runs > 1 ? ` · round ${runs}` : ""}</span><StatusBadge state={state} /></li>;
-        })}</ol>
-        <details className="activity" aria-label="Recent activity" open={!isTerminalAttempt(attempt.state)}><summary>{isTerminalAttempt(attempt.state) ? "Activity history" : "Live activity"}</summary>
-          {activity.length === 0 ? <p className="subtle">Waiting for the worker's first activity. This page checks for updates automatically.</p> : <ol>{activity.map((event) => <li key={event.seq}><time>{formatClock(event.started_at)}</time><span>{event.type === "tool_call" ? `Codex used ${event.name ?? "a tool"}` : event.type === "phase_start" ? `Started ${event.phase === "scout" ? "reading the project" : event.phase}` : event.type === "phase_end" ? `Finished ${event.phase === "scout" ? "reading the project" : event.phase}` : event.name === "agent_text" ? "Codex sent a progress update" : event.name === "repair_edge" ? "Check failed → agents are repairing and retesting automatically" : event.name === "repair_exhausted" ? "Repair limit reached; see the diagnostic" : event.type === "gate_fail" ? "A check failed; inspect the workflow's repair activity" : "Worker reported an error"}</span></li>)}</ol>}
-        </details>
-        <details className="evidence"><summary>Technical activity</summary>{timeline}</details>
-      </> : timeline}
-      {openPhase && <button type="button" onClick={() => setOpenPhase(null)}>Clear phase filter</button>}
+
+      {verdict.tone === "bad" && <div className="stop-banner" role="status">
+        <p><strong>{verdict.word === "Held" ? "Held for a person" : outcome.title}</strong>
+          {verdict.word === "Held" ? summary?.publish_hold ?? "The workflow held publication." : attempt.error?.split("\n")[0] ?? outcome.detail}</p>
+        <p className="subtle">{verdict.word === "Held" && jobID
+          ? <>To release it, stop the worker that ran this job, then run <code>jig worker publish-retry {jobID}</code> with that worker's <code>--data</code> directory.</>
+          : outcome.next}</p>
+      </div>}
+
+      <StationLine stations={stations} selected={focus?.name ?? null} onSelect={setOpenPhase} moving={!terminal}
+        label={`Attempt ${attempt.attempt_number} stations`} />
+      <TimingStrip stations={stations} />
+      {(pullRequest || proof?.remote_ref) && <p className="proof">
+        {pullRequest && <a href={pullRequest} rel="noreferrer noopener" target="_blank">Pull request {/\/pull\/(\d+)/.exec(pullRequest)?.[1] ? `#${/\/pull\/(\d+)/.exec(pullRequest)?.[1]}` : ""} →</a>}
+        {proof?.remote_ref && <span>remote ref <code>{proof.remote_ref.slice(0, 12)}</code> verified</span>}
+      </p>}
+
+      <div className="lower">
+        <section aria-label="Recent activity">
+          <h4>{terminal ? "Activity history" : "Live activity"}</h4>
+          {feed.length === 0 ? <p className="subtle">Waiting for the worker's first activity. This page checks for updates automatically.</p>
+            : <ol className="feed">{feed.map((line) => <li key={line.seq}><time>{formatClock(line.at)}</time><b>{line.verb}</b><span title={line.detail}>{line.detail}</span></li>)}</ol>}
+        </section>
+        <section aria-label="Station detail">
+          <h4>{focus ? `Station · ${focus.label} · ${focus.note || focus.state}` : "Station detail"}</h4>
+          {!focus && <p className="subtle">No station has started.</p>}
+          {/* A finished attempt's final report is the Result below; a station's
+              own report is shown here only once the operator picks it. */}
+          {focus && openPhase && typeof focusFields.summary === "string" && <blockquote className={`station-quote station-quote-${focus.state}`}>{focusFields.summary}</blockquote>}
+          {focus && !openPhase && typeof focusFields.summary === "string" && <p className="subtle">Select a station on the line to read its report.</p>}
+          {/* A live station has no report yet; what its agent last said is the
+              nearest thing, and it is whole here where the feed cuts it. */}
+          {focus && focus.state === "live" && said && <blockquote className="station-quote station-quote-live">{said}</blockquote>}
+          {focus && typeof focusFields.summary !== "string" && !(focus.state === "live" && said) && <p className="subtle">{focus.state === "live" ? "This station is running. Its report arrives when it ends." : focus.state === "wait" ? "This station has not run." : focus.kind === "delivery" ? "Delivery step. Its record is in the proof line above and in the evidence below." : "This station recorded no written report."}</p>}
+          {focus && <ul className="station-checks">
+            {(focusResult?.gates?.checks ?? []).map((check, index) => <li key={`${check.item}-${index}`} className={check.ok ? "ok" : "not-ok"}>{check.item}{check.note ? `: ${check.note}` : ""}</li>)}
+            {focus.durationMs !== null && <li className="plain">{formatDuration(focus.durationMs)}{focus.rounds > 1 ? ` over ${focus.rounds} rounds` : ""}{focus.costUSD !== null ? ` · ${formatUSD(focus.costUSD)}` : ""}</li>}
+          </ul>}
+          {openPhase && <button type="button" onClick={() => setOpenPhase(null)}>Clear station filter</button>}
+        </section>
+      </div>
+
+      {taskMode === "auto" && planSummary && <section className="directive"><h3>Agent's directive</h3><p>{planSummary}</p><p className="subtle">The builder receives the full plan automatically. No input is needed here.</p></section>}
+      <details className="evidence"><summary>Technical activity</summary>{timeline}</details>
       <ErrorBanner error={error} />
-      <AttemptEvidence attempt={attempt} openPhase={openPhase} compact={compact} />
+      <AttemptEvidence attempt={attempt} openPhase={evidencePhase} compact />
     </div>
   );
 }
