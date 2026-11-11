@@ -15,7 +15,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // APIError is a control-plane error answer: the stable code the worker

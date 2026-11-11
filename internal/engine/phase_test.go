@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/engine"
-	"github.com/StructuPath/jig/internal/engine/enginetest"
-	"github.com/StructuPath/jig/internal/protocol"
-	"github.com/StructuPath/jig/internal/runtime"
-	"github.com/StructuPath/jig/internal/runtime/claudecode"
+	"github.com/StructuPath/JIG-Software-Factory/internal/engine"
+	"github.com/StructuPath/JIG-Software-Factory/internal/engine/enginetest"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/runtime"
+	"github.com/StructuPath/JIG-Software-Factory/internal/runtime/claudecode"
 )
 
 // ---- fixtures --------------------------------------------------------------

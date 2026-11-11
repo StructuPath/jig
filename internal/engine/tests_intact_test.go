@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 const goTests = `package a

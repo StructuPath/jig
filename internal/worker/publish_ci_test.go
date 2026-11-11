@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // ciSnapshot is integrationSnapshot opted into the CI wait.

@@ -26,8 +26,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/StructuPath/jig/internal/protocol"
-	"github.com/StructuPath/jig/internal/worker"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/worker"
 )
 
 const workerPublishRetryUsage = `Usage: jig worker publish-retry [flags] <job-id>

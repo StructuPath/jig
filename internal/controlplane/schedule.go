@@ -37,7 +37,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // Trigger kinds. A trigger is either a clock or a GitHub query; there is no

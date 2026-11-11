@@ -29,7 +29,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // InvocationTarget is one repository a run is invoked against. Repository is

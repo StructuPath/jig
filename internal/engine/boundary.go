@@ -64,7 +64,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // fingerprint maps each path a snapshot covers to a content-derived state

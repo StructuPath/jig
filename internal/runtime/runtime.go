@@ -14,7 +14,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // ErrKilled is what Handle.Result returns after Kill stopped the process

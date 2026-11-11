@@ -35,9 +35,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/StructuPath/jig/internal/engine"
-	"github.com/StructuPath/jig/internal/protocol"
-	"github.com/StructuPath/jig/internal/worker"
+	"github.com/StructuPath/JIG-Software-Factory/internal/engine"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/worker"
 )
 
 const workerUsage = `Usage: jig worker [--server <url>] [--data <dir>] [--runtime <name>] [--capacity <n>]

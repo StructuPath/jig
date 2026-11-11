@@ -32,7 +32,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // CIRerunSummary is one re-run as the publish summary reports it. The field

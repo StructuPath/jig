@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/controlplane"
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 func TestWorkerRegistersClaimsRunsPublishesAndReapsItsScratchOnInterrupt(t *testing.T) {
@@ -254,7 +254,7 @@ func TestTriggerCommandsCreateListAndToggleEnablement(t *testing.T) {
 	code = triggerCommand(context.Background(), []string{"create",
 		"--server", base, "--def", definitionID, "--name", "issues",
 		"--kind", controlplane.TriggerGitHubIssue,
-		"--repo", "github.com/StructuPath/jig", "--repo", "github.com/StructuPath/other",
+		"--repo", "github.com/StructuPath/JIG-Software-Factory", "--repo", "github.com/StructuPath/other",
 		"--instructions", "work the issue"}, &out, &errs)
 	if code != exitUsage {
 		t.Fatalf("two --repo flags on a github trigger exited %d, want %d", code, exitUsage)

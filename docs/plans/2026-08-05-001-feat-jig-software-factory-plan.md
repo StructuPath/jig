@@ -6,7 +6,7 @@ date: 2026-08-05
 
 # feat: Build jig, a local-first software factory
 
-**Target repo:** `StructuPath/jig` (this repo). Reference codebases are cited as `factory:<path>` (Victor's Go control plane, local checkout at `~/factory`) and `sssf:<path>` (disler/super-simple-software-factory, `example` branch). Neither parent is modified; both are read-only pattern sources.
+**Target repo:** `StructuPath/JIG-Software-Factory` (this repo). Reference codebases are cited as `factory:<path>` (Victor's Go control plane, local checkout at `~/factory`) and `sssf:<path>` (disler/super-simple-software-factory, `example` branch). Neither parent is modified; both are read-only pattern sources.
 
 ---
 
@@ -224,7 +224,7 @@ Exit gate: three consecutive accepted runs of a two-phase fixture definition via
 - **Goal:** A building repo with the full persistent model and shared types, before any behavior.
 - **Requirements:** R1, R2, R3, R18, R19
 - **Dependencies:** none
-- **Files:** `go.mod` (`github.com/StructuPath/jig`), `cmd/jig/main.go`, `internal/protocol/types.go`, `internal/protocol/limits.go`, `internal/protocol/definition.go`, `migrations/001_core.sql`, `migrations/embed.go`, `Justfile`, `.github/workflows/ci.yml`, `internal/protocol/definition_test.go`, `internal/controlplane/migrate_test.go`
+- **Files:** `go.mod` (`github.com/StructuPath/JIG-Software-Factory`), `cmd/jig/main.go`, `internal/protocol/types.go`, `internal/protocol/limits.go`, `internal/protocol/definition.go`, `migrations/001_core.sql`, `migrations/embed.go`, `Justfile`, `.github/workflows/ci.yml`, `internal/protocol/definition_test.go`, `internal/controlplane/migrate_test.go`
 - **Approach:** Tables: `definitions`, `runs` (frozen snapshot by value, per-target pinned SHAs), `jobs`, `attempts` (partial unique index: one active attempt per job), `claim_requests`, `events` (per-attempt monotonic `seq`, `UNIQUE(attempt_id, seq)`), `envelopes` (with `valid` and `attempt` columns), `gate_results`, `workers` (advertised env names, runtime capabilities/version), `retained_worktrees` (control-plane ledger, R16), `publish_records`, `schema_migrations`. Every limit is a named constant in `internal/protocol/limits.go`, including the worst-case send count and per-attempt wall-clock ceiling (R11). Definition schema (YAML) per R1 and KTD2: chain, repair edges with budgets and exhaustion policy, `if:` guards, roster with env allowlists, gates and predicate checks resolved against the built-in registry names (R9).
 - **Patterns to follow:** `factory:migrations/001_controlplane.sql` (constraint style, partial indexes), `factory:internal/protocol/types.go` (limits-as-constants), `sssf:adws/adw_modules/data_types.py` (envelope field shapes, GateReport).
 - **Test scenarios:**

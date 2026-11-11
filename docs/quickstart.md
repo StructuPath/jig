@@ -13,7 +13,7 @@ equivalent.
 ## 1. Build
 
 ```sh
-git clone https://github.com/StructuPath/jig
+git clone https://github.com/StructuPath/JIG-Software-Factory jig
 cd jig
 go build -o bin/jig ./cmd/jig
 ./bin/jig version

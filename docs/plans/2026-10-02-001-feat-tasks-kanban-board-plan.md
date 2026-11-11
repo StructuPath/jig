@@ -6,7 +6,7 @@ date: 2026-10-02
 
 # feat: Kanban board layout for My tasks
 
-**Target repo:** `StructuPath/jig`. UI-only change under `web/`; no Go, API, or migration change.
+**Target repo:** `StructuPath/JIG-Software-Factory`. UI-only change under `web/`; no Go, API, or migration change.
 
 ---
 

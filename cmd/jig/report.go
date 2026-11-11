@@ -21,7 +21,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/StructuPath/jig/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
 )
 
 const reportUsage = `Usage: jig report [flags]

@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
-	"github.com/StructuPath/jig/internal/runtime"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/runtime"
 )
 
 // stubScript stands in for the CLI. It echoes back the session id it was

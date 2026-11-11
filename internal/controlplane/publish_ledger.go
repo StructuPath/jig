@@ -26,7 +26,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 var publishRefPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)

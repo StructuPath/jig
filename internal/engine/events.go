@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // EventSink receives the attempt's ordered trace events. Emit must be safe

@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // mintLeaseToken mints one fencing token per claim: 32 random bytes,

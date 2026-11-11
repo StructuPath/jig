@@ -36,8 +36,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/StructuPath/jig/internal/controlplane"
-	"github.com/StructuPath/jig/web"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/web"
 )
 
 const serveUsage = `Usage: jig serve [--data <dir>] [--addr <host:port>] [--allow-non-loopback] [--no-github-poll]

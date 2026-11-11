@@ -6,7 +6,7 @@ date: 2026-09-28
 
 # feat: Measure the factory, re-run flaky CI, parallel reviewers, and close CI repair's test gaps
 
-**Target repo:** `StructuPath/jig`. This follows v0.2.0 (CI repair). `docs/plans/2026-09-27-001-feat-ci-repair-plan.md` is the prior plan and the style reference; its KTDs are cited as `CI:KTDn`, and the v1 plan's (`docs/plans/2026-08-05-001-feat-jig-software-factory-plan.md`) as `V1:KTDn`.
+**Target repo:** `StructuPath/JIG-Software-Factory`. This follows v0.2.0 (CI repair). `docs/plans/2026-09-27-001-feat-ci-repair-plan.md` is the prior plan and the style reference; its KTDs are cited as `CI:KTDn`, and the v1 plan's (`docs/plans/2026-08-05-001-feat-jig-software-factory-plan.md`) as `V1:KTDn`.
 
 ---
 

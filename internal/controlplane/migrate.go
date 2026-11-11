@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/StructuPath/jig/migrations"
+	"github.com/StructuPath/JIG-Software-Factory/migrations"
 )
 
 // Migrate applies every embedded migration that the schema_migrations ledger

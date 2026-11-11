@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // reportFixture seeds report rows straight into the ledger.

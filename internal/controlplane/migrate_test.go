@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/StructuPath/jig/migrations"
+	"github.com/StructuPath/JIG-Software-Factory/migrations"
 	_ "modernc.org/sqlite"
 )
 
@@ -50,7 +50,7 @@ func seedJob(t *testing.T, db *sql.DB) (jobID string) {
 		`INSERT INTO runs(id, definition_id, definition_generation, snapshot, state, created_at, updated_at)
 		 VALUES ('run-1', 'def-1', 1, 'name: smoke', 'active', 0, 0)`,
 		`INSERT INTO jobs(id, run_id, repository, base_sha, state, created_at, updated_at)
-		 VALUES ('job-1', 'run-1', 'github.com/StructuPath/jig', 'abc123', 'queued', 0, 0)`,
+		 VALUES ('job-1', 'run-1', 'github.com/StructuPath/JIG-Software-Factory', 'abc123', 'queued', 0, 0)`,
 		`INSERT INTO workers(id, name, worker_version, capacity, registered_at, last_heartbeat)
 		 VALUES ('worker-1', 'local', 'dev', 2, 0, 0)`,
 	}

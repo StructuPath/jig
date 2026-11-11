@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/controlplane"
-	"github.com/StructuPath/jig/internal/protocol"
-	"github.com/StructuPath/jig/internal/worker"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/worker"
 )
 
 const publishRetryDefinition = `name: publish-retry-e2e

@@ -1,4 +1,4 @@
-module github.com/StructuPath/jig
+module github.com/StructuPath/JIG-Software-Factory
 
 go 1.26.4
 

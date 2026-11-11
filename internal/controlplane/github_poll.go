@@ -44,7 +44,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // GitHubIssueMatch is one observed issue, already validated against the

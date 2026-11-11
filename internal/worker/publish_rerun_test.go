@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // rerunSnapshot waits for CI with a re-run budget and, when repairBudget is
