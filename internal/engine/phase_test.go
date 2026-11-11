@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -636,6 +637,11 @@ acceptance: [all_phases_passed]
 	if strings.Contains(joined, "SECRET=") {
 		t.Fatal("SECRET leaked into the subprocess env — the allowlist is not exclusive")
 	}
+	// A hook installer must not write core.hooksPath into the shared cache
+	// entry's config: the agent env switches husky off.
+	if !slices.Contains(env, "HUSKY=0") {
+		t.Fatal("HUSKY=0 missing from the agent subprocess env")
+	}
 	var home string
 	for _, entry := range env {
 		if value, found := strings.CutPrefix(entry, "HOME="); found {
@@ -1200,6 +1206,7 @@ acceptance: [all_phases_passed]
 		"XDG_CONFIG_HOME": true, "XDG_CACHE_HOME": true,
 		"XDG_DATA_HOME": true, "XDG_STATE_HOME": true,
 		"JIG_BASE_SHA": true, "PWD": true, "SHLVL": true, "_": true,
+		"HUSKY": true,
 	}
 	for name := range values {
 		if !allowed[name] {
@@ -1208,6 +1215,9 @@ acceptance: [all_phases_passed]
 	}
 	if values["FOO"] != "bar" {
 		t.Errorf("allowlisted FOO = %q, want bar", values["FOO"])
+	}
+	if values["HUSKY"] != "0" {
+		t.Errorf("gate subprocess HUSKY = %q, want 0 so a hook installer stays off", values["HUSKY"])
 	}
 	if _, leaked := values["SECRET"]; leaked {
 		t.Error("SECRET leaked into the gate subprocess env")

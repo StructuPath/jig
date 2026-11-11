@@ -107,23 +107,36 @@ func composeEnv(base []string, allow []string) []string {
 	return composed
 }
 
+// hookInstallerEnv switches off repository hook installers in every jig
+// subprocess. Attempt worktrees share the cache entry's git config, so a
+// `core.hooksPath` written there by an installer outlives the attempt and the
+// worker then refuses the whole entry (worker metadata.go). husky's `prepare`
+// script writes exactly that on a plain `npm install`; HUSKY=0 is its
+// documented off switch. jig's own git commands never run hooks anyway.
+func hookInstallerEnv() []string {
+	return []string{"HUSKY=0"}
+}
+
 // subprocessEnv is the complete environment an agent subprocess receives:
-// the resolved allowlist plus the ephemeral HOME family. HOME-family names
-// are stripped from the allowlist portion first — duplicate env entries are
-// ambiguous across libcs, and an allowlisted HOME must never be able to
-// re-point an agent at the operator's real home.
+// the resolved allowlist plus the ephemeral HOME family and the hook
+// installer switches. Names jig sets itself are stripped from the allowlist
+// portion first — duplicate env entries are ambiguous across libcs, an
+// allowlisted HOME must never be able to re-point an agent at the operator's
+// real home, and an allowlisted HUSKY must never switch the installer back on.
 func subprocessEnv(base []string, allow []string, home string) []string {
-	homeFamily := map[string]bool{
-		"HOME": true, "XDG_CONFIG_HOME": true, "XDG_CACHE_HOME": true,
-		"XDG_DATA_HOME": true, "XDG_STATE_HOME": true,
+	owned := append(homeEnv(home), hookInstallerEnv()...)
+	ownedNames := make(map[string]bool, len(owned))
+	for _, entry := range owned {
+		name, _, _ := strings.Cut(entry, "=")
+		ownedNames[name] = true
 	}
 	var env []string
 	for _, entry := range composeEnv(base, allow) {
 		name, _, _ := strings.Cut(entry, "=")
-		if homeFamily[name] {
+		if ownedNames[name] {
 			continue
 		}
 		env = append(env, entry)
 	}
-	return append(env, homeEnv(home)...)
+	return append(env, owned...)
 }
