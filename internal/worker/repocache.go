@@ -21,7 +21,7 @@ import (
 	"sync"
 	"unicode"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // repoCache is the worker's managed repository cache under <data>/repos.

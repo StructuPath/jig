@@ -22,7 +22,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // FleetMember is one registered worker as an operator reads it: the stored

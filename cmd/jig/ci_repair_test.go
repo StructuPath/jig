@@ -26,9 +26,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/controlplane"
-	"github.com/StructuPath/jig/internal/protocol"
-	"github.com/StructuPath/jig/internal/worker"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/worker"
 )
 
 const ciRepairDefinition = `name: ci-repair-e2e

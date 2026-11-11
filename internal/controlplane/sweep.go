@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // LostAttempt names one attempt the sweeper marked lost and its job. State is

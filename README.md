@@ -28,7 +28,7 @@ definition (YAML)  →  run (frozen by value)  →  job per repository  →  att
 **From source** (Go 1.26+, git, and one agent CLI):
 
 ```sh
-git clone https://github.com/StructuPath/jig
+git clone https://github.com/StructuPath/JIG-Software-Factory jig
 cd jig
 just build          # or: go build -o bin/jig ./cmd/jig
 ```
@@ -45,7 +45,7 @@ VERSION=v0.2.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')          # darwin or linux
 ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 
-BASE=https://github.com/StructuPath/jig/releases/download/$VERSION
+BASE=https://github.com/StructuPath/JIG-Software-Factory/releases/download/$VERSION
 curl -fsSLO "$BASE/jig_${VERSION}_${OS}_${ARCH}.tar.gz"
 curl -fsSLO "$BASE/SHA256SUMS"
 

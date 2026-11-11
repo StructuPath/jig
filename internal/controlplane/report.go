@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // defaultReportWindow is the window a report covers when the caller names no

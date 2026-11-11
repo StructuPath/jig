@@ -114,7 +114,7 @@ describe("buildStations", () => {
     const record = (step: string, seconds: number, extra: Partial<PublishRecord> = {}): PublishRecord =>
       ({ attempt_id: "attempt-1", step, branch: "jig/job-1/1", completed_at: at(seconds), ...extra });
     const publish = [
-      record("push", 212), record("pull_request", 214, { pr_url: "https://github.com/StructuPath/jig/pull/46" }),
+      record("push", 212), record("pull_request", 214, { pr_url: "https://github.com/StructuPath/JIG-Software-Factory/pull/46" }),
       record("proof", 216, { remote_ref: "1e7dfcf94402" }), record("ci", 540),
       // Another attempt's record never lights this attempt's stations.
       { attempt_id: "attempt-0", step: "proof", branch: "jig/job-1/0", completed_at: at(1) },

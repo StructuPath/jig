@@ -27,7 +27,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // defaultEventPageSize and maxEventPageSize bound one cursor page. The

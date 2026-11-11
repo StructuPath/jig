@@ -27,8 +27,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/StructuPath/jig/internal/controlplane"
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 const defUsage = `Usage: jig def <command> [flags]

@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // acceptanceResult is the evaluated predicate with per-check evidence.

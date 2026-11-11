@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // parsedEnvelope is one valid envelope: the canonical JSON, the full field

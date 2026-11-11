@@ -46,7 +46,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // Trace transport tuning. These are worker-local rhythm knobs rather than

@@ -1,6 +1,6 @@
 package engine
 
-import "github.com/StructuPath/jig/internal/worker"
+import "github.com/StructuPath/JIG-Software-Factory/internal/worker"
 
 // FieldViewOf exposes a kept chain's merged field view to the external test
 // package: the view guards and the publish hold read is part of what a

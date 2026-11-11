@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // applyRetainedWorktrees upserts ledger rows for a worker's reported

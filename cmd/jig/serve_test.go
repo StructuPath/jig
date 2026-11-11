@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
 	_ "modernc.org/sqlite"
 )
 

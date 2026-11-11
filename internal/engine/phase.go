@@ -33,9 +33,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
-	"github.com/StructuPath/jig/internal/runtime"
-	"github.com/StructuPath/jig/internal/worker"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/runtime"
+	"github.com/StructuPath/JIG-Software-Factory/internal/worker"
 )
 
 // phaseStatusSkipped marks a phase whose `if:` guard held false. Skipping

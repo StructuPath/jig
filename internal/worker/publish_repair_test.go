@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // repairLoopSnapshot waits for CI and repairs it with up to `budget` rounds.

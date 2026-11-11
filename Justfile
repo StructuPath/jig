@@ -37,7 +37,7 @@ release version="":
 
 # Prove the worker never imports control-plane implementation code (KTD1).
 boundary:
-    @! go list -deps ./internal/worker | grep -qx 'github.com/StructuPath/jig/internal/controlplane'
+    @! go list -deps ./internal/worker | grep -qx 'github.com/StructuPath/JIG-Software-Factory/internal/controlplane'
 
 # Run the local and CI checks.
 check: format-check vet boundary definitions test build

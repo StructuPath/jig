@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // Claim answers one worker claim request. A nil, nil return is an empty

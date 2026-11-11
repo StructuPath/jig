@@ -15,8 +15,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/StructuPath/jig/internal/controlplane"
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // newHookedWorker builds a worker whose control plane fires before(path) on

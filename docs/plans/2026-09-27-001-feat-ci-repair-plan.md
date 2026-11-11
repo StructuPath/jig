@@ -6,7 +6,7 @@ date: 2026-09-27
 
 # feat: Repair red CI inside the attempt (publish.ci.on_fail)
 
-**Target repo:** `StructuPath/jig`. Builds on the CI gate (be9b795, `publish.ci`) and the risk gate and publish hold (9242460). Everything cited as `file:line` is at `origin/main` b2b6325.
+**Target repo:** `StructuPath/JIG-Software-Factory`. Builds on the CI gate (be9b795, `publish.ci`) and the risk gate and publish hold (9242460). Everything cited as `file:line` is at `origin/main` b2b6325.
 
 ---
 

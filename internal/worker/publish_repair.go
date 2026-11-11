@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // CIRepairSummary is one repair round as the publish summary reports it.

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/runtime"
+	"github.com/StructuPath/JIG-Software-Factory/internal/runtime"
 )
 
 func TestLiveSmokeRealCodex(t *testing.T) {

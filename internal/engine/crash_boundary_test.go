@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/StructuPath/jig/internal/engine/enginetest"
-	"github.com/StructuPath/jig/internal/protocol"
+	"github.com/StructuPath/JIG-Software-Factory/internal/engine/enginetest"
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // builderReaderSnapshot is a builder that may write src/ followed by a
