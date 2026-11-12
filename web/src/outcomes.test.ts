@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseAttemptSummary } from "./api";
-import { attemptOutcome } from "./outcomes";
+import { attemptOutcome, publishAction } from "./outcomes";
 import type { Attempt } from "./types";
 
 function attempt(overrides: Partial<Attempt>): Attempt {
@@ -40,5 +40,29 @@ describe("trace-based outcomes", () => {
       expect(parseAttemptSummary(result)).toBeNull();
       expect(attemptOutcome(attempt({ result })).title).toBe("Work did not pass");
     }
+  });
+});
+
+describe("the publish action", () => {
+  const unpublished = (result: string) => attempt({ state: "accepted_unpublished", result });
+
+  it("is a release for a hold and a retry for a publish that failed", () => {
+    expect(publishAction("accepted_unpublished", unpublished(JSON.stringify({ publish: { state: "held" } })))?.label).toBe("Release hold");
+    expect(publishAction("accepted_unpublished", unpublished(JSON.stringify({ publish: { state: "failed", code: "ci_failed" } })))?.label).toBe("Retry publication");
+  });
+
+  it("is absent where a publish-only retry cannot help", () => {
+    const keptLocal = JSON.stringify({ publish: "held", publish_hold: 'publish.hold_when "jig_ui_delivery != publish" held' });
+    expect(publishAction("accepted_unpublished", unpublished(keptLocal))).toBeNull();
+    expect(publishAction("accepted_unpublished", unpublished(JSON.stringify({ publish: { state: "failed", code: "publish_empty_changeset" } })))).toBeNull();
+    expect(publishAction("accepted_unpublished", unpublished(JSON.stringify({ publish: "not_attempted" })))).toBeNull();
+  });
+
+  it("is absent unless both the job and its latest attempt are unpublished", () => {
+    const held = unpublished(JSON.stringify({ publish: { state: "held" } }));
+    expect(publishAction("active", held)).toBeNull();
+    expect(publishAction("accepted", held)).toBeNull();
+    expect(publishAction("accepted_unpublished", undefined)).toBeNull();
+    expect(publishAction("accepted_unpublished", attempt({ state: "running" }))).toBeNull();
   });
 });

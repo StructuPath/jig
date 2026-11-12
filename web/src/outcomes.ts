@@ -37,7 +37,7 @@ export function attemptOutcome(attempt: Attempt): { title: string; detail: strin
     if (publish === "held" || (typeof publish === "object" && publish?.state === "held")) return {
       title: "Checks passed · awaiting review",
       detail: "The workflow deliberately held publication for human review.",
-      next: "Review the result and retained worktree before releasing the publication hold.",
+      next: "Review the result and retained worktree, then use Release hold above. The worker that ran the task publishes it as a pull request; Jig does not merge held work.",
     };
     if (publish === "not_attempted" && !attempt.error) return {
       title: "Checks passed · publication not attempted",
@@ -47,7 +47,7 @@ export function attemptOutcome(attempt: Attempt): { title: string; detail: strin
     return {
       title: "Checks passed · publication incomplete",
       detail: "The coding workflow passed, but delivery did not finish. The diagnostic below records where it stopped.",
-      next: "Resolve the publication or CI problem before retrying publication; rerunning the coding workflow is a separate action.",
+      next: "Resolve the publication or CI problem, then use Retry publication above; rerunning the coding workflow is a separate action.",
     };
   }
   if (attempt.state === "cancelled") return {
@@ -69,4 +69,33 @@ export function attemptOutcome(attempt: Attempt): { title: string; detail: strin
     detail: "The attempt did not meet Jig's acceptance requirements. Inspect the diagnostic and failed checks below.",
     next: "Fix the cause before retrying. A retry uses the same frozen workflow; prompt, model, or workflow changes require a new run.",
   };
+}
+
+export interface PublishAction {
+  label: "Release hold" | "Retry publication";
+  /** What the operator is agreeing to, shown before the request is sent. */
+  consequence: string;
+}
+
+// publishAction is the one thing an operator can ask of an unpublished job:
+// have the worker that ran it finish the publish. It is offered only where a
+// publish-only retry can help — not for work the task chose to keep local,
+// not for a changeset with nothing in it, and not for a direct run, which
+// has no worker to ask.
+export function publishAction(jobState: string, latest: Attempt | undefined): PublishAction | null {
+  if (jobState !== "accepted_unpublished" || latest?.state !== "accepted_unpublished") return null;
+  switch (attemptOutcome(latest).title) {
+    case "Checks passed · awaiting review":
+      return {
+        label: "Release hold",
+        consequence: "pushes the held branch and opens a pull request. Jig does not merge it.",
+      };
+    case "Checks passed · publication incomplete":
+      return {
+        label: "Retry publication",
+        consequence: "re-runs only the publish steps that did not finish, on the same branch and pull request.",
+      };
+    default:
+      return null;
+  }
 }

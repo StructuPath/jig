@@ -9,7 +9,7 @@ import { useCallback, useMemo, useState } from "react";
 import { api, parseAttemptSummary } from "./api";
 import { formatClock, formatDateTime, formatDuration, formatUSD, isTerminalAttempt, projectName, runtimeLabel, shortID, taskHeading, taskState, taskTitle, workflowName } from "./format";
 import { buildLane } from "./lanes";
-import { attemptOutcome } from "./outcomes";
+import { attemptOutcome, publishAction } from "./outcomes";
 import { useAttemptEvents, useNow, usePolled } from "./polling";
 import { StationLine, TimingStrip } from "./StationLine";
 import { buildFeed, buildStations, verdictFor } from "./stations";
@@ -83,6 +83,19 @@ export function JobDetail({ jobID }: { jobID: string }) {
   );
 }
 
+// PublishPending says where an operator's publish request stands: it waits
+// for the one worker that holds the attempt's retained worktree, so whether
+// that worker is running is the whole answer to "why has nothing happened".
+function PublishPending({ workerID }: { workerID?: string }) {
+  const { data } = usePolled(api.fleet, 5000, "fleet:publish-pending");
+  const owner = (data?.workers ?? []).find((worker) => worker.id === workerID);
+  const where = workerID ? `worker ${shortID(workerID)}` : "the worker that ran it";
+  const standing = !data ? "" : owner?.live
+    ? " It is running and takes the request on its next poll, or when it has a free slot."
+    : " That worker is not running. Start it and it takes the request; nothing is lost while it is stopped.";
+  return <p className="subtle" role="status">Publish requested · waiting for {where}.{standing}</p>;
+}
+
 export function JobPanel({
   jobID,
   nowMs,
@@ -100,12 +113,16 @@ export function JobPanel({
   const { data, error, loading, refresh } = usePolled(load, 3000, `job:${jobID}`);
   const [actionError, setActionError] = useState<Error | null>(null);
   const [pending, setPending] = useState(false);
+  const [confirmingPublish, setConfirmingPublish] = useState(false);
 
-  const act = async (action: "retry" | "cancel") => {
+  const act = async (action: "retry" | "cancel" | "publish" | "withdraw") => {
     setPending(true);
+    setConfirmingPublish(false);
     try {
       if (action === "retry") await api.retryJob(jobID);
-      else await api.cancelJob(jobID);
+      else if (action === "cancel") await api.cancelJob(jobID);
+      else if (action === "publish") await api.requestPublish(jobID);
+      else await api.withdrawPublishRequest(jobID);
       setActionError(null);
       refresh();
     } catch (failure) {
@@ -120,6 +137,8 @@ export function JobPanel({
   const attempts = data.attempts ?? [];
   const latest = attempts.at(-1);
   const ready = latest && attemptOutcome(latest).title === "Task complete · kept local";
+  const publish = publishAction(data.job.state, latest);
+  const publishRequested = Boolean(data.job.publish_requested_at);
 
   return (
     <section className="panel" id={`job-${jobID}`}>
@@ -144,8 +163,21 @@ export function JobPanel({
           {["queued", "active"].includes(data.job.state) && <button type="button" disabled={pending || data.job.cancellation_requested} onClick={() => void act("cancel")}>
             {data.job.cancellation_requested ? "Cancellation requested" : "Cancel"}
           </button>}
+          {publish && !publishRequested && (confirmingPublish ? (
+            <span className="confirm">
+              <button type="button" disabled={pending} onClick={() => void act("publish")}>Confirm {publish.label.toLowerCase()}</button>
+              <button type="button" onClick={() => setConfirmingPublish(false)}>Keep as is</button>
+            </span>
+          ) : (
+            <button type="button" disabled={pending} onClick={() => setConfirmingPublish(true)}>{publish.label}…</button>
+          ))}
+          {publish && publishRequested &&
+            <button type="button" disabled={pending} onClick={() => void act("withdraw")}>Withdraw request</button>}
         </div>
       </header>
+      {publish && confirmingPublish && !publishRequested &&
+        <p className="subtle" role="status">{publish.label} on {data.job.repository} {publish.consequence}</p>}
+      {publish && publishRequested && <PublishPending workerID={latest?.worker_id} />}
       <ErrorBanner error={actionError} />
       <ErrorBanner error={error} />
 
@@ -280,7 +312,7 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
         <p><strong>{verdict.word === "Held" ? "Held for a person" : outcome.title}</strong>
           {verdict.word === "Held" ? summary?.publish_hold ?? "The workflow held publication." : attempt.error?.split("\n")[0] ?? outcome.detail}</p>
         <p className="subtle">{verdict.word === "Held" && jobID
-          ? <>To release it, stop the worker that ran this job, then run <code>jig worker publish-retry {jobID}</code> with that worker's <code>--data</code> directory.</>
+          ? <>To release it, use <strong>Release hold</strong> above, or run <code>jig job release {jobID}</code>. The worker that ran this job publishes it as a pull request; Jig does not merge held work.</>
           : outcome.next}</p>
       </div>}
 

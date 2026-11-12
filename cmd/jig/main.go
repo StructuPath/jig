@@ -31,6 +31,7 @@ Usage:
   jig run      Run a definition directly against a local repository
   jig def      Validate, manage, and invoke job definitions
   jig trigger  Manage admission triggers (cron schedules, GitHub polling)
+  jig job      Release a held or unpublished job through its running worker
   jig report   Summarize the factory's quality over a time window
   jig version  Print the release identity
 
@@ -66,6 +67,8 @@ func run(ctx context.Context, args []string) int {
 		return defCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "trigger":
 		return triggerCommand(ctx, args[1:], os.Stdout, os.Stderr)
+	case "job":
+		return jobCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "report":
 		return reportCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "version", "--version":

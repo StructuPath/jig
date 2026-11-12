@@ -34,6 +34,8 @@ export interface Attempt {
   runtime_version?: string;
   result?: string;
   error?: string;
+  /** Why publish.hold_when held this attempt; kept after a release. */
+  publish_hold?: string;
   started_at?: string;
   completed_at?: string;
   created_at: string;
@@ -46,6 +48,8 @@ export interface Job {
   base_sha: string;
   state: string;
   cancellation_requested: boolean;
+  /** Set while an operator's publish request waits for the owning worker. */
+  publish_requested_at?: string;
   created_at: string;
   updated_at: string;
 }
