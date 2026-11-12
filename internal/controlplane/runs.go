@@ -507,26 +507,18 @@ func (s *Store) Runs(ctx context.Context) ([]protocol.Run, error) {
 
 // RunJobs lists one run's jobs in creation order.
 func (s *Store) RunJobs(ctx context.Context, runID string) ([]protocol.Job, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, run_id, repository, base_sha, state, cancellation_requested, created_at, updated_at
-		FROM jobs WHERE run_id = ? ORDER BY created_at, id
-	`, runID)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+jobColumns+` FROM jobs WHERE run_id = ? ORDER BY created_at, id`, runID)
 	if err != nil {
 		return nil, unavailable(err)
 	}
 	defer rows.Close()
 	values := []protocol.Job{}
 	for rows.Next() {
-		var value protocol.Job
-		var cancel int
-		var createdAt, updatedAt int64
-		if err := rows.Scan(&value.ID, &value.RunID, &value.Repository, &value.BaseSHA,
-			&value.State, &cancel, &createdAt, &updatedAt); err != nil {
+		value, err := scanJob(rows)
+		if err != nil {
 			return nil, unavailable(err)
 		}
-		value.CancellationRequested = cancel != 0
-		value.CreatedAt = fromMillis(createdAt)
-		value.UpdatedAt = fromMillis(updatedAt)
 		values = append(values, value)
 	}
 	if err := rows.Err(); err != nil {

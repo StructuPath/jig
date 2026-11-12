@@ -145,14 +145,17 @@ type Run struct {
 // operator sets it, the worker observes it on its next heartbeat, and only
 // the worker performs the transition (R5).
 type Job struct {
-	ID                    string    `json:"id"`
-	RunID                 string    `json:"run_id"`
-	Repository            string    `json:"repository"`
-	BaseSHA               string    `json:"base_sha"`
-	State                 string    `json:"state"`
-	CancellationRequested bool      `json:"cancellation_requested"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	ID                    string `json:"id"`
+	RunID                 string `json:"run_id"`
+	Repository            string `json:"repository"`
+	BaseSHA               string `json:"base_sha"`
+	State                 string `json:"state"`
+	CancellationRequested bool   `json:"cancellation_requested"`
+	// PublishRequestedAt is when an operator asked for this job's publish to
+	// be finished, or nil when no request is waiting for the owning worker.
+	PublishRequestedAt *time.Time `json:"publish_requested_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // Attempt is one worker execution of a job. Retry always creates a new

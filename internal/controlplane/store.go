@@ -774,21 +774,35 @@ func (s *Store) Attempt(ctx context.Context, attemptID string) (protocol.Attempt
 
 // Job reads one job.
 func (s *Store) Job(ctx context.Context, jobID string) (protocol.Job, error) {
-	var value protocol.Job
-	var cancel int
-	var createdAt, updatedAt int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, run_id, repository, base_sha, state, cancellation_requested, created_at, updated_at
-		FROM jobs WHERE id = ?
-	`, jobID).Scan(&value.ID, &value.RunID, &value.Repository, &value.BaseSHA,
-		&value.State, &cancel, &createdAt, &updatedAt)
+	value, err := scanJob(s.db.QueryRowContext(ctx,
+		`SELECT `+jobColumns+` FROM jobs WHERE id = ?`, jobID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return value, ErrNotFound
 	}
 	if err != nil {
 		return value, unavailable(err)
 	}
+	return value, nil
+}
+
+// jobColumns and scanJob are the one read of a job row, shared by every
+// query that returns one, so a new column cannot reach some reads and miss
+// others.
+const jobColumns = `id, run_id, repository, base_sha, state, cancellation_requested,
+	publish_requested_at, created_at, updated_at`
+
+func scanJob(row rowScanner) (protocol.Job, error) {
+	var value protocol.Job
+	var cancel int
+	var publishRequestedAt sql.NullInt64
+	var createdAt, updatedAt int64
+	err := row.Scan(&value.ID, &value.RunID, &value.Repository, &value.BaseSHA,
+		&value.State, &cancel, &publishRequestedAt, &createdAt, &updatedAt)
+	if err != nil {
+		return value, err
+	}
 	value.CancellationRequested = cancel != 0
+	value.PublishRequestedAt = timePointer(publishRequestedAt)
 	value.CreatedAt = fromMillis(createdAt)
 	value.UpdatedAt = fromMillis(updatedAt)
 	return value, nil

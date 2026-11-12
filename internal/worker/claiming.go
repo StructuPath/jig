@@ -179,6 +179,9 @@ func (w *Worker) runClaimLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		// Requests come before claims: a person is waiting on a release, and
+		// its work is already done.
+		w.servePublishRequests(ctx, &attempts)
 		for w.activeCount() < w.config.Capacity {
 			token, err := mintLeaseToken()
 			if err != nil {

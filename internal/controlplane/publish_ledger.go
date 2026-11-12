@@ -431,7 +431,8 @@ func (s *Store) RetryPublish(
 			"the attempt left accepted_unpublished during the retry")
 	}
 	result, err = tx.ExecContext(ctx, `
-		UPDATE jobs SET state = 'active', cancellation_requested = 0, updated_at = ?
+		UPDATE jobs SET state = 'active', cancellation_requested = 0, updated_at = ?,
+		    publish_requested_at = NULL
 		WHERE id = ? AND state = 'accepted_unpublished'
 	`, now.UnixMilli(), jobID)
 	if err != nil {
@@ -473,6 +474,101 @@ func (s *Store) RetryPublish(
 	return retry, nil
 }
 
+// ---- the operator's publish request -----------------------------------------
+
+// RequestPublish records an operator's request to finish publishing an
+// accepted_unpublished job: release a hold, or retry a publish that did not
+// complete. It carries no lease and names no worker, because the operator
+// has neither. The worker that ran the attempt reads the request while it
+// runs (WorkerPublishRequests) and performs the publish-only retry itself;
+// RetryPublish clears the request in the transaction that grants the lease,
+// so one request is at most one retry.
+//
+// A request already waiting is returned unchanged, with its original time:
+// asking twice is not asking for two retries.
+func (s *Store) RequestPublish(ctx context.Context, jobID string) (protocol.Job, error) {
+	now := s.now().UnixMilli()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return protocol.Job{}, unavailable(err)
+	}
+	defer tx.Rollback()
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return protocol.Job{}, ErrNotFound
+	}
+	if err != nil {
+		return protocol.Job{}, unavailable(err)
+	}
+	if state != protocol.JobAcceptedUnpublished {
+		return protocol.Job{}, conflict("publish_request_not_allowed",
+			"only an accepted_unpublished job has a publish to finish")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET publish_requested_at = COALESCE(publish_requested_at, ?)
+		WHERE id = ? AND state = 'accepted_unpublished'
+	`, now, jobID); err != nil {
+		return protocol.Job{}, unavailable(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return protocol.Job{}, unavailable(err)
+	}
+	return s.Job(ctx, jobID)
+}
+
+// WithdrawPublishRequest clears a request no worker has taken yet. A request
+// a worker already took is gone from the row — its retry is running or done —
+// so withdrawing then changes nothing, and is not an error: the answer is the
+// job as it is.
+func (s *Store) WithdrawPublishRequest(ctx context.Context, jobID string) (protocol.Job, error) {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET publish_requested_at = NULL WHERE id = ?`, jobID)
+	if err != nil {
+		return protocol.Job{}, unavailable(err)
+	}
+	if changed, _ := result.RowsAffected(); changed == 0 {
+		return protocol.Job{}, ErrNotFound
+	}
+	return s.Job(ctx, jobID)
+}
+
+// WorkerPublishRequests lists the requests this worker can serve, oldest
+// first: requested jobs still accepted_unpublished whose latest attempt it
+// ran. A job whose attempt another worker ran is never listed here — the
+// same ownership rule RetryPublish enforces, applied before the worker asks.
+func (s *Store) WorkerPublishRequests(ctx context.Context, workerID string) ([]protocol.PublishRequest, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT j.id, a.id, j.publish_requested_at
+		FROM jobs j
+		JOIN attempts a ON a.job_id = j.id
+		WHERE j.publish_requested_at IS NOT NULL
+		  AND j.state = 'accepted_unpublished'
+		  AND a.state = 'accepted_unpublished'
+		  AND a.worker_id = ?
+		  AND a.attempt_number = (SELECT MAX(attempt_number) FROM attempts WHERE job_id = j.id)
+		ORDER BY j.publish_requested_at, j.id
+	`, workerID)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	defer rows.Close()
+	requests := []protocol.PublishRequest{}
+	for rows.Next() {
+		var request protocol.PublishRequest
+		var requestedAt int64
+		if err := rows.Scan(&request.JobID, &request.AttemptID, &requestedAt); err != nil {
+			return nil, unavailable(err)
+		}
+		request.RequestedAt = fromMillis(requestedAt)
+		requests = append(requests, request)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, unavailable(err)
+	}
+	return requests, nil
+}
+
 // ---- HTTP surface ----------------------------------------------------------
 
 // registerPublishRoutes attaches the publish surface to the control plane's
@@ -484,6 +580,9 @@ func (a *API) registerPublishRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/attempts/{attempt_id}/publish", a.attemptPublishRecords)
 	mux.HandleFunc("GET /api/jobs/{job_id}/publish", a.jobPublishRecords)
 	mux.HandleFunc("POST /api/jobs/{job_id}/publish-retry", a.retryPublish)
+	mux.HandleFunc("POST /api/jobs/{job_id}/publish-request", a.requestPublish)
+	mux.HandleFunc("DELETE /api/jobs/{job_id}/publish-request", a.withdrawPublishRequest)
+	mux.HandleFunc("GET /api/workers/{worker_id}/publish-requests", a.workerPublishRequests)
 	a.registerCIRepairRoutes(mux)
 }
 
@@ -553,4 +652,41 @@ func (a *API) retryPublish(w http.ResponseWriter, r *http.Request) {
 	a.logger.Info("state_change", "resource_type", "job", "resource_id", retry.Job.ID,
 		"new_state", retry.Job.State, "action", "publish_retry")
 	writeJSON(w, http.StatusOK, retry)
+}
+
+func (a *API) requestPublish(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	job, err := a.store.RequestPublish(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	a.logger.Info("state_change", "resource_type", "job", "resource_id", job.ID,
+		"new_state", job.State, "action", "publish_request")
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (a *API) withdrawPublishRequest(w http.ResponseWriter, r *http.Request) {
+	if !a.prepareMutation(w, r) {
+		return
+	}
+	job, err := a.store.WithdrawPublishRequest(r.Context(), r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	a.logger.Info("state_change", "resource_type", "job", "resource_id", job.ID,
+		"new_state", job.State, "action", "publish_request_withdrawn")
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (a *API) workerPublishRequests(w http.ResponseWriter, r *http.Request) {
+	requests, err := a.store.WorkerPublishRequests(r.Context(), r.PathValue("worker_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, requests)
 }

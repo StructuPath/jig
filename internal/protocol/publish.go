@@ -270,3 +270,13 @@ type CIRepairRecordRequest struct {
 	HeadAfter    string   `json:"head_after"`
 	FailedChecks []string `json:"failed_checks"`
 }
+
+// PublishRequest is one operator request the owning worker has yet to take:
+// finish publishing this accepted_unpublished job. It is what the worker
+// reads on its claim tick, and it names the attempt so the worker can hold a
+// slot for the retry before it asks for the lease.
+type PublishRequest struct {
+	JobID       string    `json:"job_id"`
+	AttemptID   string    `json:"attempt_id"`
+	RequestedAt time.Time `json:"requested_at"`
+}
