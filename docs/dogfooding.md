@@ -366,7 +366,27 @@ review after an accept, so a clean accept that you then had to rewrite
 counts as clean in the report. Record it here.
 
 A publish-only retry runs on the worker that ran the job — the retained
-worktree and the repository cache are in that worker's data directory:
+worktree and the repository cache are in that worker's data directory.
+While the worker that ran the job is running, ask it to finish the publish.
+Nothing is stopped:
+
+```sh
+jig job release <job-id>
+```
+
+or use **Release hold** (a held job) or **Retry publication** (anything else)
+on the job's page in the UI. Either one records a request on the control
+plane; the worker that ran the job takes it on its next poll, when it has a
+free slot, and runs the publish-only retry itself, with the author and base
+branch it already publishes with. `jig job release` waits for the outcome and
+exits 0 when the job is `accepted`, 3 when publish still did not finish, and
+1 when the request was refused or the wait was interrupted; `--no-wait`
+returns once the request is recorded. A request made while that worker is
+stopped stays pending until it starts, and can be withdrawn from the job's
+page. A held job that is released is published as a pull request for you to
+merge; releasing it is the sign-off, not a merge.
+
+When that worker is stopped, run the retry yourself, as that worker:
 
 ```sh
 # stop the worker that ran the job (Ctrl-C), then, as that worker:
@@ -383,8 +403,7 @@ stays `accepted_unpublished`; retry again), and 1 when it could not run.
 The data directory is locked while a worker or a retry holds it, so stop the
 worker first. A retry that is interrupted mid-publish is returned to
 `accepted_unpublished` by the control plane once its lease expires and the
-sweeper notices (about a minute); retry again after that. There is no retry button in
-the UI.
+sweeper notices (about a minute); retry again after that.
 
 ---
 

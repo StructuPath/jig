@@ -115,6 +115,10 @@ export const api = {
     request<unknown>(`/api/jobs/${encodeURIComponent(jobID)}/retry`, { method: "POST" }),
   cancelJob: (jobID: string) =>
     request<unknown>(`/api/jobs/${encodeURIComponent(jobID)}/cancel`, { method: "POST" }),
+  requestPublish: (jobID: string) =>
+    request<unknown>(`/api/jobs/${encodeURIComponent(jobID)}/publish-request`, { method: "POST" }),
+  withdrawPublishRequest: (jobID: string) =>
+    request<unknown>(`/api/jobs/${encodeURIComponent(jobID)}/publish-request`, { method: "DELETE" }),
 };
 
 export async function ensureDefinition(source: string): Promise<Definition> {

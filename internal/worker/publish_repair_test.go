@@ -280,6 +280,15 @@ func TestARoundThatDoesNotEndAcceptedPushesNothing(t *testing.T) {
 			if remoteBranches(t, s.originDir)[s.branch] != summary.RemoteRef || len(s.rounds(t, attempt.ID)) != 0 {
 				t.Fatal("a round that did not end accepted moved the branch or was recorded")
 			}
+			// Only a round the definition held marks the attempt held: the
+			// ledger must say a person was asked for, even though the held
+			// fix was never pushed.
+			if held := attempt.PublishHold != ""; held != (tc.code == "ci_repair_held") {
+				t.Fatalf("attempt publish_hold = %q for %s", attempt.PublishHold, tc.code)
+			}
+			if tc.code == "ci_repair_held" && !strings.Contains(attempt.PublishHold, "risk = high") {
+				t.Fatalf("attempt publish_hold = %q, want the round's hold reason", attempt.PublishHold)
+			}
 		})
 	}
 }

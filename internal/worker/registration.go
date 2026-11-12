@@ -474,6 +474,21 @@ func (w *Worker) activeCount() int {
 	return len(w.active)
 }
 
+// reserveActive takes a slot for attemptID when one is free and the attempt
+// does not already hold one, in a single step. A publish request stays
+// listed until its retry is granted, so the claim loop sees it again on the
+// next tick; the reservation is what keeps one request from starting two
+// retries, and from starting any when the worker is full.
+func (w *Worker) reserveActive(attemptID string) bool {
+	w.stateMutex.Lock()
+	defer w.stateMutex.Unlock()
+	if w.active[attemptID] || len(w.active) >= w.config.Capacity {
+		return false
+	}
+	w.active[attemptID] = true
+	return true
+}
+
 func (w *Worker) trackActive(attemptID string) {
 	w.stateMutex.Lock()
 	defer w.stateMutex.Unlock()

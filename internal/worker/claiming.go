@@ -179,6 +179,9 @@ func (w *Worker) runClaimLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		// Requests come before claims: a person is waiting on a release, and
+		// its work is already done.
+		w.servePublishRequests(ctx, &attempts)
 		for w.activeCount() < w.config.Capacity {
 			token, err := mintLeaseToken()
 			if err != nil {
@@ -309,6 +312,9 @@ func (w *Worker) completeAttempt(ctx context.Context, lease *attemptLease, outco
 		State:      outcome.State,
 		Result:     boundedText(outcome.Result, protocol.MaxResultBytes),
 		Error:      boundedText(outcome.Error, protocol.MaxErrorBytes),
+		// The hold travels as a field of its own, not only inside the result
+		// summary: the control plane records it and never parses a result.
+		PublishHold: boundedText(outcome.PublishHold, protocol.MaxPublishDiagnosticBytes),
 	})
 }
 

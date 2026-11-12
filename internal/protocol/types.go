@@ -145,14 +145,17 @@ type Run struct {
 // operator sets it, the worker observes it on its next heartbeat, and only
 // the worker performs the transition (R5).
 type Job struct {
-	ID                    string    `json:"id"`
-	RunID                 string    `json:"run_id"`
-	Repository            string    `json:"repository"`
-	BaseSHA               string    `json:"base_sha"`
-	State                 string    `json:"state"`
-	CancellationRequested bool      `json:"cancellation_requested"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	ID                    string `json:"id"`
+	RunID                 string `json:"run_id"`
+	Repository            string `json:"repository"`
+	BaseSHA               string `json:"base_sha"`
+	State                 string `json:"state"`
+	CancellationRequested bool   `json:"cancellation_requested"`
+	// PublishRequestedAt is when an operator asked for this job's publish to
+	// be finished, or nil when no request is waiting for the owning worker.
+	PublishRequestedAt *time.Time `json:"publish_requested_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // Attempt is one worker execution of a job. Retry always creates a new
@@ -170,9 +173,13 @@ type Attempt struct {
 	RuntimeVersion string     `json:"runtime_version,omitempty"`
 	Result         string     `json:"result,omitempty"`
 	Error          string     `json:"error,omitempty"`
-	StartedAt      *time.Time `json:"started_at,omitempty"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
+	// PublishHold is why the definition's publish.hold_when held this
+	// attempt's work, or "" when it never did. It is written once and kept
+	// through a publish-only retry: a released hold is still a held attempt.
+	PublishHold string     `json:"publish_hold,omitempty"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
 // PhaseResult is the outcome of one phase execution inside an attempt.
@@ -392,6 +399,10 @@ type CompleteAttemptRequest struct {
 	State      string `json:"state"`
 	Result     string `json:"result,omitempty"`
 	Error      string `json:"error,omitempty"`
+	// PublishHold reports that the definition's publish.hold_when held this
+	// attempt's work, and why. It is valid only with accepted_unpublished:
+	// held work is, by definition, accepted and not shipped.
+	PublishHold string `json:"publish_hold,omitempty"`
 }
 
 // Event is one trace event, dual-written to attempt-local JSONL and streamed

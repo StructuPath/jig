@@ -476,11 +476,8 @@ func (s *Store) JobDetail(ctx context.Context, jobID string) (JobDetail, error) 
 
 // JobAttempts lists every attempt of one job, oldest first.
 func (s *Store) JobAttempts(ctx context.Context, jobID string) ([]protocol.Attempt, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, job_id, worker_id, attempt_number, state, lease_expires_at,
-		       runtime_name, runtime_version, result, error, started_at, completed_at, created_at
-		FROM attempts WHERE job_id = ? ORDER BY attempt_number
-	`, jobID)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+attemptColumns+` FROM attempts WHERE job_id = ? ORDER BY attempt_number`, jobID)
 	if err != nil {
 		return nil, unavailable(err)
 	}

@@ -388,6 +388,12 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 		// through the lease, while git and the ledger always finish.
 		summary = worker.repairCI(context.WithoutCancel(ctx), r.gateway, r.options,
 			target, outcome.Continuation, summary, ci)
+		if summary.Code == ciRepairHeld {
+			// The first push was not held; this round's fix was. The attempt
+			// now contains work the definition wanted a person to see, and
+			// the ledger must say so even though the held fix was not pushed.
+			outcome.PublishHold = summary.Detail
+		}
 	}
 	return publishedOutcome(outcome, summary)
 }
@@ -1174,6 +1180,55 @@ func (w *Worker) RetryPublish(
 		}
 	}
 	return attempt, nil
+}
+
+// ---- operator publish requests ---------------------------------------------
+
+// servePublishRequests performs the publish-only retries an operator asked
+// for through the control plane, as this running worker. It is what lets a
+// held job be released without stopping the worker: the retry needs the
+// attempt's retained worktree and the data-directory lock, and this process
+// is the one that already has both.
+//
+// Each retry holds a capacity slot — a CI wait can last the definition's
+// whole timeout — and publishes with the gateway and options the worker's
+// own runner publishes with, so a release cannot differ from the original
+// attempt in author or base branch. A worker whose runner does not publish
+// serves no requests; they stay pending and visible.
+func (w *Worker) servePublishRequests(ctx context.Context, running *sync.WaitGroup) {
+	publisher, ok := w.config.Runner.(*PublishingRunner)
+	if !ok || w.activeCount() >= w.config.Capacity {
+		return
+	}
+	requests, err := w.client.PublishRequests(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.logger.Warn("publish_requests_failed", "error", err)
+		}
+		return
+	}
+	for _, request := range requests {
+		if !w.reserveActive(request.AttemptID) {
+			continue
+		}
+		running.Add(1)
+		go func(request protocol.PublishRequest) {
+			defer running.Done()
+			defer w.untrackActive(request.AttemptID)
+			attempt, err := w.RetryPublish(ctx, request.JobID, publisher.gateway, publisher.options)
+			if err != nil {
+				// A refused grant leaves the request pending, and the next
+				// tick asks again: the usual cause is an earlier retry whose
+				// lease has yet to expire.
+				if ctx.Err() == nil {
+					w.logger.Warn("publish_request_failed", "job_id", request.JobID, "error", err)
+				}
+				return
+			}
+			w.logger.Info("publish_request_served", "job_id", request.JobID,
+				"attempt_id", attempt.ID, "state", attempt.State)
+		}(request)
+	}
 }
 
 // ---- stray-branch reporting ------------------------------------------------
@@ -2016,6 +2071,14 @@ func (c *Client) AttemptCIRepairs(ctx context.Context, attemptID string) ([]prot
 
 // RetryPublish requests the publish-only retry of one accepted_unpublished
 // job (R14).
+// PublishRequests lists the operator publish requests this worker can serve.
+func (c *Client) PublishRequests(ctx context.Context) ([]protocol.PublishRequest, error) {
+	var requests []protocol.PublishRequest
+	err := c.call(ctx, http.MethodGet,
+		"/api/workers/"+url.PathEscape(c.workerID)+"/publish-requests", nil, &requests)
+	return requests, err
+}
+
 func (c *Client) RetryPublish(
 	ctx context.Context, jobID string, request protocol.PublishRetryRequest,
 ) (protocol.PublishRetry, error) {

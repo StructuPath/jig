@@ -43,6 +43,7 @@ function page(attemptID: string, events: TraceEvent[], after = 0): EventPage {
 
 /** requests records every URL the component fetched, in order. */
 let requests: string[] = [];
+let mutations: string[] = [];
 
 /**
  * mockAPI serves the read routes from a table of responses. Event routes take
@@ -54,12 +55,14 @@ function mockAPI(routes: {
   events?: Record<string, EventPage[]>;
   gates?: unknown;
   envelopes?: unknown;
+  fleet?: unknown;
 }) {
   const queues = routes.events ?? {};
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (input: string) => {
+    vi.fn(async (input: string, init?: RequestInit) => {
       requests.push(input);
+      if (init?.method && init.method !== "GET") mutations.push(`${init.method} ${input}`);
       const url = new URL(input, "http://127.0.0.1");
       const json = (body: unknown) =>
         new Response(JSON.stringify(body), {
@@ -76,6 +79,7 @@ function mockAPI(routes: {
       if (/\/gates$/.test(url.pathname)) return json(routes.gates ?? []);
       if (/\/envelopes$/.test(url.pathname)) return json(routes.envelopes ?? []);
       if (/^\/api\/jobs\//.test(url.pathname)) return json(routes.job ?? {});
+      if (url.pathname === "/api/workers") return json(routes.fleet ?? {});
       return json({});
     }),
   );
@@ -83,6 +87,7 @@ function mockAPI(routes: {
 
 beforeEach(() => {
   requests = [];
+  mutations = [];
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.setSystemTime(new Date(BASE + 60_000));
 });
@@ -422,5 +427,72 @@ describe("seq cursors", () => {
       [event(1, "log", 100), event(2, "log", 200)],
     );
     expect(merged.map((item) => item.seq)).toEqual([1, 2, 3]);
+  });
+});
+
+describe("finishing an unpublished job", () => {
+  const held = JSON.stringify({ publish: { state: "held", code: "publish_held" }, publish_hold: 'publish.hold_when "risk != low" held (risk = high)' });
+  const redCI = JSON.stringify({ publish: { state: "failed", code: "ci_failed" } });
+  const keptLocal = JSON.stringify({ publish: { state: "held" }, publish_hold: 'publish.hold_when "jig_ui_delivery != publish" held (jig_ui_delivery = local)' });
+  const empty = JSON.stringify({ publish: { state: "failed", code: "publish_empty_changeset" } });
+
+  function unpublished(result: string, job: Record<string, unknown> = {}) {
+    return {
+      job: { id: "job-1", run_id: "run-1", repository: "example/repo", base_sha: "abcdef", state: "accepted_unpublished", cancellation_requested: false, ...job },
+      run_id: "run-1", publish: [],
+      attempts: [attempt({ state: "accepted_unpublished", worker_id: "worker-abcdef123456", result, completed_at: at(1000) })],
+    };
+  }
+
+  it("releases a held job only after the operator confirms what will happen", async () => {
+    mockAPI({ job: unpublished(held) });
+    render(<JobPanel jobID="job-1" nowMs={BASE} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Release hold…" }));
+    expect(mutations).toEqual([]);
+    expect(screen.getByText(/Release hold on example\/repo pushes the held branch and opens a pull request\. Jig does not merge it\./)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep as is" }));
+    expect(mutations).toEqual([]);
+    expect(screen.queryByRole("button", { name: "Confirm release hold" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Release hold…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm release hold" }));
+    await waitFor(() => expect(mutations).toEqual(["POST /api/jobs/job-1/publish-request"]));
+  });
+
+  it("offers a publication retry, not a release, when publish failed without a hold", async () => {
+    mockAPI({ job: unpublished(redCI) });
+    render(<JobPanel jobID="job-1" nowMs={BASE} />);
+    expect(await screen.findByRole("button", { name: "Retry publication…" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Release hold…" })).toBeNull();
+  });
+
+  it.each([["kept-local work", keptLocal], ["an empty changeset", empty]])("offers nothing for %s, where a retry cannot help", async (_, result) => {
+    mockAPI({ job: unpublished(result) });
+    render(<JobPanel jobID="job-1" nowMs={BASE} />);
+    await screen.findByText("example/repo");
+    expect(screen.queryByRole("button", { name: /Release hold|Retry publication/ })).toBeNull();
+  });
+
+  it("shows a pending request with its worker's standing, and lets the operator withdraw it", async () => {
+    mockAPI({
+      job: unpublished(held, { publish_requested_at: at(2000) }),
+      fleet: { workers: [{ id: "worker-abcdef123456", live: false }] },
+    });
+    render(<JobPanel jobID="job-1" nowMs={BASE} />);
+    expect(await screen.findByText(/Publish requested · waiting for worker .*That worker is not running\./)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Release hold…" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Withdraw request" }));
+    await waitFor(() => expect(mutations).toEqual(["DELETE /api/jobs/job-1/publish-request"]));
+  });
+
+  it("says a live worker will take the request", async () => {
+    mockAPI({
+      job: unpublished(held, { publish_requested_at: at(2000) }),
+      fleet: { workers: [{ id: "worker-abcdef123456", live: true }] },
+    });
+    render(<JobPanel jobID="job-1" nowMs={BASE} />);
+    expect(await screen.findByText(/It is running and takes the request/)).toBeVisible();
   });
 });
