@@ -496,6 +496,18 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 		return protocol.Attempt{}, &ServiceError{Code: "result_too_large",
 			Message: "result or error exceeds its storage limit", Status: 413}
 	}
+	if len(input.PublishHold) > protocol.MaxPublishDiagnosticBytes {
+		return protocol.Attempt{}, &ServiceError{Code: "result_too_large",
+			Message: "publish_hold exceeds its storage limit", Status: 413}
+	}
+	if input.PublishHold != "" && input.State != protocol.AttemptAcceptedUnpublished {
+		// A hold is judged after acceptance and stops the publish, so the
+		// only state it can travel with is accepted_unpublished. Anything
+		// else is a worker contradicting itself, and the column this feeds
+		// decides what jig may later do with the work.
+		return protocol.Attempt{}, invalid("invalid_publish_hold",
+			"publish_hold is valid only with state accepted_unpublished")
+	}
 	if err := validateLeaseToken(input.LeaseToken); err != nil {
 		return protocol.Attempt{}, err
 	}
@@ -574,9 +586,13 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE attempts SET state = ?, result = ?, error = ?, completed_at = ?, publish_retry = 0
+		UPDATE attempts SET state = ?, result = ?, error = ?, completed_at = ?, publish_retry = 0,
+		    publish_hold = COALESCE(publish_hold, ?)
 		WHERE id = ? AND state IN ('preparing', 'running')
-	`, input.State, nullString(input.Result), nullString(input.Error), now, attemptID); err != nil {
+	`, input.State, nullString(input.Result), nullString(input.Error), now,
+		// Written once and never cleared: the first reason stands, and a
+		// publish-only retry's completion, which carries none, leaves it.
+		nullString(input.PublishHold), attemptID); err != nil {
 		return protocol.Attempt{}, unavailable(err)
 	}
 	// Attempt terminal states map one-to-one onto job states (R12's job half).
@@ -716,16 +732,16 @@ func (s *Store) CancelJob(ctx context.Context, jobID string) (protocol.Job, erro
 type rowScanner interface{ Scan(dest ...any) error }
 
 const attemptColumns = `id, job_id, worker_id, attempt_number, state, lease_expires_at,
-	runtime_name, runtime_version, result, error, started_at, completed_at, created_at`
+	runtime_name, runtime_version, result, error, started_at, completed_at, created_at, publish_hold`
 
 func scanAttempt(row rowScanner) (protocol.Attempt, error) {
 	var value protocol.Attempt
-	var workerID, runtimeName, runtimeVersion, result, errorText sql.NullString
+	var workerID, runtimeName, runtimeVersion, result, errorText, publishHold sql.NullString
 	var leaseExpires, startedAt, completedAt sql.NullInt64
 	var createdAt int64
 	err := row.Scan(&value.ID, &value.JobID, &workerID, &value.AttemptNumber, &value.State,
 		&leaseExpires, &runtimeName, &runtimeVersion, &result, &errorText,
-		&startedAt, &completedAt, &createdAt)
+		&startedAt, &completedAt, &createdAt, &publishHold)
 	if err != nil {
 		return value, err
 	}
@@ -735,6 +751,7 @@ func scanAttempt(row rowScanner) (protocol.Attempt, error) {
 	value.RuntimeVersion = runtimeVersion.String
 	value.Result = result.String
 	value.Error = errorText.String
+	value.PublishHold = publishHold.String
 	value.StartedAt = timePointer(startedAt)
 	value.CompletedAt = timePointer(completedAt)
 	value.CreatedAt = fromMillis(createdAt)

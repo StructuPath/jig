@@ -392,3 +392,30 @@ func TestAnInterruptedDirectRunPersistsTheEventsItEmitsWhileUnwinding(t *testing
 		}
 	}
 }
+
+// A direct run never publishes, but its definition can still hold: the
+// engine's reason is recorded on the attempt exactly as the worker path
+// records it. A hold the executor reported with any other state is dropped
+// rather than sent, because the store refuses that pair and the run would
+// lose its verdict.
+func TestADirectRunRecordsItsPublishHold(t *testing.T) {
+	const reason = `publish.hold_when "risk != low" held (risk = high)`
+	for _, tc := range []struct{ name, state, want string }{
+		{"held", protocol.AttemptAcceptedUnpublished, reason},
+		{"not accepted", protocol.AttemptFailed, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			execute := func(context.Context, DirectExecution) DirectOutcome {
+				return DirectOutcome{State: tc.state, Result: `{"publish":"held"}`, PublishHold: reason}
+			}
+			result, err := DirectRun(context.Background(), directConfig(t.TempDir(), directRepoPath(t), execute))
+			if err != nil {
+				t.Fatalf("direct run: %v", err)
+			}
+			if result.Attempt.State != tc.state || result.Attempt.PublishHold != tc.want {
+				t.Fatalf("attempt = %s with publish_hold %q, want %s with %q",
+					result.Attempt.State, result.Attempt.PublishHold, tc.state, tc.want)
+			}
+		})
+	}
+}

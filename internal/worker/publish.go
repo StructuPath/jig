@@ -388,6 +388,12 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 		// through the lease, while git and the ledger always finish.
 		summary = worker.repairCI(context.WithoutCancel(ctx), r.gateway, r.options,
 			target, outcome.Continuation, summary, ci)
+		if summary.Code == ciRepairHeld {
+			// The first push was not held; this round's fix was. The attempt
+			// now contains work the definition wanted a person to see, and
+			// the ledger must say so even though the held fix was not pushed.
+			outcome.PublishHold = summary.Detail
+		}
 	}
 	return publishedOutcome(outcome, summary)
 }

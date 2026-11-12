@@ -1020,3 +1020,50 @@ func TestAPublishHoldEndsAcceptedUnpublishedWithoutTouchingTheRemote(t *testing.
 		t.Fatal("a held publish must not create or adopt a pull request")
 	}
 }
+
+// The hold reaches the control plane as a field of the completion, not only
+// as text inside the result: the attempt records it, and the publish-only
+// retry that releases the hold publishes the work without erasing the fact
+// that it was held.
+func TestAPublishHoldIsRecordedOnTheAttemptAndKeptThroughItsRelease(t *testing.T) {
+	h := newHarness(t)
+	originDir, head, identity := newOriginRepo(t)
+	h.seedRun("run-1", protocol.RunTarget{Repository: identity, BaseSHA: head})
+	job := h.enqueue("run-1", identity)
+	const reason = `publish.hold_when "risk != low" held (risk = high)`
+
+	write := writeAndDeclare(t, map[string]string{"src/auth.txt": "held work\n"})
+	inner := RunnerFunc(func(ctx context.Context, attempt *PreparedAttempt) Outcome {
+		outcome := write.Run(ctx, attempt)
+		outcome.PublishHold = reason
+		return outcome
+	})
+	gateway := newFakeGateway()
+	w, _ := newPublishingWorker(t, h, filepath.Join(t.TempDir(), "worker"), inner, gateway)
+
+	attempt, err := w.ClaimOnce(context.Background())
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if attempt == nil || attempt.State != protocol.AttemptAcceptedUnpublished || attempt.PublishHold != reason {
+		t.Fatalf("attempt = %+v, want accepted_unpublished with the hold recorded", attempt)
+	}
+	branch := protocol.PublishBranch(job.ID, 1)
+	if _, pushed := remoteBranches(t, originDir)[branch]; pushed {
+		t.Fatal("a held attempt pushed its branch")
+	}
+
+	released, err := w.RetryPublish(context.Background(), job.ID, gateway, PublishOptions{
+		CommitAuthorName: "jig-test", CommitAuthorEmail: "jig@test",
+	})
+	if err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if released.State != protocol.AttemptAccepted || released.PublishHold != reason {
+		t.Fatalf("released attempt = %s with publish_hold %q, want accepted and still held",
+			released.State, released.PublishHold)
+	}
+	if _, pushed := remoteBranches(t, originDir)[branch]; !pushed {
+		t.Fatal("the release did not push the held branch")
+	}
+}

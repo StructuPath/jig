@@ -79,6 +79,8 @@ type DirectOutcome struct {
 	State  string
 	Result string
 	Error  string
+	// PublishHold is the engine's hold reason, recorded on the attempt.
+	PublishHold string
 }
 
 // DirectExecution is everything the injected executor needs to run the
@@ -349,10 +351,11 @@ func DirectRun(ctx context.Context, config DirectRunConfig) (DirectRunResult, er
 	}
 
 	attempt, err := store.CompleteAttempt(completionCtx, attemptID, protocol.CompleteAttemptRequest{
-		LeaseToken: token,
-		State:      outcome.State,
-		Result:     outcome.Result,
-		Error:      outcome.Error,
+		LeaseToken:  token,
+		State:       outcome.State,
+		Result:      outcome.Result,
+		Error:       outcome.Error,
+		PublishHold: directPublishHold(outcome),
 	})
 	if err != nil {
 		return zero, fmt.Errorf("record outcome (engine said %s): %w", outcome.State, err)
@@ -724,6 +727,20 @@ func (s *Store) loseAbandonedAttempt(ctx context.Context, attemptID, jobID, reas
 		return unavailable(err)
 	}
 	return nil
+}
+
+// directPublishHold is the hold reason a direct run reports, bounded as the
+// worker path bounds it. An interrupted run may have had its state rewritten
+// to cancelled above, and a hold is only ever reported with the state it was
+// judged under.
+func directPublishHold(outcome DirectOutcome) string {
+	if outcome.State != protocol.AttemptAcceptedUnpublished {
+		return ""
+	}
+	if len(outcome.PublishHold) > protocol.MaxPublishDiagnosticBytes {
+		return outcome.PublishHold[:protocol.MaxPublishDiagnosticBytes]
+	}
+	return outcome.PublishHold
 }
 
 func boundedError(value string) string {

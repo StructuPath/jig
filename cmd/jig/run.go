@@ -223,9 +223,10 @@ func engineExecutor(
 			outcome.Continuation.Release()
 		}
 		return controlplane.DirectOutcome{
-			State:  outcome.State,
-			Result: outcome.Result,
-			Error:  outcome.Error,
+			State:       outcome.State,
+			Result:      outcome.Result,
+			Error:       outcome.Error,
+			PublishHold: outcome.PublishHold,
 		}
 	}
 }

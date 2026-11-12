@@ -6,6 +6,7 @@ package controlplane
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -425,5 +426,130 @@ func TestPublishRetryCarriesTheRunSnapshot(t *testing.T) {
 	}
 	if retry.Snapshot != ciFixtureSnapshot {
 		t.Fatalf("retry snapshot = %q, want the run's frozen definition", retry.Snapshot)
+	}
+}
+
+// A publish hold is a fact on the attempt, not a string inside a result the
+// control plane never reads: written once when the attempt completes held,
+// and kept through the publish-only retry that releases it. What jig may
+// later do with the work is decided from this column, so a released hold
+// must still read as held.
+func TestAPublishHoldIsRecordedOnceAndSurvivesItsRelease(t *testing.T) {
+	store, _ := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+	claim := claimAndStart(t, store, "run-1", repoA)
+	ctx := context.Background()
+	const reason = `publish.hold_when "risk != low" held (risk = high)`
+
+	if started, err := store.Attempt(ctx, claim.Attempt.ID); err != nil || started.PublishHold != "" {
+		t.Fatalf("a running attempt reads publish_hold %q (err=%v), want never held", started.PublishHold, err)
+	}
+	held, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAcceptedUnpublished, PublishHold: reason,
+	})
+	if err != nil {
+		t.Fatalf("complete held: %v", err)
+	}
+	if held.PublishHold != reason {
+		t.Fatalf("publish_hold = %q, want the reason", held.PublishHold)
+	}
+
+	// The release: the same attempt is re-leased, publishes, and completes
+	// accepted. Its completion carries no hold, and the first reason stands.
+	retry, err := store.RetryPublish(ctx, claim.Job.ID,
+		protocol.PublishRetryRequest{WorkerID: workerA, LeaseToken: tokenB})
+	if err != nil {
+		t.Fatalf("publish retry: %v", err)
+	}
+	if retry.Attempt.PublishHold != reason {
+		t.Fatalf("the re-leased attempt reads publish_hold %q, want the reason", retry.Attempt.PublishHold)
+	}
+	proveThePublish(t, store, claim, tokenB)
+	released, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenB, State: protocol.AttemptAccepted,
+	})
+	if err != nil {
+		t.Fatalf("complete released: %v", err)
+	}
+	if released.State != protocol.AttemptAccepted || released.PublishHold != reason {
+		t.Fatalf("released attempt = %s with publish_hold %q, want accepted and still held",
+			released.State, released.PublishHold)
+	}
+}
+
+// A second hold on the same attempt — a retry that somehow reported one —
+// never rewrites the first: the column answers "was this ever held, and why
+// first", and the first reason is the one a person released.
+func TestTheFirstPublishHoldReasonStands(t *testing.T) {
+	store, _ := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+	claim := claimAndStart(t, store, "run-1", repoA)
+	ctx := context.Background()
+
+	if _, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAcceptedUnpublished, PublishHold: "first",
+	}); err != nil {
+		t.Fatalf("complete held: %v", err)
+	}
+	if _, err := store.RetryPublish(ctx, claim.Job.ID,
+		protocol.PublishRetryRequest{WorkerID: workerA, LeaseToken: tokenB}); err != nil {
+		t.Fatalf("publish retry: %v", err)
+	}
+	again, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenB, State: protocol.AttemptAcceptedUnpublished, PublishHold: "second",
+	})
+	if err != nil {
+		t.Fatalf("complete again: %v", err)
+	}
+	if again.PublishHold != "first" {
+		t.Fatalf("publish_hold = %q, want the first reason", again.PublishHold)
+	}
+}
+
+// A hold travels only with accepted_unpublished. Held work is accepted and
+// not shipped; a hold on anything else is a worker contradicting itself, and
+// the completion is refused whole rather than stored without the hold.
+func TestAPublishHoldIsRefusedWithAnyOtherState(t *testing.T) {
+	for _, state := range []string{protocol.AttemptAccepted, protocol.AttemptFailed, protocol.AttemptCancelled} {
+		t.Run(state, func(t *testing.T) {
+			store, _ := newTestStore(t)
+			registerTestWorker(t, store, 1)
+			seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+			claim := claimAndStart(t, store, "run-1", repoA)
+			ctx := context.Background()
+			proveThePublish(t, store, claim, tokenA)
+
+			_, err := store.CompleteAttempt(ctx, claim.Attempt.ID, protocol.CompleteAttemptRequest{
+				LeaseToken: tokenA, State: state, PublishHold: "risk = high",
+			})
+			if err == nil || serviceCode(t, err) != "invalid_publish_hold" {
+				t.Fatalf("hold with %s: err=%v, want invalid_publish_hold", state, err)
+			}
+			attempt, err := store.Attempt(ctx, claim.Attempt.ID)
+			if err != nil {
+				t.Fatalf("read attempt: %v", err)
+			}
+			if attempt.State != protocol.AttemptRunning || attempt.PublishHold != "" {
+				t.Fatalf("the refused completion left state %q and publish_hold %q",
+					attempt.State, attempt.PublishHold)
+			}
+		})
+	}
+}
+
+func TestAnOversizedPublishHoldIsRefused(t *testing.T) {
+	store, _ := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	seedRun(t, store, "run-1", protocol.RunTarget{Repository: repoA, BaseSHA: shaA})
+	claim := claimAndStart(t, store, "run-1", repoA)
+
+	_, err := store.CompleteAttempt(context.Background(), claim.Attempt.ID, protocol.CompleteAttemptRequest{
+		LeaseToken: tokenA, State: protocol.AttemptAcceptedUnpublished,
+		PublishHold: strings.Repeat("x", protocol.MaxPublishDiagnosticBytes+1),
+	})
+	if err == nil || serviceCode(t, err) != "result_too_large" {
+		t.Fatalf("oversized hold: err=%v, want result_too_large", err)
 	}
 }
