@@ -287,7 +287,7 @@ func TestReportCountsEveryOutcomeExactlyWithinTheWindow(t *testing.T) {
 	want := Report{
 		Since: since, Until: until, ObservedAt: store.now().UTC(),
 		Jobs:    ReportJobs{Total: 14, Accepted: 6, AcceptedUnpublished: 6, Failed: 1, Cancelled: 1},
-		Accepts: ReportAccepts{Clean: 5, CIGreen: 4, NoCIWait: 1, PersonFixed: 1},
+		Accepts: ReportAccepts{Clean: 5, CIGreen: 4, NoCIWait: 1, PersonFixed: 1, MergedRate: floatPointer(0)},
 		Publish: ReportPublish{
 			Eligible: 12, Published: 6, Held: 2, NotAttempted: 1, Failed: 2, Unreadable: 1,
 			FailedCodes: map[string]int{"ci_failed": 1, "ci_timeout": 1},
@@ -329,6 +329,37 @@ func TestReportCountsEveryOutcomeExactlyWithinTheWindow(t *testing.T) {
 	}
 }
 
+func TestReportKeepsGreenRepairSuccessfulWhenMergeIsBlocked(t *testing.T) {
+	for _, retried := range []bool{false, true} {
+		f, clock := newReportFixture(t)
+		state := protocol.JobAcceptedUnpublished
+		blocked := summary("failed", "merge_blocked", map[string]any{
+			"performed_steps": []string{"push", "pull_request", "proof", "ci"},
+			"ci_repairs":      []map[string]any{{"round": 1, "outcome": "pushed"}},
+		})
+		body := result(t, blocked)
+		if retried {
+			state = protocol.JobAccepted
+			body = result(t, summary("published", "", nil), blocked)
+		}
+		f.job("merge-blocked", reportRunCI, state, clock.Now())
+		a := f.attempt("merge-blocked", 1, state, body)
+		f.step(a, protocol.PublishStepProof, shaA)
+		f.rounds(a, shaA, shaB)
+		f.step(a, protocol.PublishStepCI, shaB)
+		if retried {
+			f.step(a, protocol.PublishStepMerge, shaC)
+		}
+		r := mustReport(t, f.store, clock.Now().Add(-time.Hour), clock.Now().Add(time.Hour))
+		if r.CI.Repair.Succeeded != 1 || r.CI.Repair.Entered != 1 || len(r.CI.Repair.StopCodes) != 0 {
+			t.Fatalf("retried=%t repair=%+v", retried, r.CI.Repair)
+		}
+		if !retried && r.Publish.FailedCodes["merge_blocked"] != 1 {
+			t.Fatalf("lost merge failure: %+v", r.Publish)
+		}
+	}
+}
+
 // An accept the ledger cannot vouch for is never clean: a CI-waiting accept
 // with no ci record, and one whose frozen definition no longer parses.
 func TestReportNeverCountsAnUnprovableAcceptAsClean(t *testing.T) {
@@ -346,7 +377,7 @@ func TestReportNeverCountsAnUnprovableAcceptAsClean(t *testing.T) {
 	f.step(broken, protocol.PublishStepProof, shaA)
 
 	got := mustReport(t, f.store, now.Add(-time.Hour), now.Add(time.Hour))
-	if got.Accepts != (ReportAccepts{Unverified: 2}) {
+	if !reflect.DeepEqual(got.Accepts, ReportAccepts{Unverified: 2, MergedRate: floatPointer(0)}) {
 		t.Fatalf("accepts = %+v, want 2 unverified and nothing clean", got.Accepts)
 	}
 	if got.Spend.PerCleanAcceptUSD != nil {

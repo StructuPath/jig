@@ -174,8 +174,18 @@ var envelopeBaseFields = []string{"status", "summary", "artifacts", "notes_for_n
 // for a person; everything else ships. CI, when it waits, makes a green CI
 // run on the pull request's head part of what `accepted` means.
 type PublishSpec struct {
-	HoldWhen string  `yaml:"hold_when"`
-	CI       *CISpec `yaml:"ci"`
+	HoldWhen string     `yaml:"hold_when"`
+	CI       *CISpec    `yaml:"ci"`
+	Merge    *MergeSpec `yaml:"merge"`
+}
+
+// MergeSpec opts never-held work into exact-head merge after CI (merge plan R1).
+type MergeSpec struct {
+	Method string `yaml:"method"`
+}
+
+func (spec *DefinitionSpec) Merges() bool {
+	return spec.Publish != nil && spec.Publish.Merge != nil
 }
 
 // CISpec opts a definition into waiting for the pull request's CI after
@@ -545,8 +555,18 @@ func (spec *DefinitionSpec) validatePublish(phases map[string]PhaseSpec) error {
 		return nil
 	}
 	hold := strings.TrimSpace(spec.Publish.HoldWhen)
-	if hold == "" && spec.Publish.CI == nil {
+	if hold == "" && spec.Publish.CI == nil && spec.Publish.Merge == nil {
 		return fmt.Errorf("publish: declare hold_when, ci, or both")
+	}
+	if spec.Merges() {
+		if !spec.WaitsForCI() {
+			return fmt.Errorf("publish: merge requires ci.wait: true")
+		}
+		switch spec.Publish.Merge.Method {
+		case "squash", "merge", "rebase":
+		default:
+			return fmt.Errorf("publish: merge: method must be squash, merge, or rebase")
+		}
 	}
 	if hold != "" {
 		if _, err := ParsePredicate(spec.Publish.HoldWhen); err != nil {

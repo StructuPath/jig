@@ -54,6 +54,7 @@ Flags:
                          (default "jig@localhost")
   --base-branch          pull-request base branch; empty resolves the
                          repository's default branch
+  --allow-merge          allow merge on retry (the owning worker must also have opted in)
 
 Exit codes:
   0  published: the attempt is accepted
@@ -80,6 +81,7 @@ func workerPublishRetryCommand(ctx context.Context, args []string, stdout, stder
 	authorName := flags.String("commit-author-name", "jig", "publish commit author name")
 	authorEmail := flags.String("commit-author-email", "jig@localhost", "publish commit author email")
 	baseBranch := flags.String("base-branch", "", "pull-request base branch")
+	allowMerge := flags.Bool("allow-merge", false, "allow exact-head merge on retry")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -104,6 +106,7 @@ func workerPublishRetryCommand(ctx context.Context, args []string, stdout, stder
 	defer lock.release()
 
 	host, err := worker.New(worker.Config{
+		AllowMerge:    *allowMerge,
 		ServerURL:     *serverURL,
 		DataDir:       *dataDir,
 		WorkerVersion: version,

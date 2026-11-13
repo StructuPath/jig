@@ -23,11 +23,12 @@ const (
 	// runs only for definitions whose publish.ci waits, and its remote_ref is
 	// the head CI passed on — which may be a later commit than proof's when a
 	// person pushed a fix before the publish retry.
-	PublishStepCI = "ci"
+	PublishStepCI    = "ci"
+	PublishStepMerge = "merge"
 )
 
 // PublishSteps is the pipeline in execution order.
-var PublishSteps = []string{PublishStepPush, PublishStepPullRequest, PublishStepProof, PublishStepCI}
+var PublishSteps = []string{PublishStepPush, PublishStepPullRequest, PublishStepProof, PublishStepCI, PublishStepMerge}
 
 // PublishStepPrerequisites names the steps that must already be recorded
 // before a step may be authorized or recorded. It is enforced
@@ -38,6 +39,7 @@ var PublishStepPrerequisites = map[string][]string{
 	PublishStepPullRequest: {PublishStepPush},
 	PublishStepProof:       {PublishStepPush, PublishStepPullRequest},
 	PublishStepCI:          {PublishStepPush, PublishStepPullRequest, PublishStepProof},
+	PublishStepMerge:       {PublishStepPush, PublishStepPullRequest, PublishStepProof, PublishStepCI},
 }
 
 // ValidPublishStep reports whether value names a publish step.
@@ -148,6 +150,8 @@ type PublishAuthorizationRequest struct {
 // when the step is already recorded — the worker must then skip the side
 // effect entirely, which is what makes re-entry idempotent.
 type PublishAuthorization struct {
+	// MergeHead is the ledger's CI-green, jig-pushed head (merge plan R3).
+	MergeHead     string         `json:"merge_head,omitempty"`
 	AttemptID     string         `json:"attempt_id"`
 	JobID         string         `json:"job_id"`
 	AttemptNumber int            `json:"attempt_number"`

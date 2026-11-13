@@ -514,3 +514,14 @@ preflight step above.
   cumulative per-session `total_cost_usd` once per send, so the gate's
   $1.89–$5.03 per run overstate resumed sessions. Do not compare a trial's
   spend per clean accept to them as if they were exact.
+
+## Optional automatic-merge trial
+
+Keep merge disabled on real repositories until the scratch-repository gate
+in `docs/plans/2026-11-12-001-feat-auto-merge-and-hold-release-plan.md` passes.
+Use `publish.merge: {method: squash}` together with `jig worker --allow-merge`.
+Record the merge commit, CI head, publish records, and `jig report` for each
+case: clean pass, held release, CI repair, conflict, foreign head, and a
+worker without merge consent. Held releases must never have a merge record.
+Merge refusals stay unpublished with a code; do not bypass protection or
+queue a future merge. Post-merge checks and automatic revert are out of scope.

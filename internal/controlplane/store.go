@@ -291,17 +291,18 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO workers(id, name, worker_version, capacity, env_names_json, runtimes_json, registered_at, last_heartbeat)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO workers(id, name, worker_version, capacity, env_names_json, runtimes_json, registered_at, last_heartbeat, allow_merge)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			worker_version = excluded.worker_version,
 			capacity = excluded.capacity,
 			env_names_json = excluded.env_names_json,
 			runtimes_json = excluded.runtimes_json,
+			allow_merge = excluded.allow_merge,
 			last_heartbeat = excluded.last_heartbeat
 	`, workerID, input.Name, input.WorkerVersion, input.Capacity,
-		string(envJSON), string(runtimesJSON), now, now); err != nil {
+		string(envJSON), string(runtimesJSON), now, now, input.AllowMerge); err != nil {
 		return protocol.Worker{}, unavailable(err)
 	}
 	if _, err := s.applyRetainedWorktrees(ctx, tx, workerID, input.RetainedWorktrees); err != nil {
@@ -334,7 +335,7 @@ func normalizeEnvNames(names []string) []string {
 // worker is.
 const workerSelect = `
 	SELECT id, name, worker_version, capacity, env_names_json, runtimes_json,
-	       registered_at, last_heartbeat,
+	       registered_at, last_heartbeat, allow_merge,
 	       (SELECT COUNT(*) FROM attempts
 	        WHERE worker_id = workers.id AND state IN ('preparing', 'running'))
 	FROM workers`
@@ -355,7 +356,7 @@ func scanWorker(row rowScanner) (protocol.Worker, error) {
 	var envJSON, runtimesJSON string
 	var registeredAt, lastHeartbeat int64
 	err := row.Scan(&value.ID, &value.Name, &value.WorkerVersion, &value.Capacity,
-		&envJSON, &runtimesJSON, &registeredAt, &lastHeartbeat, &value.ActiveCount)
+		&envJSON, &runtimesJSON, &registeredAt, &lastHeartbeat, &value.AllowMerge, &value.ActiveCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return value, err
 	}
@@ -582,6 +583,17 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 			}
 			if err := requireCIGreenPastRepairs(ctx, tx, attemptID); err != nil {
 				return protocol.Attempt{}, err
+			}
+		}
+		if spec.Merges() {
+			var missing bool
+			if err := tx.QueryRowContext(ctx, `SELECT publish_hold IS NULL AND NOT EXISTS
+			    (SELECT 1 FROM publish_records WHERE attempt_id = attempts.id AND step = 'merge')
+			    FROM attempts WHERE id = ?`, attemptID).Scan(&missing); err != nil {
+				return protocol.Attempt{}, unavailable(err)
+			}
+			if missing {
+				return protocol.Attempt{}, conflict("publish_merge_required", "this never-held attempt requires a recorded merge step")
 			}
 		}
 	}

@@ -1,3 +1,12 @@
+# Automatic merge is OFF. To opt in, uncomment publish.merge and start the
+# worker with --allow-merge. After tests and reviews, the risk classifier is
+# the final hold gate before the default branch: sensitive paths (auth,
+# secrets, schemas, deploy/infra, .github, dependencies, check config), net
+# test-line removal, or more than 400 changed lines are high risk. Tune the
+# classifier for your repository. A wrong low-risk change can still pass;
+# there is no post-merge verification or automatic revert. Ever-held work
+# never auto-merges, even after release. Prove the flow on a scratch repo.
+#
 # factory-parallel.yaml — factory.yaml with its reviewer panel run in
 # parallel. Everything but the name and the `parallel:` line after `phases`
 # is the stock factory (a test holds the two in step), and the notes after
@@ -474,6 +483,7 @@ phases:
 parallel: [review-correctness, review-security, review-maintainability]
 acceptance: [all_phases_passed, verdict_consistent, diff_matches_claims]
 publish:
+  # merge: {method: squash}
   hold_when: "risk != low"
   ci:
     wait: true

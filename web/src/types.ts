@@ -126,6 +126,7 @@ export interface Station {
 
 // Delivery is the frozen publish policy the job runs under.
 export interface Delivery {
+	merge_method?: string;
   hold_when?: string;
   ci_wait: boolean;
 }
@@ -141,6 +142,7 @@ export interface Report {
 }
 
 export interface QueueEntry {
+	requires_merge?: boolean;
   job_id: string;
   run_id: string;
   definition?: string;

@@ -65,4 +65,11 @@ describe("the publish action", () => {
     expect(publishAction("accepted_unpublished", undefined)).toBeNull();
     expect(publishAction("accepted_unpublished", attempt({ state: "running" }))).toBeNull();
   });
+
+  it("states that retry can merge only never-held work under a merge policy", () => {
+    const failed = unpublished(JSON.stringify({ publish: { state: "failed", code: "merge_blocked" } }));
+    const delivery = { ci_wait: true, merge_method: "squash" };
+    expect(publishAction("accepted_unpublished", failed, delivery)?.consequence).toContain("may merge");
+    expect(publishAction("accepted_unpublished", { ...failed, publish_hold: "risk" }, delivery)?.consequence).not.toContain("may merge");
+  });
 });

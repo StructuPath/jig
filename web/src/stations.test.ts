@@ -38,6 +38,17 @@ function fold(a: Attempt, events: TraceEvent[], publish: PublishRecord[] = [], d
 const states = (views: { name: string; state: string }[]) => Object.fromEntries(views.map((view) => [view.name, view.state]));
 
 describe("buildStations", () => {
+  it("shows merged, blocked, and held-release delivery without calling a hold merged", () => {
+    const delivery = { ...factory, merge_method: "squash" };
+    const records: PublishRecord[] = ["proof", "ci"].map((step) => ({
+      attempt_id: "attempt-1", job_id: "job-1", attempt_number: 1, step,
+      branch: "jig/job-1/1", remote_ref: "abc", completed_at: at(100),
+    }));
+    const merged = { ...records[0], step: "merge", completed_at: at(110) };
+    expect(fold(attempt({ state: "accepted" }), [], [...records, merged], delivery).at(-1)).toMatchObject({ state: "pass", note: "merged", durationMs: 10_000 });
+    expect(fold(attempt({ state: "accepted_unpublished", result: JSON.stringify({ publish: { state: "failed", code: "merge_blocked" } }) }), [], records, delivery).at(-1)).toMatchObject({ state: "bad", note: "merge_blocked" });
+    expect(fold(attempt({ state: "accepted", publish_hold: "risk" }), [], records, delivery).at(-1)).toMatchObject({ state: "skip", note: "human merge required" });
+  });
   it("shows the whole chain while the second station is still running", () => {
     const events = [...phase("plan", 0, 12), { seq: 125, type: "phase_start", phase: "build", started_at: at(12) }];
     const views = fold(attempt(), events, [], factory, BASE + 60_000);

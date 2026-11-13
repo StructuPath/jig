@@ -373,3 +373,7 @@ func sameJSON(t *testing.T, a, b json.RawMessage) bool {
 	}
 	return reflect.DeepEqual(left, right)
 }
+
+func (g *e2eGateway) MergePullRequest(context.Context, string, string, string, string) (string, error) {
+	panic("unexpected merge")
+}

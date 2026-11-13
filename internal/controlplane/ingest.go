@@ -389,8 +389,9 @@ type Station struct {
 
 // Delivery is the publish policy a job runs under.
 type Delivery struct {
-	HoldWhen string `json:"hold_when,omitempty"`
-	CIWait   bool   `json:"ci_wait"`
+	MergeMethod string `json:"merge_method,omitempty"`
+	HoldWhen    string `json:"hold_when,omitempty"`
+	CIWait      bool   `json:"ci_wait"`
 }
 
 // stationsFromSnapshot reads the chain and publish policy out of a frozen
@@ -419,6 +420,9 @@ func stationsFromSnapshot(snapshot string) ([]Station, *Delivery) {
 	}
 	delivery := &Delivery{}
 	if spec.Publish != nil {
+		if spec.Merges() {
+			delivery.MergeMethod = spec.Publish.Merge.Method
+		}
 		delivery.HoldWhen = spec.Publish.HoldWhen
 		delivery.CIWait = spec.Publish.CI != nil && spec.Publish.CI.Wait
 	}
@@ -499,15 +503,16 @@ func (s *Store) JobAttempts(ctx context.Context, jobID string) ([]protocol.Attem
 // QueueEntry is one row of the work queue: the job, where it came from, and
 // the attempt currently holding it (nil while queued).
 type QueueEntry struct {
-	JobID      string            `json:"job_id"`
-	RunID      string            `json:"run_id"`
-	Definition string            `json:"definition,omitempty"`
-	Repository string            `json:"repository"`
-	BaseSHA    string            `json:"base_sha"`
-	State      string            `json:"state"`
-	Position   int               `json:"position,omitempty"`
-	Attempt    *protocol.Attempt `json:"attempt,omitempty"`
-	EnqueuedAt time.Time         `json:"enqueued_at"`
+	RequiresMerge bool              `json:"requires_merge,omitempty"`
+	JobID         string            `json:"job_id"`
+	RunID         string            `json:"run_id"`
+	Definition    string            `json:"definition,omitempty"`
+	Repository    string            `json:"repository"`
+	BaseSHA       string            `json:"base_sha"`
+	State         string            `json:"state"`
+	Position      int               `json:"position,omitempty"`
+	Attempt       *protocol.Attempt `json:"attempt,omitempty"`
+	EnqueuedAt    time.Time         `json:"enqueued_at"`
 }
 
 // QueueView is the work queue with its depth — the number every operator
@@ -525,7 +530,7 @@ type QueueView struct {
 func (s *Store) Queue(ctx context.Context) (QueueView, error) {
 	view := QueueView{Entries: []QueueEntry{}, ObservedAt: s.now().UTC()}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT j.id, j.run_id, j.repository, j.base_sha, j.state, j.created_at, COALESCE(d.name, '')
+		SELECT j.id, j.run_id, j.repository, j.base_sha, j.state, j.created_at, COALESCE(d.name, ''), r.snapshot
 		FROM jobs j
 		JOIN runs r ON r.id = j.run_id
 		LEFT JOIN definitions d ON d.id = r.definition_id
@@ -539,11 +544,15 @@ func (s *Store) Queue(ctx context.Context) (QueueView, error) {
 	for rows.Next() {
 		var entry QueueEntry
 		var created int64
+		var snapshot string
 		if err := rows.Scan(&entry.JobID, &entry.RunID, &entry.Repository,
-			&entry.BaseSHA, &entry.State, &created, &entry.Definition); err != nil {
+			&entry.BaseSHA, &entry.State, &created, &entry.Definition, &snapshot); err != nil {
 			return view, unavailable(err)
 		}
 		entry.EnqueuedAt = fromMillis(created)
+		if spec, err := protocol.ParseDefinition([]byte(snapshot)); err == nil {
+			entry.RequiresMerge = spec.Merges()
+		}
 		if entry.State == protocol.JobQueued {
 			view.Depth++
 			entry.Position = view.Depth

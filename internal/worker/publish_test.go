@@ -1067,3 +1067,7 @@ func TestAPublishHoldIsRecordedOnTheAttemptAndKeptThroughItsRelease(t *testing.T
 		t.Fatal("the release did not push the held branch")
 	}
 }
+
+func (g *fakeGateway) MergePullRequest(context.Context, string, string, string, string) (string, error) {
+	panic("unexpected merge")
+}

@@ -77,6 +77,7 @@ export function Queue() {
                 <td>{entry.definition ?? "—"}</td>
                 <td>
                   <StatusBadge state={entry.state} />
+                  {entry.state === "queued" && entry.requires_merge && <small>Requires a worker with --allow-merge</small>}
                 </td>
                 <td>
                   {entry.attempt ? (

@@ -443,3 +443,7 @@ func TestALinkedWorkerLockIsRefusedAndItsTargetLeftIntact(t *testing.T) {
 		})
 	}
 }
+
+func (g *retryGateway) MergePullRequest(context.Context, string, string, string, string) (string, error) {
+	panic("unexpected merge")
+}

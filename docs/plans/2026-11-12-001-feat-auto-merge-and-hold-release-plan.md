@@ -231,3 +231,16 @@ Named so nobody mistakes this plan for the whole road to an unattended factory. 
 - `examples/definitions/factory.yaml`: `classify-risk` (424), `publish` (461)
 - Parent plan `docs/plans/2026-08-05-001-feat-jig-software-factory-plan.md` (KTD1 boundary, KTD6 fencing, R12, R14) and `docs/plans/2026-09-27-001-feat-ci-repair-plan.md` (the "accepted keeps meaning" bar, the head-moved rule)
 - First dogfood trial, 2026-10-08: hold-release gap, held lane not exercised
+
+## Implementation note: immediate merge transport
+
+U4–U7 use `gh api --method PUT repos/{owner}/{repo}/pulls/{number}/merge`
+with the ledger-authorized `sha` and validated `merge_method`, instead of
+`gh pr merge --match-head-commit`. The latter may enqueue a PR when GitHub
+requires a merge queue, even without `--auto`. The immediate REST endpoint
+retains the exact-head compare and rejects required queues without leaving
+future merge intent. A read before the request recovers an already-merged
+PR only when its head still matches the authorized head.
+
+U8 remains a live scratch-repository gate. Local HTTP/git fixtures and a
+scripted GitHub gateway do not prove GitHub permissions or real CI behavior.

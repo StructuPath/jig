@@ -103,9 +103,10 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 	var capacity int
 	var lastHeartbeat int64
 	var envNamesJSON, runtimesJSON string
+	var allowMerge bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT capacity, last_heartbeat, env_names_json, runtimes_json FROM workers WHERE id = ?
-	`, workerID).Scan(&capacity, &lastHeartbeat, &envNamesJSON, &runtimesJSON)
+		SELECT capacity, last_heartbeat, env_names_json, runtimes_json, allow_merge FROM workers WHERE id = ?
+	`, workerID).Scan(&capacity, &lastHeartbeat, &envNamesJSON, &runtimesJSON, &allowMerge)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -192,6 +193,9 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 			// The definition was written for a runtime this worker does not
 			// run. Claimed anyway, the adapter refuses the roster only after
 			// the attempt starts, burning every agent start (U10).
+			continue
+		}
+		if spec.Merges() && !allowMerge {
 			continue
 		}
 		chosenJob = value.jobID
