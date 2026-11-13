@@ -325,6 +325,7 @@ type WorktreeReleaseRequest struct {
 // before any phase runs (R17). Runtimes carries the probe results per
 // installed agent CLI.
 type WorkerRegistration struct {
+	AllowMerge        bool                `json:"allow_merge"`
 	Name              string              `json:"name"`
 	WorkerVersion     string              `json:"worker_version"`
 	Capacity          int                 `json:"capacity"`
@@ -337,6 +338,7 @@ type WorkerRegistration struct {
 // Worker is the control plane's record of a registered worker. ActiveCount
 // is computed (attempts currently leased by this worker), never stored.
 type Worker struct {
+	AllowMerge    bool                `json:"allow_merge"`
 	ID            string              `json:"id"`
 	Name          string              `json:"name"`
 	WorkerVersion string              `json:"worker_version"`

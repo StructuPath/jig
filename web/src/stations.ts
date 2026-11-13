@@ -216,6 +216,18 @@ export function buildStations(
     }
     views.push(ciView);
   }
+  if (delivery.merge_method) {
+    const merged = step("merge");
+    const wasHeld = Boolean(attempt.publish_hold);
+    const mergeAt = parseTime(merged?.completed_at);
+    views.push({
+      name: "merge", label: "merge", kind: "delivery",
+      state: merged ? "pass" : wasHeld ? "skip" : ci ? (terminal ? "bad" : "live") : "wait",
+      durationMs: mergeAt !== null && ciAt !== null ? Math.max(0, mergeAt - ciAt) : null,
+      costUSD: null, rounds: merged ? 1 : 0,
+      note: merged ? "merged" : wasHeld ? "human merge required" : ci && terminal ? (outcome.code ?? "not merged") : "waiting",
+    });
+  }
   return views;
 }
 

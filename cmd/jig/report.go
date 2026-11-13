@@ -149,6 +149,8 @@ func printReport(w io.Writer, report controlplane.Report) {
 
 	accepts := report.Accepts
 	section(w, "Accepts", [][2]string{
+		{"merged by jig", count(accepts.Merged)},
+		{"merged share of accepts", rate(accepts.MergedRate)},
 		{"clean", count(accepts.Clean)},
 		{"  green CI on a head jig pushed", count(accepts.CIGreen)},
 		{"  definition does not wait for CI", count(accepts.NoCIWait)},

@@ -123,8 +123,9 @@ type PublishSummary struct {
 	PullRequestURL string `json:"pr_url,omitempty"`
 	// CIRef is the head commit CI was judged on; CIFailures names the checks
 	// that were red (or still pending at the timeout), bounded.
-	CIRef      string    `json:"ci_ref,omitempty"`
-	CIFailures []CICheck `json:"ci_failures,omitempty"`
+	CIRef       string    `json:"ci_ref,omitempty"`
+	MergeCommit string    `json:"merge_commit,omitempty"`
+	CIFailures  []CICheck `json:"ci_failures,omitempty"`
 	// CIRepairs lists the CI repair rounds this publish ran, in order.
 	CIRepairs []CIRepairSummary `json:"ci_repairs,omitempty"`
 	// CIReruns lists the flaky-check re-runs this publish ran, in order;
@@ -166,6 +167,7 @@ type PullRequestRequest struct {
 // implementation, calling it twice for one head ref must yield one pull
 // request. Tests substitute a fake; no unit test reaches GitHub.
 type PullRequestGateway interface {
+	MergePullRequest(ctx context.Context, repository, url, method, head string) (string, error)
 	FindOrCreatePullRequest(ctx context.Context, request PullRequestRequest) (PullRequest, error)
 	// CommitChecks reports every CI signal attached to one commit: check runs
 	// and legacy commit statuses alike, each normalized to pending, pass, or
@@ -246,8 +248,9 @@ func (o PublishOptions) ciRegistrationGrace() time.Duration {
 // ciPolicy is what the frozen definition says about CI: whether publish
 // waits for it, and for how long.
 type ciPolicy struct {
-	wait    bool
-	timeout time.Duration
+	mergeMethod string
+	wait        bool
+	timeout     time.Duration
 	// repairBudget is publish.ci.on_fail's budget; zero means red CI ends
 	// the attempt, as it always has.
 	repairBudget int
@@ -266,6 +269,9 @@ func ciPolicyFor(snapshot string) ciPolicy {
 		return ciPolicy{}
 	}
 	policy := ciPolicy{wait: spec.WaitsForCI(), timeout: spec.CITimeout()}
+	if spec.Merges() {
+		policy.mergeMethod = spec.Publish.Merge.Method
+	}
 	if policy.wait && spec.Publish.CI.OnFail != nil {
 		policy.repairBudget = spec.Publish.CI.OnFail.Budget
 	}
@@ -395,6 +401,7 @@ func (r *PublishingRunner) Run(ctx context.Context, prepared *PreparedAttempt) O
 			outcome.PublishHold = summary.Detail
 		}
 	}
+	summary = worker.mergePublished(context.WithoutCancel(ctx), r.gateway, target, ci, summary)
 	return publishedOutcome(outcome, summary)
 }
 
@@ -421,6 +428,7 @@ func publishedOutcome(outcome Outcome, summary PublishSummary) Outcome {
 // publishTarget is one attempt's publish identity: what to publish, where,
 // and under which lease.
 type publishTarget struct {
+	wasHeld       bool
 	attemptID     string
 	jobID         string
 	attemptNumber int
@@ -1147,6 +1155,7 @@ func (w *Worker) RetryPublish(
 
 	target := publishTarget{
 		attemptID:     retry.Attempt.ID,
+		wasHeld:       retry.Attempt.PublishHold != "",
 		jobID:         retry.Job.ID,
 		attemptNumber: retry.Attempt.AttemptNumber,
 		repository:    retry.Job.Repository,
@@ -1163,6 +1172,7 @@ func (w *Worker) RetryPublish(
 	// abandoned before its pull request exists.
 	summary := w.publish(context.WithoutCancel(ctx), gateway, options, target,
 		changedPathsFromResult(retry.Attempt.Result), ciPolicyFor(retry.Snapshot))
+	summary = w.mergePublished(context.WithoutCancel(ctx), gateway, target, ciPolicyFor(retry.Snapshot), summary)
 	outcome := publishedOutcome(Outcome{
 		State: protocol.AttemptAcceptedUnpublished, Result: retry.Attempt.Result,
 	}, summary)

@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -68,7 +69,10 @@ type ReportJobs struct {
 // ReportAccepts splits accepted jobs by what the ledger proves (KTD4, R4).
 // Clean = CIGreen + NoCIWait. PersonFixed and Unverified are never clean.
 type ReportAccepts struct {
-	Clean int `json:"clean"`
+	Merged int `json:"merged"`
+	// MergedRate is ledger-proven merges over accepted jobs, not model quality.
+	MergedRate *float64 `json:"merged_rate"`
+	Clean      int      `json:"clean"`
 	// CIGreen: green CI recorded on a head jig pushed.
 	CIGreen int `json:"clean_ci_green"`
 	// NoCIWait: proof under a definition that does not wait for CI; jig
@@ -197,6 +201,7 @@ type reportJob struct {
 	proofRef  string
 	ciRef     string
 	hasCI     bool
+	hasMerge  bool
 	// pushedHeads are the heads jig pushed: the proof ref and every round's
 	// head_after.
 	pushedHeads map[string]bool
@@ -209,8 +214,10 @@ type reportJob struct {
 // names are the worker's (PublishSummary, CIRepairSummary) plus U4's pinned
 // `ci_reruns`.
 type reportSummary struct {
-	State      string `json:"state"`
-	Code       string `json:"code"`
+	Performed  []string `json:"performed_steps"`
+	Reused     []string `json:"reused_steps"`
+	State      string   `json:"state"`
+	Code       string   `json:"code"`
 	CIFailures []struct {
 		Verdict string `json:"verdict"`
 	} `json:"ci_failures"`
@@ -369,6 +376,9 @@ func (r *Report) addPublished(job *reportJob, spec *protocol.DefinitionSpec) str
 	bucket := ""
 	if job.state == protocol.JobAccepted {
 		r.Jobs.Accepted++
+		if job.hasMerge {
+			r.Accepts.Merged++
+		}
 		r.Publish.Published++
 		switch {
 		case spec == nil || (waits && !job.hasCI):
@@ -429,7 +439,9 @@ func (r *Report) addWaited(job *reportJob, result reportResult, cleanGreen bool)
 		r.CI.Repair.Entered++
 		r.CI.Repair.Rounds += job.rounds
 		switch {
-		case repair != nil && repair.State == "published":
+		// A merge refusal follows green CI; it must not turn the repair red.
+		case repair != nil && (repair.State == "published" ||
+			slices.Contains(repair.Performed, protocol.PublishStepCI) || slices.Contains(repair.Reused, protocol.PublishStepCI)):
 			r.CI.Repair.Succeeded++
 		case repair != nil && repair.Code != "":
 			r.CI.Repair.StopCodes[repair.Code]++
@@ -477,6 +489,7 @@ func (r *Report) addWaited(job *reportJob, result reportResult, cleanGreen bool)
 }
 
 func (r *Report) finish() {
+	r.Accepts.MergedRate = ratio(r.Accepts.Merged, r.Jobs.Accepted)
 	r.Publish.HeldRate = ratio(r.Publish.Held, r.Publish.Eligible)
 	r.CI.Repair.EntryRate = ratio(r.CI.Repair.Entered, r.CI.Waited)
 	r.CI.Repair.SuccessRate = ratio(r.CI.Repair.Succeeded, r.CI.Repair.Entered)
@@ -560,8 +573,8 @@ func (s *Store) reportJobs(ctx context.Context, since, until int64) ([]*reportJo
 func (s *Store) reportLedger(ctx context.Context, since, until int64, byAttempt map[string]*reportJob) error {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT attempt_id, step, remote_ref FROM publish_records
-		WHERE step IN (?, ?) AND attempt_id IN (`+reportLatestAttempts+`)
-	`, protocol.PublishStepProof, protocol.PublishStepCI, since, until)
+		WHERE step IN (?, ?, ?) AND attempt_id IN (`+reportLatestAttempts+`)
+	`, protocol.PublishStepProof, protocol.PublishStepCI, protocol.PublishStepMerge, since, until)
 	if err != nil {
 		return unavailable(err)
 	}
@@ -578,6 +591,8 @@ func (s *Store) reportLedger(ctx context.Context, since, until int64, byAttempt 
 		if step == protocol.PublishStepProof {
 			job.proofRef = ref
 			job.pushedHeads[ref] = true
+		} else if step == protocol.PublishStepMerge {
+			job.hasMerge = true
 		} else {
 			job.ciRef = ref
 			job.hasCI = true

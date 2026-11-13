@@ -1,5 +1,5 @@
 import { parseAttemptSummary } from "./api";
-import type { Attempt } from "./types";
+import type { Attempt, Delivery } from "./types";
 
 export function attemptOutcome(attempt: Attempt): { title: string; detail: string; next: string } {
   const summary = parseAttemptSummary(attempt.result);
@@ -82,7 +82,7 @@ export interface PublishAction {
 // publish-only retry can help — not for work the task chose to keep local,
 // not for a changeset with nothing in it, and not for a direct run, which
 // has no worker to ask.
-export function publishAction(jobState: string, latest: Attempt | undefined): PublishAction | null {
+export function publishAction(jobState: string, latest: Attempt | undefined, delivery?: Delivery): PublishAction | null {
   if (jobState !== "accepted_unpublished" || latest?.state !== "accepted_unpublished") return null;
   switch (attemptOutcome(latest).title) {
     case "Checks passed · awaiting review":
@@ -93,7 +93,8 @@ export function publishAction(jobState: string, latest: Attempt | undefined): Pu
     case "Checks passed · publication incomplete":
       return {
         label: "Retry publication",
-        consequence: "re-runs only the publish steps that did not finish, on the same branch and pull request.",
+        consequence: "re-runs only the publish steps that did not finish, on the same branch and pull request." +
+          (delivery?.merge_method && !latest.publish_hold ? " This workflow may merge the pull request after its checks pass." : ""),
       };
     default:
       return null;

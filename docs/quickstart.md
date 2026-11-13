@@ -252,6 +252,14 @@ purpose: `factory.yaml` scores every change for risk and holds high-risk
 work with `publish: held` in its result. Read the risk reviewer's briefing in
 the trace, then the publish retry is your sign-off.
 
+For unattended low-risk merges, add `merge: {method: squash}` under `publish`
+and start the worker with `--allow-merge`. Both switches are required; stock
+definitions leave merge off. Never-held work merges only on Jig's own green
+CI head. Held work still ends at a PR after release. Protection, conflicts,
+and a person's new commit stop merge without a rebase or a queued merge.
+Prove this on a scratch repository before using a real default branch.
+Post-merge verification and automatic revert are not provided.
+
 `factory.yaml` also sets `publish.ci.wait`, so a published job is
 `accepted` only once CI on its pull request is green, and `publish.ci.on_fail`,
 so red CI is first given back to the builder: up to two repair rounds, each

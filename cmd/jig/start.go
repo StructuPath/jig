@@ -18,17 +18,18 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	flags := flag.NewFlagSet("jig start", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	noOpen := flags.Bool("no-open", false, "do not open the browser")
+	allowMerge := flags.Bool("allow-merge", false, "allow exact-head merge for opted-in definitions")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "Usage: jig start [--no-open]")
+		fmt.Fprintln(stderr, "Usage: jig start [--no-open] [--allow-merge]")
 		return exitUsage
 	}
 	url := "http://" + defaultServerAuthority
 	client := &http.Client{Timeout: time.Second}
 	var heartbeatAfter time.Time
-	running, ready, err := localCodexReady(ctx, client, url, heartbeatAfter)
+	running, ready, err := localCodexReady(ctx, client, url, heartbeatAfter, *allowMerge)
 	if err != nil {
 		fmt.Fprintln(stderr, "jig start:", err)
 		return exitInfraFailed
@@ -61,7 +62,11 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		if running && workerDone == nil {
 			fmt.Fprintln(stdout, "Starting your signed-in Codex worker…")
 			workerDone = make(chan int, 1)
-			go func() { workerDone <- workerCommand(workerCtx, []string{"--runtime", "codex"}, stdout, stderr) }()
+			workerArgs := []string{"--runtime", "codex"}
+			if *allowMerge {
+				workerArgs = append(workerArgs, "--allow-merge")
+			}
+			go func() { workerDone <- workerCommand(workerCtx, workerArgs, stdout, stderr) }()
 		}
 		select {
 		case <-ctx.Done():
@@ -76,7 +81,7 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			fmt.Fprintln(stderr, "Jig could not become ready in 30 seconds. Check the startup messages above.")
 			return exitInfraFailed
 		case <-ticker.C:
-			running, ready, err = localCodexReady(ctx, client, url, heartbeatAfter)
+			running, ready, err = localCodexReady(ctx, client, url, heartbeatAfter, *allowMerge)
 			if err != nil {
 				fmt.Fprintln(stderr, "jig start:", err)
 				return exitInfraFailed
@@ -117,7 +122,7 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 }
 
-func localCodexReady(ctx context.Context, client *http.Client, url string, heartbeatAfter time.Time) (running, ready bool, err error) {
+func localCodexReady(ctx context.Context, client *http.Client, url string, heartbeatAfter time.Time, requireMerge bool) (running, ready bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/api/workers", nil)
 	if err != nil {
 		return false, false, err
@@ -129,9 +134,10 @@ func localCodexReady(ctx context.Context, client *http.Client, url string, heart
 	defer response.Body.Close()
 	var fleet struct {
 		Workers []struct {
-			Live      bool      `json:"live"`
-			Heartbeat time.Time `json:"last_heartbeat"`
-			Runtimes  []struct {
+			AllowMerge bool      `json:"allow_merge"`
+			Live       bool      `json:"live"`
+			Heartbeat  time.Time `json:"last_heartbeat"`
+			Runtimes   []struct {
 				Name string `json:"name"`
 			} `json:"runtimes"`
 		} `json:"workers"`
@@ -145,6 +151,9 @@ func localCodexReady(ctx context.Context, client *http.Client, url string, heart
 	for _, worker := range fleet.Workers {
 		for _, capability := range worker.Runtimes {
 			if worker.Live && capability.Name == "codex" && (heartbeatAfter.IsZero() || !worker.Heartbeat.Before(heartbeatAfter)) {
+				if requireMerge && !worker.AllowMerge {
+					continue
+				}
 				return true, true, nil
 			}
 		}

@@ -62,7 +62,7 @@ func loadPublishContext(ctx context.Context, tx *sql.Tx, attemptID string) (publ
 func validatePublishStep(step, branch, expectedBranch string) error {
 	if !protocol.ValidPublishStep(step) {
 		return invalid("invalid_publish_step",
-			"step must be one of push, pull_request, proof, ci")
+			"step must be one of push, pull_request, proof, ci, merge")
 	}
 	if len(branch) > protocol.MaxPublishBranchBytes {
 		return invalid("invalid_publish_branch", "branch exceeds its storage limit")
@@ -91,6 +91,42 @@ func requirePublishPrerequisites(ctx context.Context, tx *sql.Tx, attemptID, ste
 		}
 	}
 	return nil
+}
+
+// requireMerge enforces consent and provenance at BOTH fences (merge plan KTD4/5/7).
+func requireMerge(ctx context.Context, tx *sql.Tx, attemptID string) (string, error) {
+	spec, err := attemptDefinition(ctx, tx, attemptID)
+	if err != nil {
+		return "", err
+	}
+	if !spec.Merges() {
+		return "", conflict("merge_not_declared", "the frozen definition does not declare merge")
+	}
+	var held, allowed bool
+	if err := tx.QueryRowContext(ctx, `SELECT a.publish_hold IS NOT NULL, w.allow_merge
+	    FROM attempts a JOIN workers w ON w.id = a.worker_id WHERE a.id = ?`, attemptID).Scan(&held, &allowed); err != nil {
+		return "", unavailable(err)
+	}
+	if held {
+		return "", conflict("merge_held", "an attempt that was held can never be merged by jig")
+	}
+	if !allowed {
+		return "", conflict("merge_not_allowed", "the owning worker did not opt into merge")
+	}
+	if err := requirePublishPrerequisites(ctx, tx, attemptID, protocol.PublishStepMerge); err != nil {
+		return "", err
+	}
+	var head, pushed string
+	if err := tx.QueryRowContext(ctx, `SELECT ci.remote_ref, COALESCE(
+	    (SELECT head_after FROM publish_ci_repairs WHERE attempt_id = ci.attempt_id ORDER BY round DESC LIMIT 1),
+	    (SELECT remote_ref FROM publish_records WHERE attempt_id = ci.attempt_id AND step = 'push'))
+	    FROM publish_records ci WHERE ci.attempt_id = ? AND ci.step = 'ci'`, attemptID).Scan(&head, &pushed); err != nil {
+		return "", unavailable(err)
+	}
+	if head != pushed {
+		return "", conflict("merge_head_moved", "CI passed on a head the attempt did not push")
+	}
+	return head, nil
 }
 
 func readPublishRecord(ctx context.Context, tx *sql.Tx, attemptID, step string) (protocol.PublishRecord, bool, error) {
@@ -146,6 +182,13 @@ func (s *Store) AuthorizePublishStep(
 	if err := verifyActiveLease(value.lease, input.LeaseToken, now); err != nil {
 		return authorization, err
 	}
+	mergeHead := ""
+	if input.Step == protocol.PublishStepMerge {
+		mergeHead, err = requireMerge(ctx, tx, attemptID)
+		if err != nil {
+			return authorization, err
+		}
+	}
 	record, exists, err := readPublishRecord(ctx, tx, attemptID, input.Step)
 	if err != nil {
 		return authorization, err
@@ -161,6 +204,7 @@ func (s *Store) AuthorizePublishStep(
 		return authorization, unavailable(err)
 	}
 	authorization = protocol.PublishAuthorization{
+		MergeHead:     mergeHead,
 		AttemptID:     attemptID,
 		JobID:         value.lease.jobID,
 		AttemptNumber: value.lease.attemptNumber,
@@ -194,10 +238,10 @@ func (s *Store) RecordPublishStep(
 		return record, invalid("invalid_publish_ref", "remote_ref exceeds its storage limit")
 	}
 	switch input.Step {
-	case protocol.PublishStepPush, protocol.PublishStepProof, protocol.PublishStepCI:
+	case protocol.PublishStepPush, protocol.PublishStepProof, protocol.PublishStepCI, protocol.PublishStepMerge:
 		if !publishRefPattern.MatchString(input.RemoteRef) {
 			return record, invalid("invalid_publish_ref",
-				"push, proof, and ci records must carry a commit SHA as remote_ref")
+				"push, proof, ci, and merge records must carry a commit SHA as remote_ref")
 		}
 	case protocol.PublishStepPullRequest:
 		if !strings.HasPrefix(input.PullRequestURL, "https://") {
@@ -220,6 +264,11 @@ func (s *Store) RecordPublishStep(
 	}
 	if err := verifyActiveLease(value.lease, input.LeaseToken, now); err != nil {
 		return record, err
+	}
+	if input.Step == protocol.PublishStepMerge {
+		if _, err := requireMerge(ctx, tx, attemptID); err != nil {
+			return record, err
+		}
 	}
 	existing, exists, err := readPublishRecord(ctx, tx, attemptID, input.Step)
 	if err != nil {

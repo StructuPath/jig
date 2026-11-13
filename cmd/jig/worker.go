@@ -67,6 +67,7 @@ Flags:
                          (default "jig@localhost")
   --base-branch          pull-request base branch; empty resolves the
                          repository's default branch
+  --allow-merge          allow never-held jobs to merge when their definition opts in
 
 Exit codes:
   0  the worker stopped cleanly on SIGINT/SIGTERM
@@ -97,6 +98,7 @@ func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	authorName := flags.String("commit-author-name", "jig", "publish commit author name")
 	authorEmail := flags.String("commit-author-email", "jig@localhost", "publish commit author email")
 	baseBranch := flags.String("base-branch", "", "pull-request base branch")
+	allowMerge := flags.Bool("allow-merge", false, "allow exact-head merge for opted-in definitions")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -152,6 +154,7 @@ func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 			BaseBranch:        *baseBranch,
 		})
 	host, err = worker.New(worker.Config{
+		AllowMerge:    *allowMerge,
 		ServerURL:     *serverURL,
 		DataDir:       *dataDir,
 		Name:          *name,

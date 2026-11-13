@@ -137,7 +137,7 @@ export function JobPanel({
   const attempts = data.attempts ?? [];
   const latest = attempts.at(-1);
   const ready = latest && attemptOutcome(latest).title === "Task complete · kept local";
-  const publish = publishAction(data.job.state, latest);
+  const publish = publishAction(data.job.state, latest, data.delivery);
   const publishRequested = Boolean(data.job.publish_requested_at);
 
   return (

@@ -343,6 +343,23 @@ Rules worth knowing before you write one:
   access to the control plane: jig has one trusted operator and no
   authentication (see *Loopback only*), so the operator's retry is the
   approval, with no separate approver identity.
+- **Publish can merge.** Add `merge: {method: squash}` under `publish` and
+  start the worker with `--allow-merge` (also supported by `jig start`).
+  `merge`, `squash`, and `rebase` are the supported methods; `ci.wait: true`
+  is required. Both switches default off. A worker without consent leaves
+  these jobs queued. After green CI, Jig merges only its own exact pushed
+  head, including a CI repair's head. Any attempt ever held ends at a PR,
+  even after release; a person's commit is never automatically merged.
+  The immediate GitHub merge API preserves branch protection and refuses
+  required reviews, queues, conflicts, and changed heads. Jig never queues
+  a future merge, rebases a blocked branch, or bypasses protection.
+  A failed merge remains `accepted_unpublished`; use the existing publication
+  retry after the cause is resolved. A stopped worker's `publish-retry` also
+  needs `--allow-merge`, and its registration must retain merge consent.
+  `jig report` counts merged accepts and their share of accepted jobs from
+  the ledger; merge failures appear in the existing publish failure codes.
+  Test on a scratch repository first. There is no post-merge verification or
+  automatic revert. An incorrect change can pass every pre-merge check.
 - **Publish can wait for CI.** `publish: {ci: {wait: true, timeout: 30m}}`
   adds a fourth publish step after proof: the worker polls the check runs
   and commit statuses on the branch's head through `gh api`, and the job is

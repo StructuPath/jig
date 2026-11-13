@@ -226,6 +226,8 @@ func writeProcessGroups(manifest *attemptManifest, groups []int64) {
 
 // Config configures the single implicit worker.
 type Config struct {
+	// AllowMerge is explicit operator consent, off by default (merge plan KTD7).
+	AllowMerge bool
 	// ServerURL is the control plane's http://host:port address.
 	ServerURL string
 	// DataDir is the worker-owned state root: worker-id, attempts/ (manifests
@@ -403,6 +405,7 @@ func (w *Worker) registration() protocol.WorkerRegistration {
 	}
 	sort.Slice(retained, func(i, j int) bool { return retained[i].AttemptID < retained[j].AttemptID })
 	return protocol.WorkerRegistration{
+		AllowMerge:        w.config.AllowMerge,
 		Name:              w.config.Name,
 		WorkerVersion:     w.config.WorkerVersion,
 		Capacity:          w.config.Capacity,
