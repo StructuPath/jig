@@ -470,6 +470,18 @@ func TestReadSurfaceOverHTTP(t *testing.T) {
 	if recorder := get("/api/attempts/missing"); recorder.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for an unknown attempt, got %d", recorder.Code)
 	}
+	// Every attempt sub-resource answers an unknown id the same way, naming
+	// it, never with an empty list that reads as "ran nothing".
+	for _, path := range []string{
+		"/api/attempts/missing/events", "/api/attempts/missing/gates", "/api/attempts/missing/envelopes",
+	} {
+		recorder := get(path)
+		if recorder.Code != http.StatusNotFound || !strings.Contains(recorder.Body.String(), "not_found") ||
+			!strings.Contains(recorder.Body.String(), "missing") {
+			t.Fatalf("GET %s: expected a 404 not_found naming the attempt, got %d (%s)",
+				path, recorder.Code, recorder.Body.String())
+		}
+	}
 
 	// Ingestion is state-changing, so it keeps the browser-origin fence (R20).
 	body := `{"lease_token":"` + tokenA + `","events":[{"seq":3,"type":"log"}]}`

@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -181,6 +182,73 @@ func claimAs(t *testing.T, store *Store, workerID, requestID, token string) *pro
 		t.Fatalf("claim %s as %s: %v", requestID, workerID, err)
 	}
 	return claim
+}
+
+// ---- unparseable frozen snapshots ------------------------------------------
+
+// A snapshot frozen before a parser rule tightened (here: boolean literals
+// must be lowercase) no longer parses. Claim must fail that job with the
+// diagnostic — not skip it, leaving it queued forever with no error — and
+// still claim the valid job queued behind it.
+func TestClaimFailsAJobWhoseFrozenSnapshotNoLongerParsesAndClaimsTheNextJob(t *testing.T) {
+	store, clock := newTestStore(t)
+	ctx := context.Background()
+	stale := fixtureSnapshot + `  - name: review
+    kind: agent
+    owner: builder
+    on_fail: {when: "approved == True", run: build, then: rerun-self, budget: 2}
+`
+	if _, err := protocol.ParseDefinition([]byte(stale)); err == nil {
+		t.Fatal("the stale snapshot parses; the test no longer exercises a frozen incompatible snapshot")
+	}
+	seedRunSnapshot(t, store, "run-stale", stale, protocol.RunTarget{Repository: repoA, BaseSHA: "pin000"})
+	seedRun(t, store, "run-valid", protocol.RunTarget{Repository: repoA, BaseSHA: "pin000"})
+	registerTestWorker(t, store, 2)
+	staleJob, err := store.EnqueueJob(ctx, "run-stale", repoA)
+	if err != nil {
+		t.Fatalf("enqueue stale job: %v", err)
+	}
+	clock.Advance(time.Millisecond)
+	validJob, err := store.EnqueueJob(ctx, "run-valid", repoA)
+	if err != nil {
+		t.Fatalf("enqueue valid job: %v", err)
+	}
+	var staleAttemptID string
+	if err := store.db.QueryRow(`SELECT id FROM attempts WHERE job_id = ?`, staleJob.ID).Scan(&staleAttemptID); err != nil {
+		t.Fatalf("read stale attempt: %v", err)
+	}
+
+	claim := mustClaim(t, store, "req-1", tokenA)
+	if claim == nil || claim.Job.ID != validJob.ID {
+		t.Fatalf("claimed %+v, want the valid job %s queued behind the stale one", claim, validJob.ID)
+	}
+
+	attempt, err := store.Attempt(ctx, staleAttemptID)
+	if err != nil {
+		t.Fatalf("read stale attempt: %v", err)
+	}
+	if attempt.State != protocol.AttemptFailed {
+		t.Fatalf("stale attempt state = %q, want %q", attempt.State, protocol.AttemptFailed)
+	}
+	for _, want := range []string{"snapshot_invalid", "must be lowercase"} {
+		if !strings.Contains(attempt.Error, want) {
+			t.Fatalf("stale attempt error = %q, want it to contain %q", attempt.Error, want)
+		}
+	}
+	job, err := store.Job(ctx, staleJob.ID)
+	if err != nil {
+		t.Fatalf("read stale job: %v", err)
+	}
+	if job.State != protocol.JobFailed {
+		t.Fatalf("stale job state = %q, want %q", job.State, protocol.JobFailed)
+	}
+	run, err := store.Run(ctx, "run-stale")
+	if err != nil {
+		t.Fatalf("read stale run: %v", err)
+	}
+	if run.State != protocol.RunFailed {
+		t.Fatalf("stale run state = %q, want %q", run.State, protocol.RunFailed)
+	}
 }
 
 func TestACodexWorkerClaimsNothingWhenOnlyAClaudeCodeJobIsQueued(t *testing.T) {

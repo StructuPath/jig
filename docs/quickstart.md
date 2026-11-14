@@ -36,6 +36,11 @@ From a terminal, the equivalent is:
 ./bin/jig start
 ```
 
+`jig start` takes the same `--addr`, `--data`, and `--runtime` as `jig serve`
+and `jig worker` (defaults `127.0.0.1:8383`, `~/.jig` with the worker in
+`~/.jig/worker`, and `codex`), so a second instance or a Claude Code worker
+is `./bin/jig start --addr 127.0.0.1:8594 --data ~/.jig-b --runtime claude-code`.
+
 Open <http://127.0.0.1:8383>. Choose a Git project folder or repository,
 use **Let agents improve it**, and press **Start task**. The goal box is optional:
 agents inspect the project, choose one useful improvement, and write the directive
@@ -227,14 +232,23 @@ In a third terminal:
 
 ```
 jig worker: 4f1c…
-  runtime: claude-code 2.1.4 (resume=true, cost=true)
+  runtime: claude-code 2.1.280 (resume=true, cost=true)
   retained worktrees: 0, orphan paths: 0, missing: 0
 jig worker: claiming from http://127.0.0.1:8383
 ```
 
 Within a couple of seconds it claims the queued job, materializes a worktree
 at the pinned SHA, runs the chain, and publishes. Watch it live in the UI:
-one lane per attempt, phases and tool calls as they happen.
+one lane per attempt, phases and tool calls as they happen. From the
+terminal:
+
+```sh
+./bin/jig runs list
+./bin/jig job show <job-id> --follow     # exits 0 when accepted, 3 otherwise
+```
+
+A failed job is retried with `./bin/jig job retry <job-id>`; a cancelled one
+comes back with `./bin/jig runs readmit <run-id>`.
 
 If nothing gets claimed, open the **Fleet** view. A worker that never
 registered is not there at all; one that stopped heartbeating reads `stale`,
@@ -316,7 +330,9 @@ cancelled, terminal states recorded, ephemeral scratch destroyed.
 
 ## 6. Make it unattended
 
-A trigger admits runs without you. A nightly scout:
+A trigger admits runs without you. Every trigger is saved **disabled**, so
+nothing fires until you say so; `--enable` says so at creation. A nightly
+scout (`--cron` and `--timezone` are both required for a schedule):
 
 ```sh
 ./bin/jig trigger create \
@@ -326,8 +342,13 @@ A trigger admits runs without you. A nightly scout:
     --cron "0 3 * * *" \
     --timezone America/Denver \
     --repo "$PWD" \
-    --instructions "survey this repository and report what changed"
+    --instructions "survey this repository and report what changed" \
+    --enable
 ```
+
+Without `--enable`, the command prints
+`created disabled — start it with: jig trigger enable <trigger-id>`; run that
+when you are ready.
 
 Or one that works GitHub issues as they appear:
 
@@ -340,12 +361,18 @@ Or one that works GitHub issues as they appear:
     --state open \
     --label jig \
     --instructions "implement the issue described in the context section"
+./bin/jig trigger enable <trigger-id>
 ```
 
 ```sh
 ./bin/jig trigger list --json
 ./bin/jig trigger disable <trigger-id>     # the stop button
+./bin/jig trigger delete <trigger-id>      # a disabled trigger; its runs stay
 ```
+
+A definition whose prompts reference a parameter (`jig def validate` lists
+them as `params:`) needs each one passed to the trigger with
+`--param name=value`, exactly as `jig def invoke` does.
 
 Two counters on every trigger are worth watching. `admitted` is how many runs
 it created. `skipped` is how many firings were dropped because the previous

@@ -53,6 +53,42 @@ publish:
   ci:
     wiat: true
 `, `line 9: publish.ci: unknown field "wiat" (did you mean "wait"?)`},
+		// A merge key and an alias are YAML, not fields: the walk follows
+		// them and names the real typo elsewhere.
+		{"merge key", `
+name: bad
+roster:
+  builder: &role
+    model: claude-sonnet
+    system_prompt: s
+    user_prompt: u
+  reviewer:
+    <<: *role
+    writes: []
+  checker: *role
+phases:
+  - name: review
+    kind: agent
+    owner: reviewer
+publish:
+  ci:
+    wiat: true
+`, `line 18: publish.ci: unknown field "wiat" (did you mean "wait"?)`},
+		{"typo inside a merged anchor", `
+name: bad
+roster:
+  builder: &role
+    model: claude-sonnet
+    system_prompt: s
+    user_prompt: u
+  reviewer:
+    <<: [*role]
+    user_promt: u
+phases:
+  - name: review
+    kind: agent
+    owner: reviewer
+`, `line 10: role "reviewer": unknown field "user_promt" (did you mean "user_prompt"?)`},
 		{"top level, no near spelling", `
 name: bad
 zzzzzzzz: 1

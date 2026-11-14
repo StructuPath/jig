@@ -545,6 +545,18 @@ func TestRetryOfANonFailedJobIsRejected(t *testing.T) {
 		t.Fatal("retrying a queued job must be rejected")
 	} else if code := serviceCode(t, err); code != "retry_not_allowed" {
 		t.Fatalf("retry code = %q, want retry_not_allowed", code)
+	} else if !strings.Contains(err.Error(), "job is queued; only a failed job can be retried") {
+		t.Fatalf("retry message does not name the job's state: %v", err)
+	}
+
+	// A cancelled job is not retried; the refusal names the way back.
+	if _, err := store.CancelJob(context.Background(), job.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	_, err = store.RetryJob(context.Background(), job.ID)
+	want := "job is cancelled; only a failed job can be retried — re-admit its run: jig runs readmit run-1"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("retrying a cancelled job = %v, want %q", err, want)
 	}
 }
 

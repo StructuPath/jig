@@ -613,7 +613,8 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 	// A completion is what serves an operator's publish request: the grant
 	// leaves it on the job so an interrupted retry is served again (R14).
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET state = ?, updated_at = ?, publish_requested_at = NULL
+		UPDATE jobs SET state = ?, updated_at = ?, publish_requested_at = NULL,
+		    publish_request_interruptions = 0
 		WHERE id = ? AND state = 'active'
 	`, input.State, now, lease.jobID); err != nil {
 		return protocol.Attempt{}, unavailable(err)
@@ -643,8 +644,8 @@ func (s *Store) RetryJob(ctx context.Context, jobID string) (protocol.Job, error
 		return protocol.Job{}, unavailable(err)
 	}
 	defer tx.Rollback()
-	var state string
-	err = tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&state)
+	var state, runID string
+	err = tx.QueryRowContext(ctx, `SELECT state, run_id FROM jobs WHERE id = ?`, jobID).Scan(&state, &runID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return protocol.Job{}, ErrNotFound
 	}
@@ -652,7 +653,13 @@ func (s *Store) RetryJob(ctx context.Context, jobID string) (protocol.Job, error
 		return protocol.Job{}, unavailable(err)
 	}
 	if state != protocol.JobFailed {
-		return protocol.Job{}, conflict("retry_not_allowed", "only a failed job can be retried")
+		message := "job is " + state + "; only a failed job can be retried"
+		// A cancelled job's way back is its run, re-admitted at current HEAD
+		// (KTD9's escape hatch): name the command, not just the refusal.
+		if state == protocol.JobCancelled {
+			message += " — re-admit its run: jig runs readmit " + runID
+		}
+		return protocol.Job{}, conflict("retry_not_allowed", message)
 	}
 	var attemptNumber int
 	if err := tx.QueryRowContext(ctx, `

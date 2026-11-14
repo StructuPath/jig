@@ -84,9 +84,9 @@ func jobState(state string, requested bool, attemptError string) controlplane.Jo
 
 func jigJob(t *testing.T, ctx context.Context, args ...string) (int, string, string) {
 	t.Helper()
-	previous := jobReleasePollInterval
-	jobReleasePollInterval = time.Millisecond
-	t.Cleanup(func() { jobReleasePollInterval = previous })
+	previous := jobPollInterval
+	jobPollInterval = time.Millisecond
+	t.Cleanup(func() { jobPollInterval = previous })
 	var stdout, stderr bytes.Buffer
 	code := jobCommand(ctx, args, &stdout, &stderr)
 	return code, stdout.String(), stderr.String()

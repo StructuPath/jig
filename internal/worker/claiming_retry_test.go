@@ -219,3 +219,56 @@ func TestALostClaimAnswerIsResentWithTheSameRequest(t *testing.T) {
 		t.Fatalf("store holds %d attempts, want 1 — the resend claimed afresh", attempts)
 	}
 }
+
+// The first completion commits and its answer is lost. Before the retry, the
+// heartbeat — still running, as it must during retries — meets the now
+// terminal attempt and is told attempt_transitioned. That verdict is the
+// commit the worker is retrying, not a reason to stop: the retry must still
+// be sent and reach the server's replay of the stored outcome.
+func TestACompletionRetryOutlivesAHeartbeatThatSeesTheCommit(t *testing.T) {
+	fastRetries(t)
+	interval := heartbeatInterval
+	heartbeatInterval = 10 * time.Millisecond
+	completionRetryDelays = []time.Duration{100 * time.Millisecond, 100 * time.Millisecond}
+	t.Cleanup(func() { heartbeatInterval = interval })
+
+	h := newHarness(t)
+	_, head, identity := newOriginRepo(t)
+	h.seedRun("run-1", protocol.RunTarget{Repository: identity, BaseSHA: head})
+	h.enqueue("run-1", identity)
+
+	var mutex sync.Mutex
+	completions, heartbeatsBetween := 0, 0
+	w := newFaultyWorker(t, h, acceptingRunner(), func(path string, _ []byte) fault {
+		mutex.Lock()
+		defer mutex.Unlock()
+		switch {
+		case strings.HasSuffix(path, "/heartbeat"):
+			if completions == 1 {
+				heartbeatsBetween++
+			}
+		case strings.HasSuffix(path, "/complete"):
+			completions++
+			if completions == 1 {
+				return actThenDrop
+			}
+		}
+		return passThrough
+	})
+
+	attempt, err := w.ClaimOnce(context.Background())
+	if err != nil {
+		t.Fatalf("a completion retry must survive attempt_transitioned, got %v", err)
+	}
+	if attempt == nil || attempt.State != protocol.AttemptAcceptedUnpublished {
+		t.Fatalf("attempt = %+v, want the replayed accepted_unpublished outcome", attempt)
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	if heartbeatsBetween == 0 {
+		t.Fatalf("no heartbeat landed between the dropped answer and the retry; the test proves nothing")
+	}
+	if completions != 2 {
+		t.Fatalf("completion was sent %d times, want 2", completions)
+	}
+}
