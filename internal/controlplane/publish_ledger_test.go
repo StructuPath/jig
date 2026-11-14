@@ -674,6 +674,68 @@ func TestAPublishRequestSurvivesAnInterruptedRetry(t *testing.T) {
 	}
 }
 
+// A retry that crashes its worker is swept back and served again, but not
+// forever: after maxPublishRequestInterruptions interruptions the request is
+// cleared, the attempt records why, and the job stays accepted_unpublished.
+// A new request starts a fresh count.
+func TestAPublishRequestIsClearedAfterRepeatedInterruptedRetries(t *testing.T) {
+	store, clock := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	claim := heldJob(t, store, "run-1")
+	ctx := context.Background()
+	tokens := []string{tokenB, tokenC, tokenA}
+
+	interruptOnce := func(token string) protocol.Job {
+		t.Helper()
+		if _, err := store.RetryPublish(ctx, claim.Job.ID,
+			protocol.PublishRetryRequest{WorkerID: workerA, LeaseToken: token}); err != nil {
+			t.Fatalf("publish retry: %v", err)
+		}
+		sweepUntilSettled(t, store, clock, claim.Attempt.ID)
+		job, err := store.Job(ctx, claim.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return job
+	}
+
+	if _, err := store.RequestPublish(ctx, claim.Job.ID); err != nil {
+		t.Fatalf("request publish: %v", err)
+	}
+	for i := 1; i < maxPublishRequestInterruptions; i++ {
+		job := interruptOnce(tokens[(i-1)%len(tokens)])
+		if job.PublishRequestedAt == nil {
+			t.Fatalf("request cleared after %d interruption(s), want it served again until %d",
+				i, maxPublishRequestInterruptions)
+		}
+	}
+	job := interruptOnce(tokens[(maxPublishRequestInterruptions-1)%len(tokens)])
+	if job.State != protocol.JobAcceptedUnpublished || job.PublishRequestedAt != nil {
+		t.Fatalf("job after %d interruptions = %+v, want accepted_unpublished with the request cleared",
+			maxPublishRequestInterruptions, job)
+	}
+	attempt, err := store.Attempt(ctx, claim.Attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.State != protocol.AttemptAcceptedUnpublished ||
+		!strings.Contains(attempt.Error, "the request was cleared") {
+		t.Fatalf("attempt = %q %q, want accepted_unpublished naming the cleared request", attempt.State, attempt.Error)
+	}
+	if left, err := store.WorkerPublishRequests(ctx, workerA); err != nil || len(left) != 0 {
+		t.Fatalf("requests after the cap = %+v (err=%v), want none", left, err)
+	}
+
+	// The operator asks again: the count starts over, so one more
+	// interruption is served again rather than cleared at once.
+	if _, err := store.RequestPublish(ctx, claim.Job.ID); err != nil {
+		t.Fatalf("request publish again: %v", err)
+	}
+	if job := interruptOnce(tokenB); job.PublishRequestedAt == nil {
+		t.Fatal("a new request was cleared by the previous request's interruptions")
+	}
+}
+
 func TestAPublishRequestCanBeWithdrawnBeforeAWorkerTakesIt(t *testing.T) {
 	store, _ := newTestStore(t)
 	registerTestWorker(t, store, 1)

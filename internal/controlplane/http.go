@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
@@ -154,6 +155,17 @@ func (a *API) invokeDefinition(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
+	// The Idempotency-Key header is the conventional spelling of the body's
+	// request_id; both may be sent, but they must agree.
+	if key := r.Header.Get("Idempotency-Key"); key != "" {
+		if input.RequestID != "" && input.RequestID != key {
+			writeError(w, invalid("invalid_request_id",
+				"request_id and the Idempotency-Key header name different keys"))
+			return
+		}
+		input.RequestID = key
+	}
+	extendWriteDeadline(w, AdmissionWriteBudget(len(input.Targets)))
 	view, err := a.store.InvokeDefinition(r.Context(), input)
 	if err != nil {
 		writeError(w, err)
@@ -163,17 +175,33 @@ func (a *API) invokeDefinition(w http.ResponseWriter, r *http.Request) {
 }
 
 // readmitRun is the KTD9 escape hatch's route: a bodyless POST, because
-// re-admitting takes nothing but the run whose pins are stale.
+// re-admitting takes nothing but the run whose pins are stale. Its optional
+// idempotency key therefore rides the Idempotency-Key header.
 func (a *API) readmitRun(w http.ResponseWriter, r *http.Request) {
 	if !a.prepareMutation(w, r) {
 		return
 	}
-	view, err := a.store.ReadmitRunAtHead(r.Context(), r.PathValue("run_id"))
+	targets := 1
+	if previous, err := a.store.Run(r.Context(), r.PathValue("run_id")); err == nil {
+		targets = len(previous.Targets)
+	}
+	extendWriteDeadline(w, AdmissionWriteBudget(targets))
+	view, err := a.store.ReadmitRunAtHead(r.Context(), r.PathValue("run_id"),
+		r.Header.Get("Idempotency-Key"))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, view)
+}
+
+// extendWriteDeadline lifts the listener's write timeout for one admitting
+// request, which resolves refs over the network before it answers. Past the
+// listener's deadline the run still commits but the answer is dropped, and
+// the client's natural repeat admits a second run. A writer with no
+// deadline to set (a test recorder) has nothing to extend.
+func extendWriteDeadline(w http.ResponseWriter, budget time.Duration) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget))
 }
 
 func (a *API) getRun(w http.ResponseWriter, r *http.Request) {

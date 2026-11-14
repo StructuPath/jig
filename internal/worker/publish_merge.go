@@ -1,9 +1,11 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
@@ -90,26 +92,21 @@ func (g *GitHubCLIGateway) MergePullRequest(ctx context.Context, repository, prU
 	if sha, merged, err := read(); err != nil || merged {
 		return sha, err
 	}
-	stdout, stderr, outLarge, errLarge, err := g.run()(ctx, "gh", "api", "--method", "PUT", path+"/merge", "-f", "sha="+head, "-f", "merge_method="+method)
+	// -i puts the HTTP status line ahead of the body, so the failure is
+	// classified by GitHub's status rather than by words in gh's stderr,
+	// which change between gh releases and can quote the PR's own title.
+	stdout, stderr, outLarge, errLarge, err := g.run()(ctx, "gh", "api", "-i", "--method", "PUT", path+"/merge", "-f", "sha="+head, "-f", "merge_method="+method)
+	status, body := splitGHResponse(stdout)
 	if err != nil || outLarge || errLarge {
-		code := "merge_failed"
-		detail := string(stderr)
-		switch {
-		case strings.Contains(detail, "409"):
-			code = "merge_head_moved"
-		case strings.Contains(strings.ToLower(detail), "conflict"):
-			code = "merge_conflict"
-		case strings.Contains(detail, "405"), strings.Contains(detail, "403"), strings.Contains(detail, "422"):
-			code = "merge_blocked"
-		}
-		return "", publishFailure(code, "%s", ghDiagnostic("merge pull request", err, stderr, outLarge, errLarge))
+		return "", publishFailure(mergeFailureCode(status, body), "%s",
+			ghDiagnostic("merge pull request", err, stderr, outLarge, errLarge))
 	}
 	var result struct {
 		Merged  bool   `json:"merged"`
 		SHA     string `json:"sha"`
 		Message string `json:"message"`
 	}
-	if err := json.Unmarshal(stdout, &result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return "", publishFailure("merge_failed", "unreadable merge response: %s", err)
 	}
 	if !result.Merged {
@@ -119,4 +116,55 @@ func (g *GitHubCLIGateway) MergePullRequest(ctx context.Context, repository, prU
 		return "", publishFailure("merge_failed", "merge response has no valid merge commit")
 	}
 	return result.SHA, nil
+}
+
+// mergeFailureCode maps the status of GitHub's merge endpoint onto the
+// publish codes an operator acts on: 409 is GitHub refusing the sha fence
+// (the head moved), 405 is "not mergeable" — a conflict when GitHub's
+// message says so, otherwise a branch rule — and 403/422 are rules or
+// validation that block the merge. No status (gh never got an answer) is
+// merge_failed, which a publish retry resolves by re-reading the PR.
+func mergeFailureCode(status int, body []byte) string {
+	switch status {
+	case 409:
+		return "merge_head_moved"
+	case 405:
+		var answer struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(body, &answer) == nil && strings.Contains(strings.ToLower(answer.Message), "conflict") {
+			return "merge_conflict"
+		}
+		return "merge_blocked"
+	case 403, 422:
+		return "merge_blocked"
+	}
+	return "merge_failed"
+}
+
+// splitGHResponse splits `gh api -i` output into the HTTP status and the
+// body. gh writes the status line ("HTTP/2.0 409 Conflict"), the headers,
+// and a blank line before the body; status is 0 when the output does not
+// start with a status line (gh failed before GitHub answered).
+func splitGHResponse(output []byte) (int, []byte) {
+	if !bytes.HasPrefix(output, []byte("HTTP/")) {
+		return 0, output
+	}
+	line, rest, _ := bytes.Cut(output, []byte("\n"))
+	fields := strings.Fields(string(line))
+	if len(fields) < 2 {
+		return 0, output
+	}
+	status, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, output
+	}
+	for len(rest) > 0 {
+		var header []byte
+		header, rest, _ = bytes.Cut(rest, []byte("\n"))
+		if len(bytes.TrimSpace(header)) == 0 {
+			break
+		}
+	}
+	return status, rest
 }

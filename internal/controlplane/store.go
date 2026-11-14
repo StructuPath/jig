@@ -613,7 +613,8 @@ func (s *Store) CompleteAttempt(ctx context.Context, attemptID string, input pro
 	// A completion is what serves an operator's publish request: the grant
 	// leaves it on the job so an interrupted retry is served again (R14).
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET state = ?, updated_at = ?, publish_requested_at = NULL
+		UPDATE jobs SET state = ?, updated_at = ?, publish_requested_at = NULL,
+		    publish_request_interruptions = 0
 		WHERE id = ? AND state = 'active'
 	`, input.State, now, lease.jobID); err != nil {
 		return protocol.Attempt{}, unavailable(err)

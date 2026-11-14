@@ -94,7 +94,7 @@ func (l *attemptLease) heartbeat(ctx context.Context) error {
 // expired-but-unswept one (R5).
 func (l *attemptLease) freshen(ctx context.Context) error {
 	l.mutex.Lock()
-	stale := l.now().Sub(l.lastRenewal) >= protocol.HeartbeatInterval
+	stale := l.now().Sub(l.lastRenewal) >= heartbeatInterval
 	l.mutex.Unlock()
 	if !stale {
 		return nil
@@ -112,13 +112,17 @@ func leaseLost(err error) bool {
 	return false
 }
 
+// heartbeatInterval is protocol.HeartbeatInterval; a variable so tests can
+// make a heartbeat land inside a window they control.
+var heartbeatInterval = protocol.HeartbeatInterval
+
 // keepAlive heartbeats at HeartbeatInterval until ctx ends or the lease is
 // verdict-lost. Transient failures keep trying: the next beat may land, and
 // an expired-but-unswept lease is still renewable (R5).
 func (l *attemptLease) keepAlive(ctx context.Context, logger interface {
 	Warn(msg string, args ...any)
 }) {
-	ticker := time.NewTicker(protocol.HeartbeatInterval)
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -360,6 +364,11 @@ var completionRetryDelays = []time.Duration{
 // completion for the owning token and keeps the first stored outcome (R6).
 // Only a verdict (a 4xx answer, including a lost lease) or a cancelled
 // context ends the retries early.
+//
+// One heartbeat verdict is not a reason to stop: attempt_transitioned is
+// exactly what a heartbeat sees after the completion it is retrying has
+// committed with its answer lost, so the retry is sent anyway and the
+// server's replay (or its lease_not_owner) decides (R6).
 func (w *Worker) completeAttempt(ctx context.Context, lease *attemptLease, outcome Outcome) (protocol.Attempt, error) {
 	request := protocol.CompleteAttemptRequest{
 		LeaseToken: lease.token,
@@ -372,7 +381,7 @@ func (w *Worker) completeAttempt(ctx context.Context, lease *attemptLease, outco
 	}
 	attempt, err := w.completeAttemptOnce(ctx, lease, request)
 	for _, delay := range completionRetryDelays {
-		if err == nil || !retryable(err) || lease.lostVerdict() != nil {
+		if err == nil || !retryable(err) || !completionMayRetry(lease.lostVerdict()) {
 			break
 		}
 		w.logger.Warn("attempt_completion_retry", "attempt_id", lease.attemptID, "error", err)
@@ -385,10 +394,20 @@ func (w *Worker) completeAttempt(ctx context.Context, lease *attemptLease, outco
 }
 
 func (w *Worker) completeAttemptOnce(ctx context.Context, lease *attemptLease, request protocol.CompleteAttemptRequest) (protocol.Attempt, error) {
-	if err := lease.freshen(ctx); err != nil {
+	if err := lease.freshen(ctx); err != nil && errorCode(err) != "attempt_transitioned" {
 		return protocol.Attempt{}, fmt.Errorf("freshen lease before completion: %w", err)
 	}
 	return w.client.CompleteAttempt(ctx, lease.attemptID, request)
+}
+
+// completionMayRetry reports whether the lease verdict a heartbeat recorded
+// (nil when none) still leaves the completion worth sending.
+// attempt_transitioned means the attempt is no longer leased — possibly
+// because this very completion already committed — and only the completion
+// route can tell a replay from a sweep. lease_not_owner and
+// lease_superseded are final.
+func completionMayRetry(verdict error) bool {
+	return verdict == nil || errorCode(verdict) == "attempt_transitioned"
 }
 
 // primaryRuntime names the first probed runtime for the attempt record

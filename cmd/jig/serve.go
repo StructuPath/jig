@@ -92,6 +92,16 @@ func serveCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintf(stderr, "jig serve: %v\n", err)
 		return exitInfraFailed
 	}
+	// One data directory is one control plane. A second `jig serve` over it
+	// would run a second sweeper and a second admission loop, so every
+	// schedule would fire twice; the flock is dropped by the kernel however
+	// the process ends, so there is never a stale lock to clear.
+	lock, err := lockServeData(*dataDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "jig serve: %v\n", err)
+		return exitInfraFailed
+	}
+	defer lock.release()
 	// Open applies the embedded migrations and records each in the ledger; a
 	// re-open is a no-op (U1).
 	store, err := controlplane.Open(ctx, filepath.Join(*dataDir, "jig.db"))
@@ -182,6 +192,24 @@ func serveCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return exitInfraFailed
 	}
 	return exitAccepted
+}
+
+// lockServeData takes the exclusive flock on <data>/serve.lock for the
+// server's lifetime, the control-plane twin of lockWorkerData.
+func lockServeData(dataDir string) (*workerDataLock, error) {
+	path := filepath.Join(dataDir, "serve.lock")
+	file, err := lockDataFile(path, "serve data lock")
+	if errors.Is(err, errDataLockHeld) {
+		holder := "unknown"
+		if note, readErr := os.ReadFile(path); readErr == nil && strings.TrimSpace(string(note)) != "" {
+			holder = strings.TrimSpace(string(note))
+		}
+		return nil, fmt.Errorf("%s is in use by another jig serve (pid %s)", dataDir, holder)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &workerDataLock{file: file}, nil
 }
 
 // serveHandler composes the two halves of the one origin: the control-plane

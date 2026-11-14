@@ -155,19 +155,22 @@ func TestGitHubMergeUsesImmediateExactHeadAndRecoversAfterLostResponse(t *testin
 					b, _ := json.Marshal(map[string]any{"head": map[string]string{"sha": remoteHead}, "merged": merged, "merge_commit_sha": mergedSHA})
 					return b, nil, false, false, nil
 				}
-				want := []string{"api", "--method", "PUT", "repos/example/repo/pulls/1/merge", "-f", "sha=" + head, "-f", "merge_method=squash"}
+				want := []string{"api", "-i", "--method", "PUT", "repos/example/repo/pulls/1/merge", "-f", "sha=" + head, "-f", "merge_method=squash"}
 				if strings.Join(args, " ") != strings.Join(want, " ") {
 					t.Fatalf("unsafe merge args: %v", args)
 				}
 				puts++
 				if scenario == "queue required" {
-					return nil, []byte("required merge queue (HTTP 405)"), false, false, errors.New("exit 1")
+					return []byte("HTTP/2.0 405 Method Not Allowed\nContent-Type: application/json\r\n\r\n" +
+							`{"message":"Repository rule violations found\n\nChanges must be made through the merge queue"}`),
+						[]byte("gh: Repository rule violations found (HTTP 405)"), false, false, errors.New("exit 1")
 				}
 				merged = true
 				if scenario == "lost response" {
 					return nil, nil, false, false, errors.New("connection lost")
 				}
-				return []byte(`{"merged":true,"sha":"` + mergedSHA + `"}`), nil, false, false, nil
+				return []byte("HTTP/2.0 200 OK\nContent-Type: application/json\r\n\r\n" +
+					`{"merged":true,"sha":"` + mergedSHA + `"}`), nil, false, false, nil
 			}
 			sha, err := g.MergePullRequest(context.Background(), "github.com/example/repo", "https://github.com/example/repo/pull/1", "squash", head)
 			if scenario == "lost response" {
@@ -189,6 +192,45 @@ func TestGitHubMergeUsesImmediateExactHeadAndRecoversAfterLostResponse(t *testin
 				if err != nil || sha != mergedSHA || puts > 1 {
 					t.Fatalf("merge sha=%s err=%v puts=%d", sha, err, puts)
 				}
+			}
+		})
+	}
+}
+
+// Failures are classified by the HTTP status `gh api -i` reports, never by
+// words in stderr: a PR titled "Fix 403 conflict handling" must not turn a
+// moved head into a conflict.
+func TestGitHubMergeFailureIsClassifiedByHTTPStatus(t *testing.T) {
+	head := strings.Repeat("1", 40)
+	misleading := []byte("gh: Fix 403 conflict handling in 422 path (HTTP %d)")
+	cases := []struct {
+		name, response, want string
+	}{
+		{"head moved", "HTTP/2.0 409 Conflict\nContent-Type: application/json\r\n\r\n" +
+			`{"message":"Head branch was modified. Review and try the merge again."}`, "merge_head_moved"},
+		{"conflict", "HTTP/2.0 405 Method Not Allowed\n\r\n" +
+			`{"message":"Pull Request has merge conflicts"}`, "merge_conflict"},
+		{"not mergeable", "HTTP/2.0 405 Method Not Allowed\n\r\n" +
+			`{"message":"Pull Request is not mergeable"}`, "merge_blocked"},
+		{"forbidden", "HTTP/2.0 403 Forbidden\n\r\n" + `{"message":"Resource not accessible"}`, "merge_blocked"},
+		{"invalid", "HTTP/2.0 422 Unprocessable Entity\n\r\n" + `{"message":"Validation Failed"}`, "merge_blocked"},
+		{"server error", "HTTP/2.0 502 Bad Gateway\n\r\n" + `{"message":"conflict 409"}`, "merge_failed"},
+		{"no answer", "", "merge_failed"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g := &GitHubCLIGateway{LookPath: func(string) (string, error) { return "gh", nil }}
+			g.Run = func(_ context.Context, _ string, args ...string) ([]byte, []byte, bool, bool, error) {
+				if len(args) == 2 {
+					b, _ := json.Marshal(map[string]any{"head": map[string]string{"sha": head}})
+					return b, nil, false, false, nil
+				}
+				return []byte(c.response), misleading, false, false, errors.New("exit 1")
+			}
+			_, err := g.MergePullRequest(context.Background(), "github.com/example/repo",
+				"https://github.com/example/repo/pull/1", "squash", head)
+			if got := publishCode(err); got != c.want {
+				t.Fatalf("code = %q, want %q (err %v)", got, c.want, err)
 			}
 		})
 	}
