@@ -23,7 +23,7 @@ import (
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
-const jobUsage = `Usage: jig job release [flags] <job-id>
+const jobUsage = `Usage: jig job release <job-id> [flags]
 
 Finish publishing an accepted_unpublished job — release a publish hold, or
 retry a publish that did not complete — without stopping the worker. The
@@ -40,7 +40,8 @@ Ctrl-C and the request stays recorded.
 For a worker that is stopped, use jig worker publish-retry instead.
 
 Flags:
-  --server <url>  control plane base URL (default http://127.0.0.1:8383)
+  --server <url>  control plane base URL
+                  (default $JIG_SERVER or http://127.0.0.1:8383)
   --no-wait       record the request and return
   --json          emit the job as JSON
 
@@ -60,11 +61,12 @@ Exit codes:
 var jobReleasePollInterval = 2 * time.Second
 
 func jobCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+	if len(args) == 0 {
 		fmt.Fprint(stderr, jobUsage)
-		if len(args) == 0 {
-			return exitUsage
-		}
+		return exitUsage
+	}
+	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprint(stdout, jobUsage)
 		return exitAccepted
 	}
 	if args[0] != "release" {
@@ -78,15 +80,14 @@ func jobRelease(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	flags := flag.NewFlagSet("jig job release", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, jobUsage) }
-	server := flags.String("server", "http://"+defaultServerAuthority, "control plane URL")
+	server := serverFlag(flags)
 	noWait := flags.Bool("no-wait", false, "record the request and return")
 	asJSON := flags.Bool("json", false, "emit the job as JSON")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 1 {
-		fmt.Fprint(stderr, jobUsage)
-		return exitUsage
+		return usageError(stderr, "jig job release", "exactly one job id is required", jobUsage)
 	}
 	jobID := flags.Arg(0)
 	jobPath := "/api/jobs/" + url.PathEscape(jobID)
@@ -94,7 +95,7 @@ func jobRelease(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	var requested protocol.Job
 	if err := apiCall(ctx, *server, http.MethodPost, jobPath+"/publish-request", nil, &requested); err != nil {
 		fmt.Fprintf(stderr, "jig job release: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *noWait {
 		if *asJSON {

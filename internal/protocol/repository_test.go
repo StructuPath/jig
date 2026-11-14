@@ -7,6 +7,7 @@ package protocol
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -76,9 +77,18 @@ func TestALocalRepositoryNormalizesThroughItsSymlinks(t *testing.T) {
 }
 
 func TestAnUnrecognizableRepositoryIdentityIsRefusedRatherThanGuessed(t *testing.T) {
-	for _, form := range []string{"", "   ", "not-a-repo", "relative/path", "/no/such/path/here"} {
+	for _, form := range []string{"", "   ", "not-a-repo", "relative/path", "/no/such/path/here",
+		".", "./repo", "../repo"} {
 		if got, err := NormalizeRepositoryIdentity(form); err == nil {
 			t.Fatalf("normalize %q returned %q, want a refusal", form, got)
+		}
+	}
+	// The refusal lists the accepted forms, so the operator can fix the
+	// argument from the message alone.
+	_, err := NormalizeRepositoryIdentity(".")
+	for _, form := range []string{"absolute path", "file:///", "github.com/owner/repo"} {
+		if err == nil || !strings.Contains(err.Error(), form) {
+			t.Fatalf("refusal %v does not list %q", err, form)
 		}
 	}
 }

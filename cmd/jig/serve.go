@@ -74,12 +74,14 @@ func serveCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	address := flags.String("addr", controlplane.DefaultListenAddress, "listen address")
 	allowNonLoopback := flags.Bool("allow-non-loopback", false, "bind a non-loopback address")
 	noGitHubPoll := flags.Bool("no-github-poll", false, "disable GitHub trigger polling")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
-	if flags.NArg() != 0 || *dataDir == "" {
-		flags.Usage()
-		return exitUsage
+	if flags.NArg() != 0 {
+		return usageError(stderr, "jig serve", fmt.Sprintf("unexpected argument %q", flags.Arg(0)), serveUsage)
+	}
+	if *dataDir == "" {
+		return usageError(stderr, "jig serve", "--data is required", serveUsage)
 	}
 	if ctx == nil {
 		ctx = context.Background()

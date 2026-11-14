@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"slices"
 	"strings"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/engine"
@@ -42,6 +43,16 @@ const (
 // runtimeNames is the accepted `--runtime` vocabulary, for usage text and
 // for the error a typo produces.
 var runtimeNames = []string{runtimeClaudeCode, runtimeCodex}
+
+// unknownRuntime names a --runtime outside the vocabulary, or returns "".
+// The commands check it before touching the data directory, so a typo is a
+// usage error (exit 2) rather than a runtime that failed to start.
+func unknownRuntime(name string) string {
+	if slices.Contains(runtimeNames, name) {
+		return ""
+	}
+	return fmt.Sprintf("unknown runtime %q — expected one of %s", name, strings.Join(runtimeNames, ", "))
+}
 
 // selectedRuntime is a probed adapter plus everything the callers need to
 // wire it: its capability record and the auth seeder for its ephemeral HOME.

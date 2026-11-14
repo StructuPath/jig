@@ -376,6 +376,9 @@ func ParseDefinition(source []byte) (*DefinitionSpec, error) {
 	decoder.KnownFields(true)
 	var spec DefinitionSpec
 	if err := decoder.Decode(&spec); err != nil {
+		if named := unknownFieldError(source); named != nil {
+			return nil, fmt.Errorf("parse definition: %w", named)
+		}
 		return nil, fmt.Errorf("parse definition: %w", err)
 	}
 	if err := spec.Validate(); err != nil {

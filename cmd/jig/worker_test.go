@@ -207,10 +207,13 @@ func TestDefCommandsCreateListShowAndInvokeAgainstTheAPIWithJSONOnEveryRead(t *t
 		t.Fatalf("invoke --json does not report the fanned-out jobs with pinned SHAs:\n%s", invoked)
 	}
 
-	// An unknown definition is the control plane's own diagnostic, verbatim.
-	failure := runDefStderr(t, exitInfraFailed, "show", "--server", base, "no-such-definition")
-	if !strings.Contains(failure, "not_found") {
-		t.Fatalf("stderr does not carry the control plane's code:\n%s", failure)
+	// An unknown definition is named back, whether it was given as a name
+	// or as an id the store does not hold.
+	for _, reference := range []string{"no-such-definition", "00000000-0000-4000-8000-000000000000"} {
+		failure := runDefStderr(t, exitInfraFailed, "show", "--server", base, reference)
+		if !strings.Contains(failure, `no definition named or with id "`+reference+`"`) {
+			t.Fatalf("stderr does not name the missing definition:\n%s", failure)
+		}
 	}
 }
 
