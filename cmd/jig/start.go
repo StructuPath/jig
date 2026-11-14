@@ -96,11 +96,7 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		if running && workerDone == nil {
 			fmt.Fprintf(stdout, "Starting your signed-in %s worker…\n", *runtimeName)
 			workerDone = make(chan int, 1)
-			workerArgs := []string{"--runtime", *runtimeName, "--server", url,
-				"--data", filepath.Join(*dataDir, "worker")}
-			if *allowMerge {
-				workerArgs = append(workerArgs, "--allow-merge")
-			}
+			workerArgs := startWorkerArgs(*runtimeName, url, *dataDir, *allowMerge)
 			go func() { workerDone <- workerCommand(workerCtx, workerArgs, stdout, stderr) }()
 		}
 		select {
@@ -155,6 +151,19 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		serverDone <- code
 		return exitInfraFailed
 	}
+}
+
+// startWorkerArgs are the flags of the worker `jig start` launches. The
+// server is always passed: start checks readiness against its own address,
+// so a worker that fell back to $JIG_SERVER could register with another
+// control plane and leave start waiting on a worker that never appears.
+func startWorkerArgs(runtimeName, server, dataDir string, allowMerge bool) []string {
+	args := []string{"--runtime", runtimeName, "--server", server,
+		"--data", filepath.Join(dataDir, "worker")}
+	if allowMerge {
+		args = append(args, "--allow-merge")
+	}
+	return args
 }
 
 func localWorkerReady(

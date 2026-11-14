@@ -281,6 +281,10 @@ func TestATypoIsCorrectedAtEveryLevel(t *testing.T) {
 		{defCommand, []string{"show", "foo", "--server"}, "jig def show: flag needs an argument: --server", "Usage: jig def show"},
 		{serveCommand, []string{"--data"}, "jig serve: flag needs an argument: --data", "Usage: jig serve"},
 		{runCommand, []string{"--def", "d.yaml", ".", "p", "--data"}, "jig run: flag needs an argument: --data", "Usage: jig run"},
+		// The #60 repro: a trailing --instructions once admitted a run with
+		// the sentinel as its instructions.
+		{defCommand, []string{"invoke", "x", "--repo", ".", "--instructions"},
+			"jig def invoke: flag needs an argument: --instructions", "Usage: jig def invoke"},
 	} {
 		code, _, stderr := jigCommand(t, tc.command, tc.args...)
 		if code != exitUsage {

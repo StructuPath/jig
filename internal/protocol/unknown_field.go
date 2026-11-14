@@ -30,11 +30,13 @@ func findUnknownField(node *yaml.Node, schema reflect.Type, where string) error 
 	for schema.Kind() == reflect.Pointer {
 		schema = schema.Elem()
 	}
+	node = resolveAlias(node)
 	switch {
 	case schema.Kind() == reflect.Struct && node.Kind == yaml.MappingNode:
 		fields := yamlFields(schema)
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			key, value := node.Content[i], node.Content[i+1]
+		pairs := mappingPairs(node, nil)
+		for i := 0; i+1 < len(pairs); i += 2 {
+			key, value := pairs[i], pairs[i+1]
 			field, known := fields[key.Value]
 			if !known {
 				names := make([]string, 0, len(fields))
@@ -57,12 +59,13 @@ func findUnknownField(node *yaml.Node, schema reflect.Type, where string) error 
 			}
 		}
 	case schema.Kind() == reflect.Map && node.Kind == yaml.MappingNode:
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			child := fmt.Sprintf("%s[%q]", where, node.Content[i].Value)
+		pairs := mappingPairs(node, nil)
+		for i := 0; i+1 < len(pairs); i += 2 {
+			child := fmt.Sprintf("%s[%q]", where, pairs[i].Value)
 			if where == "roster" {
-				child = fmt.Sprintf("role %q", node.Content[i].Value)
+				child = fmt.Sprintf("role %q", pairs[i].Value)
 			}
-			if err := findUnknownField(node.Content[i+1], schema.Elem(), child); err != nil {
+			if err := findUnknownField(pairs[i+1], schema.Elem(), child); err != nil {
 				return err
 			}
 		}
@@ -100,13 +103,57 @@ func yamlFields(schema reflect.Type) map[string]reflect.Type {
 }
 
 func mappingValue(node *yaml.Node, key string) string {
+	node = resolveAlias(node)
 	if node.Kind != yaml.MappingNode {
 		return ""
 	}
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i].Value == key {
-			return node.Content[i+1].Value
+	pairs := mappingPairs(node, nil)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if pairs[i].Value == key {
+			return resolveAlias(pairs[i+1]).Value
 		}
 	}
 	return ""
+}
+
+// resolveAlias follows an alias (*role) to the node its anchor names, which
+// is what the decoder reads in its place.
+func resolveAlias(node *yaml.Node) *yaml.Node {
+	for node != nil && node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	return node
+}
+
+// mappingPairs is a mapping's key/value pairs as the decoder sees them: a
+// merge key (`<<: *role` or `<<: [*a, *b]`) is not a field but the pairs of
+// the mappings it names, so the walk checks those keys — at the lines they
+// were written on — instead of rejecting "<<" and hiding the real typo.
+// merging guards against an anchor that merges itself.
+func mappingPairs(node *yaml.Node, merging map[*yaml.Node]bool) []*yaml.Node {
+	pairs := make([]*yaml.Node, 0, len(node.Content))
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		if key.Kind != yaml.ScalarNode || key.ShortTag() != "!!merge" {
+			pairs = append(pairs, key, value)
+			continue
+		}
+		sources := []*yaml.Node{value}
+		if resolved := resolveAlias(value); resolved != nil && resolved.Kind == yaml.SequenceNode {
+			sources = resolved.Content
+		}
+		for _, source := range sources {
+			source = resolveAlias(source)
+			if source == nil || source.Kind != yaml.MappingNode || merging[source] {
+				continue
+			}
+			if merging == nil {
+				merging = map[*yaml.Node]bool{}
+			}
+			merging[source] = true
+			pairs = append(pairs, mappingPairs(source, merging)...)
+			delete(merging, source)
+		}
+	}
+	return pairs
 }

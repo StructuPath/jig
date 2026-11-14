@@ -84,7 +84,9 @@ func reportCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var raw json.RawMessage
 	if err := apiCall(ctx, *server, http.MethodGet, path, nil, &raw); err != nil {
 		fmt.Fprintf(stderr, "jig report: %v\n", err)
-		return exitInfraFailed
+		// The window is checked by the server (since before until), and that
+		// rejection is what the operator typed: exit 2, like every invalid_*.
+		return apiExit(err)
 	}
 	if *asJSON {
 		fmt.Fprintf(stdout, "%s\n", raw)

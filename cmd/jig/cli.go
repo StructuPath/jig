@@ -182,21 +182,61 @@ func cliRepository(value string) string {
 		strings.Contains(host, ".") && !strings.HasPrefix(host, ".") {
 		return value
 	}
-	absolute, err := filepath.Abs(trimmed)
+	if !hasParentStep(trimmed) {
+		absolute, err := filepath.Abs(trimmed)
+		if err != nil {
+			return value
+		}
+		return absolute
+	}
+	// A ".." means what the operating system makes of it — the parent of
+	// whatever the preceding component resolves to — not what lexical
+	// cleaning makes of it: with link -> target/child, link/../repo is
+	// target/repo, and filepath.Abs would say ./repo. Resolve symlinks first;
+	// a path that does not resolve is sent uncleaned, so the control plane's
+	// own EvalSymlinks fails on (or resolves) the same path the OS would.
+	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil {
+		if absolute, err := filepath.Abs(resolved); err == nil {
+			return absolute
+		}
+	}
+	working, err := os.Getwd()
 	if err != nil {
 		return value
 	}
-	return absolute
+	return working + string(filepath.Separator) + trimmed
+}
+
+// hasParentStep reports a ".." component, the one step lexical cleaning can
+// get wrong.
+func hasParentStep(path string) bool {
+	for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+		if component == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 var definitionIDPattern = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // resolveDefinition turns an operator's definition reference — its id or
-// its name, which the store keeps unique — into the id the API takes.
+// its name, which the store keeps unique — into the id the API takes. An
+// id-shaped reference is tried as an id first, then as a name: a name is
+// free-form, so a definition may be named like a UUID and must still be
+// reachable by that name.
 func resolveDefinition(ctx context.Context, server, reference string) (string, error) {
 	if definitionIDPattern.MatchString(reference) {
-		return reference, nil
+		var definition protocol.Definition
+		err := apiCall(ctx, server, http.MethodGet,
+			"/api/definitions/"+url.PathEscape(reference), nil, &definition)
+		if err == nil {
+			return reference, nil
+		}
+		if !isNotFound(err) {
+			return "", err
+		}
 	}
 	var definitions []protocol.Definition
 	if err := apiCall(ctx, server, http.MethodGet, "/api/definitions", nil, &definitions); err != nil {

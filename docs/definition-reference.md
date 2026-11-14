@@ -76,7 +76,7 @@ One entry per agent role under `roster:`.
 | `tools` | list of strings | no | none (CLI default tool set) | Tool names, joined with commas into Claude Code's `--tools`. A capability list, not a sandbox: the write boundary is `writes`. Refused under `runtime: codex`. | `tools: [Read, Grep, Glob, Bash]` |
 | `writes` | list of globs | no | omitted = unrestricted | Write allowlist, checked after the phase against the worktree. Omitted (`nil`) permits every path; `[]` is read-only; otherwise only matching paths may change. A breach rolls back and ends the attempt. | `writes: ["src/**", "docs/**"]` |
 | `env` | list of names | no | none | Environment allowlist: the only variables the agent receives (plus an ephemeral `HOME`). List `PATH` yourself. The union over all roles must be advertised by a worker for it to claim the job. | `env: [PATH, GH_TOKEN]` |
-| `sensitive_env` | list of names | no | none | Names whose values are redacted from every persisted trace. Values shorter than the redactor's minimum length are not redacted. | `sensitive_env: [GH_TOKEN]` |
+| `sensitive_env` | list of names | no | none | Names whose values are redacted from every persisted trace — the attempt JSONL and the events table, on worker runs and `jig run` alike (both persist through the worker's trace stream). Values shorter than the redactor's minimum length are not redacted. | `sensitive_env: [GH_TOKEN]` |
 
 Exactly one of `system_prompt` / `system_prompt_path` is required, and exactly
 one of `user_prompt` / `user_prompt_path` is required. Setting both of a pair
@@ -101,8 +101,8 @@ One entry per link under `phases:`.
 | `kind` | string | yes | — | `agent` or `code`. | `kind: agent` |
 | `owner` | string | agent: yes; code: no | — | A roster role. On an agent phase, the role that runs. On a code phase, only lends its `env` allowlist to the command and its gates. | `owner: builder` |
 | `command` | string | code: yes; agent: forbidden | — | Shell command run in the worktree. Exit 0 passes. Env is `PATH`, the owner's `env`, an ephemeral `HOME`, and `JIG_BASE_SHA` (the attempt's pinned base commit). | `command: go test ./...` |
-| `if` | string | no | `""` (always run) | Guard over the chain's merged field view. A bare field name runs the phase only when that field is truthy (not `false`, `0`, `""`, `null`, empty list, or empty object). Any multi-token value must parse as `<field> == <literal>` or `<field> != <literal>`. A guard that does not hold records the phase as skipped, which passes acceptance. | `if: revised`, `if: "risk != low"` |
-| `reports_fields` | bool | no | `false` | Code phases only. The command's last non-empty stdout line must be a JSON object; its keys join the envelope and the field view. The keys `status`, `summary`, `passed`, `failures`, `exit_code`, `output_tail` are reserved. A later agent envelope cannot overwrite a reported field. | `reports_fields: true` |
+| `if` | string | no | `""` (always run) | Guard over the chain's merged field view. A bare field name runs the phase only when that field is truthy (not `false`, `0`, `""`, `null`, empty list, or empty object). Any multi-token value must parse as `<field> == <literal>` or `<field> != <literal>`. A guard that does not hold records the phase as skipped, which passes `all_phases_passed`. A gate named in `acceptance` that only a skipped phase declares never ran, and fails acceptance (`gate never ran`). | `if: revised`, `if: "risk != low"` |
+| `reports_fields` | bool | no | `false` | Code phases only. The last non-empty line of the command's output must be a JSON object. Output is stdout and stderr combined, in the order written, so a command that logs to stderr after its report line must redirect that output (`2>/dev/null`) or print the report last; its keys join the envelope and the field view. The keys `status`, `summary`, `passed`, `failures`, `exit_code`, `output_tail` are reserved. A later agent envelope cannot overwrite a reported field. | `reports_fields: true` |
 | `gates` | list of [gate](#gate-block) | no | none | Claim verifiers run after the phase. | `gates: [{name: artifacts_exist}]` |
 | `on_fail` | [repair edge](#repair-edge-block) | no | none | The phase's one repair loop. | `on_fail: {run: build, then: rerun-self, budget: 2}` |
 
@@ -133,9 +133,9 @@ judge quality. Source: `internal/engine/gates.go`, `tests_intact.go`.
 | `artifacts_exist` | Every path in `artifacts` exists inside the worktree. An empty or absent `artifacts` list records no check and passes. | `artifacts` | `declared artifact path is not inside the worktree`; `declared artifact does not exist` |
 | `files_non_empty` | Every existing, non-directory path in `artifacts` has size > 0. Missing paths are left to `artifacts_exist`. | `artifacts` | `declared artifact is empty` |
 | `diff_matches_claims` | `changed_files` is present and is a list, and each entry exists inside the worktree. It checks existence on disk; it does not compare against `git diff`. `[]` passes ("the phase claims no changed files"). | `changed_files` | `the envelope claims no changed_files`; `changed_files must be a list of paths, got <type>`; `claimed changed file is not a path string`; `claimed changed file is not inside the worktree`; `claimed changed file does not exist` |
-| `verdict_consistent` | The verdict agrees with itself: no `approved: true` with blocking items or unmet findings, and a rejection names a problem. `approved` must be a JSON boolean; absence is a failure, not a rejection. | `approved` (bool), `blocking` (list), `findings[].met` (bool) | `<n> blocking item(s) while approved=true`; `<n> unmet requirement(s) while approved=true`; `"approved" is missing: state the verdict explicitly as true or false. …`; `"approved" must be a JSON boolean, got <type>: …`; `approved=false but no blocking item or unmet requirement was given` |
+| `verdict_consistent` | The verdict agrees with itself: no `approved: true` with blocking items or unmet findings, and a rejection names a problem. The order matters: with any blocking item or unmet finding, the gate passes unless `approved` is literally `true`, so a missing or non-boolean `approved` passes there as a rejection. Only with no blocking item and no unmet finding does a missing `approved` fail, and a non-boolean `approved` fail. Ask the reviewer's prompt for an explicit boolean `approved` every time. | `approved` (bool), `blocking` (list), `findings[].met` (bool) | `<n> blocking item(s) while approved=true`; `<n> unmet requirement(s) while approved=true`; `"approved" is missing: state the verdict explicitly as true or false. …`; `"approved" must be a JSON boolean, got <type>: …`; `approved=false but no blocking item or unmet requirement was given` |
 | `tests_pass` | The gate's `command` exits 0 in the worktree, with the phase's env. | none | `exit <n>` plus an output tail; `timed out` plus an output tail |
-| `tests_intact` | Diffs every changed file against the attempt's base commit. Test files (`_test.go`, `_test.py`, `test_*.py`, `conftest.py`, `*.test.*`/`*.spec.*` JS/TS, `_spec.rb`, and anything under `test/`, `tests/`, `__tests__/`, `spec/`) must not be deleted, lose tests or assertions, or gain skip/focus markers. Changed source files must not gain checker suppressions or stubs. Unreadable files fail closed. | none (reads git, not the envelope) | e.g. `test file deleted since base <sha>; restore it …`; `net loss of <n> <what> …`; `adds a skip/focus marker (…)…`; `the attempt has no pinned base commit to diff against` |
+| `tests_intact` | Diffs every changed file against the attempt's base commit. Test files (`_test.go`, `_test.py`, `test_*.py`, `conftest.py`, `*.test.*`/`*.spec.*` JS/TS, `_spec.rb`, and anything under `test/`, `tests/`, `__tests__/`, `spec/`) must not be deleted, lose tests or assertions, or gain skip/focus markers. Changed source files must not gain checker suppressions or stubs. A test file the gate cannot inspect (binary, over 4 MiB, a lexer edge case) fails closed. A source file it cannot inspect records a passing `not inspected for suppressions or stubs: …` check. | none (reads git, not the envelope) | e.g. `test file deleted since base <sha>; restore it …`; `net loss of <n> <what> …`; `adds a skip/focus marker (…)…`; `the attempt has no pinned base commit to diff against` |
 
 The envelope base fields (`internal/engine/envelope.go`): `status` (required,
 `"success"` or `"fail"`), `summary` (string), `artifacts` (list of strings),
@@ -191,9 +191,16 @@ How the group runs: each member runs in its own ephemeral HOME and session
 and is handed the envelope from before the group, never a sibling's. Any
 other worktree change while the group runs — including one a crashed member
 left — rolls back and aborts the attempt. Rejections resolve after every
-member finishes: the first member in declared order that rejected with
-budget left dispatches its repair target and charges only its own budget,
-and then the whole group runs again, so earlier approvals are re-judged. The
+member finishes, in declared order. A member whose repair edge did not
+trigger and that did not pass ends the attempt there, as it would
+sequentially. The first member whose edge triggered with budget left
+dispatches its repair target with its own envelope and charges only its own
+budget; later members are not judged on that run. Then the whole group runs
+again from the repair's envelope: every member that ran before runs again,
+including a reviewer that already approved, and spends its time and cost
+again. A member skipped by its guard on the first run stays skipped. A
+triggered member with its budget spent follows its `exhausted` rule:
+`fail-job` ends the attempt, `proceed` moves on to the next member. The
 group runs at most 1 + the sum of its members' budgets times.
 `examples/definitions/factory-parallel.yaml` is the stock factory with its
 review panel grouped; `factory.yaml` stays sequential.
@@ -422,7 +429,7 @@ phases:
 
   - name: classify-risk
     kind: code
-    reports_fields: true                  # last stdout line is a JSON object
+    reports_fields: true                  # last output line is a JSON object
     command: |
       echo "classifying"
       printf '{"risk":"low"}\n'

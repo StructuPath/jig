@@ -236,6 +236,18 @@ func TestReportRejectsAnUnparseableWindowWithUsage(t *testing.T) {
 	}
 }
 
+// A window only the server can judge — since after until — is still what
+// the operator typed, so its invalid_report_window rejection exits 2.
+func TestReportAnInvertedWindowIsAUsageError(t *testing.T) {
+	base, stop := startReportServe(t)
+	defer stop()
+	code, _, stderr := jigReport(t, "--server", base,
+		"--since", "2026-02-01T00:00:00Z", "--until", "2026-01-01T00:00:00Z")
+	if code != exitUsage || !strings.Contains(stderr, "invalid_report_window") {
+		t.Fatalf("an inverted window exited %d, want %d\nstderr: %s", code, exitUsage, stderr)
+	}
+}
+
 func TestReportExitsOneWhenTheServerIsUnreachable(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -29,6 +29,7 @@ import (
 	"github.com/StructuPath/JIG-Software-Factory/internal/engine/enginetest"
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 	"github.com/StructuPath/JIG-Software-Factory/internal/runtime"
+	"github.com/StructuPath/JIG-Software-Factory/internal/worker"
 )
 
 const runUsage = `Usage: jig run --def <file> [--data <dir>] [--runtime <name>] [--json] [--no-seed-auth] <repo-path> "<prompt>"
@@ -213,18 +214,35 @@ func engineExecutor(
 				fmt.Fprintf(os.Stderr, "jig run: destroy attempt scratch: %v\n", err)
 			}
 		}()
-		jsonl, err := engine.NewJSONLSink(execution.TracePath)
+		// The worker's own trace stream, not a raw JSONL sink: it is where the
+		// declared sensitive_env values are redacted before an event reaches
+		// the JSONL or the events table (R15), and a direct run persists a
+		// trace exactly as a worker run does.
+		spec, err := protocol.ParseDefinition([]byte(execution.Claim.Snapshot))
+		if err != nil {
+			return infraFail(fmt.Errorf("parse frozen definition: %w", err))
+		}
+		trace, err := worker.NewTraceStream(worker.TraceStreamConfig{
+			AttemptID: execution.Claim.Attempt.ID,
+			TracePath: execution.TracePath,
+			Ingest:    directIngester(execution.Persist),
+			Spec:      spec,
+			Environ:   os.Environ(),
+		})
 		if err != nil {
 			return infraFail(err)
 		}
-		defer jsonl.Close()
-		sink := engine.SinkFunc(func(event protocol.Event) error {
-			return errors.Join(jsonl.Emit(event), execution.Persist(event))
-		})
+		// Closed before the outcome is returned, so the store holds the
+		// terminal events before DirectRun records the terminal attempt.
+		defer func() {
+			if err := trace.Close(context.WithoutCancel(ctx)); err != nil {
+				fmt.Fprintf(os.Stderr, "jig run: trace: %v\n", err)
+			}
+		}()
 		runner, err := engine.New(engine.Config{
 			Runtime:     agentRuntime,
 			Capability:  capability,
-			Sink:        sink,
+			Sink:        trace,
 			ScratchRoot: scratchRoot,
 			SeedHome:    seeder,
 			BaseEnv:     os.Environ(),
@@ -254,6 +272,23 @@ func engineExecutor(
 			PublishHold: outcome.PublishHold,
 		}
 	}
+}
+
+// directIngester delivers a trace stream's batches straight into the direct
+// run's store, the in-process stand-in for the worker's HTTP ingestion. A
+// failed event fails the batch, which the stream replays; (attempt_id, seq)
+// makes the replay land once (KTD8).
+type directIngester func(protocol.Event) error
+
+func (persist directIngester) IngestEvents(
+	_ context.Context, _ string, batch protocol.EventBatch,
+) (protocol.EventBatchResult, error) {
+	for _, event := range batch.Events {
+		if err := persist(event); err != nil {
+			return protocol.EventBatchResult{}, err
+		}
+	}
+	return protocol.EventBatchResult{Accepted: len(batch.Events)}, nil
 }
 
 // resultSummary is the shape the engine writes into Attempt.Result: the

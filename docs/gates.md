@@ -16,9 +16,13 @@ enters the repair loop through the same door as a failing agent report.
 
 ## A verdict is stated, never inferred
 
-Under `verdict_consistent` a reviewer must write `approved` as a JSON
-boolean; omitting it is its own gate failure, not a silent rejection. The
-distinction matters because `on_fail: {when: "approved == false"}` is how a
+Under `verdict_consistent` a reviewer should write `approved` as a JSON
+boolean. With no blocking item and no unmet finding, omitting it (or writing
+a non-boolean) is its own gate failure, not a silent rejection. With a
+blocking item or an unmet finding, the gate checks only that `approved` is
+not `true`, so a missing verdict passes there as a rejection
+(`internal/engine/gates.go`). Ask for the boolean in every reviewer prompt.
+The distinction matters because `on_fail: {when: "approved == false"}` is how a
 review routes work back to a builder, and a verdict nobody stated must not
 decide that either way.
 
