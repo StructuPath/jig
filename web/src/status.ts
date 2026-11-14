@@ -6,7 +6,8 @@
 // the status is folded from the attempt, and from the job state only before
 // any attempt exists.
 import { parseAttemptSummary } from "./api";
-import type { Attempt, Delivery } from "./types";
+import { publishAction } from "./outcomes";
+import type { Attempt, Delivery, JobDetail } from "./types";
 
 export type Tone = "good" | "live" | "warn" | "bad" | "idle";
 export type ColumnID = "waiting" | "running" | "review" | "done" | "stopped";
@@ -69,4 +70,17 @@ export function jobStatus({ jobState, attempt, delivery, ask = false }: {
     case "lost": return { word: "Lost", tone: "bad", column: "stopped" };
     default: return { word: "Stopped", tone: "bad", column: "stopped" };
   }
+}
+
+/**
+ * jobOpen says whether a job's status can still change while its run state
+ * stays put: it is queued or running, a publish request waits on its worker,
+ * or it is unpublished work an operator can still release or retry. A publish
+ * retry leaves the run `mixed`, so a view that stops polling on the run state
+ * alone keeps saying "Held" after the job has moved to "Not published".
+ */
+export function jobOpen(detail: Pick<JobDetail, "job" | "attempts" | "delivery">): boolean {
+  if (["queued", "active"].includes(detail.job.state)) return true;
+  if (detail.job.publish_requested_at) return true;
+  return publishAction(detail.job.state, detail.attempts?.at(-1) ?? undefined, detail.delivery) !== null;
 }

@@ -55,12 +55,12 @@ it("names each starter by a hash of its final source, runtime pin included", asy
   }
 });
 
-function mockServer({ online = true, fail = false } = {}) {
+function mockServer({ online = true, fail = false, definitions = [] as unknown[] } = {}) {
   const fetch = vi.fn(async (url: string, init?: RequestInit) => {
     const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
     if (url === "/api/workers") return json({ workers: online ? [{ live: true, runtimes: [{ name: "codex" }] }] : [] });
     if (url === "/api/definitions" && init?.method === "POST") return json({ id: "definition-1" });
-    if (url === "/api/definitions") return json([]);
+    if (url === "/api/definitions") return json(definitions);
     if (url === "/api/runs" && init?.method === "POST") return fail ? json({ error: { code: "invalid_repository", message: "Project folder was not found." } }, 400) : json({ run: { id: "run-1" }, jobs: [] });
     return json([]);
   });
@@ -117,11 +117,28 @@ it("starts a job with no worker online and says the job waits", async () => {
   render(<Tasks />);
   fireEvent.change(screen.getByLabelText("1. Project"), { target: { value: "/tmp/project" } });
   expect(await screen.findByText(/No worker is online — the job waits until you run/)).toBeVisible();
+  // A starter job runs on Codex; plain `jig worker` runs Claude Code and
+  // would leave it queued.
+  expect(screen.getByText("jig worker --runtime codex", { selector: "code" })).toBeVisible();
   const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
   fireEvent.click(start);
   await waitFor(() => expect(window.location.pathname).toBe("/runs/run-1"));
   expect(fetch.mock.calls.some(([url, init]) => url === "/api/runs" && init?.method === "POST")).toBe(true);
+});
+
+it("names the runtime a saved workflow pins in the no-worker command", async () => {
+  mockServer({ online: false, definitions: [
+    { id: "d-pinned", name: "pinned", source: "name: pinned\nruntime: claude-code\n" },
+    { id: "d-any", name: "any", source: "name: any\n" },
+  ] });
+  render(<Tasks />);
+  const saved = await screen.findByRole("radio", { name: /Run a saved workflow/ });
+  await waitFor(() => expect(saved).toBeEnabled());
+  fireEvent.click(saved);
+  expect(await screen.findByText("jig worker --runtime claude-code", { selector: "code" })).toBeVisible();
+  fireEvent.change(screen.getByLabelText("Workflow"), { target: { value: "d-any" } });
+  expect(screen.getByText("jig worker", { selector: "code" })).toBeVisible();
 });
 
 it("opens a follow-up with the same project and an explicit Make changes choice", async () => {

@@ -15,7 +15,8 @@ import { formatDuration, isTerminalAttempt, projectName, stateLabel, taskHeading
 import { buildLane } from "./lanes";
 import { useAttemptEvents, usePolled } from "./polling";
 import { buildStations, verdictFor } from "./stations";
-import { isLocalDelivery, runTone } from "./status";
+import { isLocalDelivery, jobOpen, jobStatus, runTone } from "./status";
+import type { JobStatus } from "./status";
 import type { Attempt, JobDetail, Run, TraceEvent } from "./types";
 import { Link } from "./ui";
 
@@ -50,7 +51,7 @@ function FloorRow({ run, nowMs }: { run: Run; nowMs: number }) {
       {jobID
         ? <FloorJob jobID={jobID} run={run} name={name} settled={settled} nowMs={nowMs} />
         : jobs.length > 1 ? <ManyJobs run={run} count={jobs.length} name={name} />
-        : <Unlit state={run.state} name={name} />}
+        : <Unlit status={runStatus(run)} name={name} />}
     </tr>
   );
 }
@@ -74,11 +75,20 @@ function ManyJobs({ run, count, name }: { run: Run; count: number; name: ReactNo
   );
 }
 
+/**
+ * runStatus is a row's status before its job detail is known: the run state in
+ * the words and colour its board card and run header use for the same case.
+ */
+function runStatus(run: Run): Pick<JobStatus, "word" | "tone"> {
+  const state = taskState(run);
+  return { word: stateLabel(state), tone: runTone(state) };
+}
+
 /** Unlit is a row with nothing to light yet: no job, or no attempt. */
-function Unlit({ state, name }: { state: string; name: ReactNode }) {
+function Unlit({ status, name }: { status: Pick<JobStatus, "word" | "tone">; name: ReactNode }) {
   return (
     <>
-      <td><span className="floor-state floor-state-idle">{state}</span></td>
+      <td><span className={`floor-state floor-state-${status.tone}`}>{status.word}</span></td>
       {name}
       <td><span className="floor-none">—</span></td>
       <td className="floor-mono">—</td>
@@ -91,9 +101,11 @@ function FloorJob({ jobID, run, name, settled, nowMs }: {
   jobID: string; run: Run; name: ReactNode; settled: boolean; nowMs: number;
 }) {
   const loadJob = useCallback(() => api.job(jobID), [jobID]);
-  const job = usePolled(loadJob, settled ? 0 : 4000, `floor:job:${jobID}`);
+  // A settled run's job still changes while it is open (jobOpen): a publish
+  // retry leaves the run `mixed` and moves the job from Held on.
+  const job = usePolled(loadJob, (detail) => settled && detail && !jobOpen(detail) ? 0 : 4000, `floor:job:${jobID}`);
   const attempt = job.data?.attempts?.at(-1);
-  if (!job.data || !attempt) return <Unlit state={job.data ? "queued" : run.state} name={name} />;
+  if (!job.data || !attempt) return <Unlit status={job.data ? jobStatus({ jobState: job.data.job.state }) : runStatus(run)} name={name} />;
   // Only a live attempt follows its trace; a finished one is lit from its
   // result, so a floor of finished jobs polls nothing.
   return isTerminalAttempt(attempt.state)
@@ -129,7 +141,10 @@ function Cells({ detail, run, attempt, events, name, nowMs }: {
 
   return (
     <>
-      <td><span className={`floor-state floor-state-${verdict.tone}`}>{verdict.word}</span></td>
+      <td>
+        <span className={`floor-state floor-state-${verdict.tone}`}>{verdict.word}</span>
+        {verdict.station && <small className="floor-station">{verdict.station}</small>}
+      </td>
       {name}
       <td>
         {stations.length === 0 ? <span className="floor-none">—</span> : <span className="floor-lamps" role="img" aria-label={lampsLabel}>

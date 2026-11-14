@@ -13,10 +13,11 @@
 //     recognise goes to Needs review — an unknown state should reach a
 //     human, not vanish.
 //
-// A settled run whose one job's status is known (status.ts) lands in that
-// status's column, so the board and the job list never disagree about the
-// same job. Run state alone is the fallback: it cannot tell a held job from
-// one with nothing to publish, since both make the run `mixed`.
+// A one-job run whose job status is known (status.ts), active or settled,
+// lands in that status's column, so the board and the job list never
+// disagree about the same job. The queue and the run state are the
+// fallback: run state cannot tell a held job from one with nothing to
+// publish, since both make the run `mixed`.
 import { taskState } from "./format";
 import type { ColumnID, JobStatus } from "./status";
 import type { QueueEntry, Run } from "./types";
@@ -45,11 +46,11 @@ export interface Column {
  * reads it rather than `run.state`.
  */
 export function runColumn(run: Run, jobStates: string[] | undefined, status?: JobStatus): ColumnID {
+  if (status) return status.column;
   if (run.state === "active") {
     if (jobStates?.length && jobStates.every((state) => state === "queued")) return "waiting";
     return "running";
   }
-  if (status) return status.column;
   switch (taskState(run)) {
     case "accepted":
     case "complete":

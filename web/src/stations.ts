@@ -232,17 +232,19 @@ export function buildStations(
 export interface Verdict {
   word: string;
   tone: Tone;
+  /** The live station of a running attempt, shown beside the word, never in its place. */
+  station?: string;
 }
 
 /**
  * verdictFor is the one word the job page leads with: the shared job status
- * (status.ts), with a running attempt named by its live station.
+ * (status.ts), so it reads as the board card and the run header do. A running
+ * attempt also names its live station, as a separate label.
  */
 export function verdictFor(attempt: Attempt, stations: StationView[], delivery: Delivery | undefined, ask = false): Verdict {
   const { word, tone } = jobStatus({ attempt, delivery, ask });
-  if (attempt.state !== "running") return { word, tone };
-  const live = stations.find((station) => station.state === "live");
-  return { word: live ? live.label : word, tone };
+  const live = attempt.state === "running" ? stations.find((station) => station.state === "live") : undefined;
+  return live ? { word, tone, station: live.label } : { word, tone };
 }
 
 export interface FeedLine {

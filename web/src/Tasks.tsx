@@ -86,8 +86,13 @@ export function Tasks() {
   // waits. Only a saved-workflow choice with no workflow cannot start.
   const ready = saved ? Boolean(workflow) : true;
   const runnable = saved ? (pinned ? liveRuntimes.includes(pinned) : liveRuntimes.length > 0) : codexReady;
+  // `jig worker` runs Claude Code unless told otherwise, so the command names
+  // the runtime the job needs: Codex for the task form's own jobs, and the
+  // pinned runtime for a saved workflow that pins one.
+  const needed = saved ? pinned : "codex";
+  const workerCommand = needed ? `jig worker --runtime ${needed}` : "jig worker";
   const waitNote = liveRuntimes.length === 0
-    ? <>No worker is online — the job waits until you run <code>jig worker</code>.</>
+    ? <>No worker is online — the job waits until you run <code>{workerCommand}</code>.</>
     : `No online worker runs ${saved ? pinned ?? "any runtime" : "Codex"} — the job waits in the queue until one does.`;
   const taskNeeded = saved || mode !== "auto";
   const nowMs = useNow(1000);

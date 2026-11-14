@@ -6,21 +6,34 @@ import { useCallback, useRef } from "react";
 import { api } from "./api";
 import { buildBoard } from "./board";
 import { usePolled } from "./polling";
-import { jobStatus } from "./status";
+import { jobOpen, jobStatus } from "./status";
 import type { JobStatus } from "./status";
 import { TaskCard } from "./Tasks";
 import type { Run } from "./types";
 import { ErrorBanner } from "./ui";
 
-// runStatus is a settled one-job run's shared job status (status.ts), read
-// from the same job detail the job list reads, so the card and its column say
-// what the list says. A run over several jobs, or one whose detail fails to
-// load, has none and falls back to its run state.
-async function runStatus(run: Run): Promise<JobStatus | null> {
+interface RunStatus {
+  status: JobStatus;
+  /** The job can still change (jobOpen), so its status is read again. */
+  open: boolean;
+}
+
+// runStatus is a one-job run's shared job status (status.ts), read from the
+// same job detail the job list and the run header read, so the card and its
+// column say what they say — queued, preparing, running or settled. A run
+// over several jobs, or one whose detail fails to load, has none and falls
+// back to its run state.
+async function runStatus(run: Run): Promise<RunStatus | null> {
   const view = await api.run(run.id);
   if (view.jobs?.length !== 1) return null;
   const detail = await api.job(view.jobs[0].id);
-  return jobStatus({ jobState: detail.job.state, attempt: detail.attempts?.at(-1), delivery: detail.delivery, ask: run.parameters?.task_mode === "ask" });
+  const status = jobStatus({ jobState: detail.job.state, attempt: detail.attempts?.at(-1), delivery: detail.delivery, ask: run.parameters?.task_mode === "ask" });
+  return { status, open: run.state === "active" || jobOpen(detail) };
+}
+
+interface Statuses {
+  byRun: Map<string, JobStatus>;
+  open: boolean;
 }
 
 export function TaskBoard({ runs }: { runs: Run[] }) {
@@ -29,23 +42,35 @@ export function TaskBoard({ runs }: { runs: Run[] }) {
   // A failed queue poll is not a blank board: with no queue data the fold
   // shows active runs as Running and the banner says why (KTD6).
   //
-  // A settled run's status does not change, so it is read once per run and
-  // state, not polled. Active runs are placed from the queue.
-  const settled = runs.filter((run) => run.state !== "active");
-  const settledRef = useRef(settled);
-  settledRef.current = settled;
-  const settledKey = settled.map((run) => `${run.id}:${run.state}`).join(",");
-  const loadStatuses = useCallback(async () => {
-    const list = settledRef.current;
-    const results = await Promise.allSettled(list.map(runStatus));
-    const statuses = new Map<string, JobStatus>();
+  // Every one-job run reads its job status, active runs too, so a card never
+  // says "In progress" beside a header that says "Queued". A status that can
+  // no longer change is kept per run and state and not read again; the poll
+  // runs while any run is active or any job is open, and stops when none is.
+  const runsRef = useRef(runs);
+  runsRef.current = runs;
+  const closed = useRef(new Map<string, JobStatus>());
+  const runsKey = runs.map((run) => `${run.id}:${run.state}`).join(",");
+  const loadStatuses = useCallback(async (): Promise<Statuses> => {
+    const list = runsRef.current;
+    const results = await Promise.allSettled(list.map(async (run) => {
+      const kept = closed.current.get(`${run.id}:${run.state}`);
+      return kept ? { status: kept, open: false } : runStatus(run);
+    }));
+    const byRun = new Map<string, JobStatus>();
+    let open = false;
     results.forEach((result, index) => {
-      if (result.status === "fulfilled" && result.value) statuses.set(list[index].id, result.value);
+      const run = list[index];
+      if (result.status !== "fulfilled" || !result.value) return;
+      byRun.set(run.id, result.value.status);
+      if (result.value.open) open = true;
+      else closed.current.set(`${run.id}:${run.state}`, result.value.status);
     });
-    return statuses;
-  }, [settledKey]); // settledKey names the runs the ref holds; a new set reloads.
-  const statuses = usePolled(loadStatuses, 0, `board-statuses:${settledKey}`);
-  const board = buildBoard(runs, queue.data ? queue.data.entries ?? [] : null, statuses.data ?? undefined);
+    return { byRun, open };
+  }, []);
+  const active = runs.some((run) => run.state === "active");
+  const statuses = usePolled(loadStatuses, (data) => !data || data.open || active ? 2000 : 0, `board-statuses:${runsKey}`);
+  const byRun = statuses.data?.byRun;
+  const board = buildBoard(runs, queue.data ? queue.data.entries ?? [] : null, byRun);
 
   return <>
     <ErrorBanner error={queue.error} />
@@ -55,7 +80,7 @@ export function TaskBoard({ runs }: { runs: Run[] }) {
           <h2 id={`board-${column.id}`}>{column.label} <span className="board-count">{column.runs.length}</span></h2>
           {column.runs.length === 0 ?
             <p className="subtle board-empty">Nothing here.</p> :
-            column.runs.map((run) => <TaskCard key={run.id} run={run} status={statuses.data?.get(run.id)} />)}
+            column.runs.map((run) => <TaskCard key={run.id} run={run} status={byRun?.get(run.id)} />)}
         </section>
       ))}
     </div>

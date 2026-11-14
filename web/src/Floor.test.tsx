@@ -101,9 +101,11 @@ afterEach(() => vi.unstubAllGlobals());
 
 it("lights a finished job's row from its result, without reading its trace", async () => {
   render(<Floor runs={[run("run-done", "accepted", "Hint when no control plane answers")]} nowMs={NOW} />);
-  // The row's cells are replaced as its job detail arrives, so the row is
-  // found through the verdict that only the finished detail produces.
-  const row = within((await screen.findByText("Accepted")).closest("tr") as HTMLElement);
+  // The row's cells are replaced as its job detail arrives, and the run
+  // state already reads "Accepted" before then, so the row is found through
+  // the lamps that only the finished detail produces.
+  const row = within((await screen.findByRole("img", { name: "5 of 5 stations passed" })).closest("tr") as HTMLElement);
+  expect(row.getByText("Accepted")).toBeVisible();
   expect(row.getByText("Hint when no control plane answers")).toBeVisible();
   // Three phases plus publish and CI, all proven.
   expect(row.getByRole("img", { name: "5 of 5 stations passed" })).toBeVisible();
@@ -141,7 +143,9 @@ it("keeps a row readable when the run has no job yet", async () => {
   render(<Floor runs={[run("run-empty", "active", "Queued work")]} nowMs={NOW} />);
   const row = within((await screen.findByText("Queued work")).closest("tr") as HTMLElement);
   await waitFor(() => expect(requests).toContain("/api/runs/run-empty"));
-  expect(row.getByText("active")).toBeVisible();
+  // Before any job exists the row reads the run state as its board card and
+  // run header do.
+  expect(row.getByText("In progress")).toBeVisible();
 });
 
 it("starts a saved workflow as itself, on the runtime it pins", async () => {

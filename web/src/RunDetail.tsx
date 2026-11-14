@@ -13,7 +13,7 @@ import { attemptOutcome, publishAction } from "./outcomes";
 import { useAttemptEvents, useNow, usePolled } from "./polling";
 import { StationLine, TimingStrip } from "./StationLine";
 import { buildFeed, buildStations, verdictFor } from "./stations";
-import { jobStatus } from "./status";
+import { jobOpen, jobStatus } from "./status";
 import { SwimLane } from "./SwimLane";
 import { taskSteps } from "./starters";
 import type { TaskMode } from "./starters";
@@ -80,10 +80,13 @@ const SETTLED_RUNS = ["accepted", "failed", "cancelled", "mixed"];
 // RunStatus is the run header's badge. A one-job run shows its job's status,
 // the same word and colour as the job list and the board; a run over several
 // repositories has no single job to speak for it and keeps the run state.
+// A settled run still polls while its job can change (jobOpen): a publish
+// retry moves the job on while the run stays `mixed`.
 function RunStatus({ run, jobs }: { run: Run; jobs: Job[] }) {
   const jobID = jobs.length === 1 ? jobs[0].id : null;
   const load = useCallback(() => jobID ? api.job(jobID) : Promise.resolve(null), [jobID]);
-  const { data } = usePolled(load, SETTLED_RUNS.includes(run.state) ? 0 : 3000, `run-status:${jobID ?? run.id}:${run.state}`);
+  const settled = SETTLED_RUNS.includes(run.state);
+  const { data } = usePolled(load, (detail) => settled && (!jobID || (detail && !jobOpen(detail))) ? 0 : 3000, `run-status:${jobID ?? run.id}:${run.state}`);
   if (!jobID || !data) return <StatusBadge state={taskState(run)} />;
   return <JobBadge status={jobStatus({ jobState: data.job.state, attempt: data.attempts?.at(-1), delivery: data.delivery, ask: run.parameters?.task_mode === "ask" })} />;
 }
@@ -324,7 +327,7 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
         </div>
         <p className={`verdict verdict-${verdict.tone}`}>
           {verdict.word}
-          <small>{formatDuration(elapsed)} elapsed{lastEvent?.started_at && !terminal ? ` · Last activity ${formatDuration(Math.max(0, nowMs - Date.parse(lastEvent.started_at)))} ago` : ""}</small>
+          <small>{verdict.station ? `${verdict.station} · ` : ""}{formatDuration(elapsed)} elapsed{lastEvent?.started_at && !terminal ? ` · Last activity ${formatDuration(Math.max(0, nowMs - Date.parse(lastEvent.started_at)))} ago` : ""}</small>
         </p>
       </section>
 
