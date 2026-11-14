@@ -86,6 +86,11 @@ func runShellCommand(
 	output := io.MultiWriter(tail, lines)
 	shell.Stdout = output
 	shell.Stderr = output
+	// Output goes to a Go writer, so Wait also waits for the copy from the
+	// pipe to end — and a process the command backgrounded (`server & go
+	// test`) holds that pipe open after the shell exits. Without a bound, a
+	// gate that exited 0 would hang until the phase timeout (R8).
+	shell.WaitDelay = commandWaitDelay
 	if err := shell.Start(); err != nil {
 		return commandResult{ExitCode: -1, StartError: err.Error()}
 	}
@@ -110,6 +115,10 @@ func runShellCommand(
 		result := commandResult{OutputTail: tail.String(), LastLine: last, LastLineOverflow: overflow}
 		if exitError, ok := err.(*exec.ExitError); ok {
 			result.ExitCode = exitError.ExitCode()
+		} else if errors.Is(err, exec.ErrWaitDelay) {
+			// The shell exited 0 and only a backgrounded process still held
+			// the output pipe: a normal exit, judged as one.
+			result.ExitCode = 0
 		} else if err != nil {
 			result.ExitCode = -1
 			result.StartError = err.Error()
@@ -117,10 +126,20 @@ func runShellCommand(
 		return result
 	case <-ctx.Done():
 		_ = syscall.Kill(-shell.Process.Pid, syscall.SIGKILL)
-		<-done
+		// WaitDelay already bounds Wait once the shell is dead; this bounds
+		// the case where the kill itself does not land, so a cancelled phase
+		// always returns.
+		select {
+		case <-done:
+		case <-time.After(2 * commandWaitDelay):
+		}
 		return commandResult{ExitCode: -1, TimedOut: true, OutputTail: tail.String()}
 	}
 }
+
+// commandWaitDelay is how long Wait keeps reading a command's output after
+// the shell itself has exited, before the pipes are closed.
+const commandWaitDelay = 5 * time.Second
 
 // reportedFields reads a reports_fields code phase's report: its last
 // non-empty output line, which must be a JSON object. Everything before it
