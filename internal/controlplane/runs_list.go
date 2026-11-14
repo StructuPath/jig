@@ -225,7 +225,7 @@ func runPage(ctx context.Context, tx *sql.Tx, before string, limit int) ([]proto
 		return nil, "", unavailable(err)
 	}
 	defer rows.Close()
-	runs := make([]protocol.Run, 0, limit)
+	runs := []protocol.Run{}
 	for rows.Next() {
 		run, err := scanRun(rows)
 		if err != nil {
