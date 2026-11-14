@@ -52,7 +52,9 @@ export function TaskBoard({ runs }: { runs: Run[] }) {
   const runsRef = useRef(runs);
   runsRef.current = runs;
   const closed = useRef(new Map<string, { key: string; status: JobStatus | null }>());
-  const runsKey = runs.map((run) => `${run.id}:${run.state}`).join(",");
+  // The update time is in the key so that a retry which settles between two
+  // run-list polls, in the same state, still restarts the status poll.
+  const runsKey = runs.map((run) => `${run.id}:${run.state}:${run.updated_at}`).join(",");
   const loadStatuses = useCallback(async (): Promise<Statuses> => {
     const list = runsRef.current;
     const keyOf = (run: Run) => `${run.state}:${run.updated_at}`;

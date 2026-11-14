@@ -223,6 +223,20 @@ it("reads a retried run afresh, so a job lost on retry says Lost rather than the
   await waitFor(() => expect(within(column("Stopped")).getByText("Lost")).toBeInTheDocument());
 });
 
+it("reads a run again when a retry settles between polls in the same state", async () => {
+  let body: JobBody = { state: "failed", attempt: { state: "failed" } };
+  mockStatusAPI({ job: () => body });
+  const failed = { ...run("run-quick", "failed", "Quick retry"), updated_at: "2026-10-02T10:00:00Z" };
+  const { rerender } = render(<TaskBoard runs={[failed]} />);
+  await waitFor(() => expect(within(column("Stopped")).getByText("Stopped")).toBeInTheDocument());
+
+  // The retry ran and was lost between two run-list polls: the board never
+  // saw the run active, only a newer update time in the same state.
+  body = { state: "failed", attempt: { state: "lost" } };
+  rerender(<TaskBoard runs={[{ ...failed, updated_at: "2026-10-02T10:05:00Z" }]} />);
+  await waitFor(() => expect(within(column("Stopped")).getByText("Lost")).toBeInTheDocument());
+});
+
 it("does not read settled runs over several jobs on every status poll", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   mockStatusAPI({ jobs: (id) => (id === "run-held" ? 1 : 2), job: () => heldJob });
