@@ -342,7 +342,11 @@ func excerpt(head string, length int64) (string, bool) {
 // last phase event per (attempt, phase) from the trace, then the statuses in
 // each attempt's result, which win once the attempt has one — the job page
 // reads them in that same order. Phases keep the order they first appeared
-// in, trace first. Two queries whatever the number of attempts.
+// in, trace first. A phase whose last event is phase_start reads "running"
+// while its attempt is open and "stopped" once the attempt has completed_at
+// — the sweeper closes a lost attempt that way, with no result and no
+// phase_end — as the lane's completion fallback does (web/src/lanes.ts). Two
+// queries whatever the number of attempts.
 func pagePhaseProgress(ctx context.Context, tx *sql.Tx, attemptIDs string) (map[string][]PhaseProgress, error) {
 	progress := map[string][]PhaseProgress{}
 	index := map[string]map[string]int{}
@@ -360,8 +364,8 @@ func pagePhaseProgress(ctx context.Context, tx *sql.Tx, attemptIDs string) (map[
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.attempt_id, e.phase, e.type, e.payload, last.rounds
-		FROM events e JOIN (
+		SELECT e.attempt_id, e.phase, e.type, e.payload, last.rounds, a.completed_at IS NOT NULL
+		FROM events e JOIN attempts a ON a.id = e.attempt_id JOIN (
 			SELECT attempt_id, phase, MAX(seq) AS last_seq, MIN(seq) AS first_seq,
 			       SUM(type = 'phase_start') AS rounds
 			FROM events
@@ -379,10 +383,14 @@ func pagePhaseProgress(ctx context.Context, tx *sql.Tx, attemptIDs string) (map[
 		var attemptID, phase, kind string
 		var body []byte
 		var rounds int
-		if err := rows.Scan(&attemptID, &phase, &kind, &body, &rounds); err != nil {
+		var completed bool
+		if err := rows.Scan(&attemptID, &phase, &kind, &body, &rounds, &completed); err != nil {
 			return nil, unavailable(err)
 		}
 		status := "running"
+		if completed {
+			status = "stopped"
+		}
 		switch kind {
 		case protocol.EventPhaseDeath:
 			status = "death"

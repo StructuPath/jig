@@ -432,6 +432,57 @@ func TestRunListShowsPhaseProgressOfAnActiveAttemptFromItsTrace(t *testing.T) {
 	}
 }
 
+// A worker that dies mid-phase leaves a phase_start with no phase_end; the
+// sweeper marks the attempt lost and sets completed_at without a result. The
+// job page then shows that phase "stopped" (web/src/lanes.ts), so the list
+// must too, and a result status still wins once there is one.
+func TestRunListShowsASweptAttemptsOpenPhaseAsStopped(t *testing.T) {
+	store, _ := newTestStore(t)
+	seedRunSnapshot(t, store, "run-swept", runListSnapshot)
+	seedListJob(t, store, "run-swept", "job-swept", protocol.JobActive, "running")
+	if _, err := store.db.Exec(`
+		UPDATE attempts SET result = NULL, lease_expires_at = ? WHERE id = 'job-swept-a1'
+	`, store.now().UnixMilli()-1); err != nil {
+		t.Fatal(err)
+	}
+	status := func(value string) json.RawMessage { return json.RawMessage(fmt.Sprintf(`{"status":%q}`, value)) }
+	if err := store.AppendEvents(context.Background(), "job-swept-a1", []protocol.Event{
+		{Seq: 1, Type: protocol.EventPhaseStart, Phase: "build"},
+		{Seq: 2, Type: protocol.EventPhaseEnd, Phase: "build", Payload: status(protocol.EnvelopeSuccess)},
+		{Seq: 3, Type: protocol.EventPhaseStart, Phase: "test"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, swept, err := store.sweepAttempt(context.Background(), "job-swept-a1", store.now().UnixMilli()); err != nil || !swept {
+		t.Fatalf("sweep: swept %v, err %v", swept, err)
+	}
+
+	read := func() JobSummary {
+		t.Helper()
+		items, _, err := store.RunList(context.Background(), RunListPage{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return items[0].JobSummaries[0]
+	}
+	got := read()
+	if got.LatestAttempt == nil || got.LatestAttempt.State != protocol.AttemptLost || got.LatestAttempt.CompletedAt == nil {
+		t.Fatalf("swept attempt: %+v, want lost with completed_at", got.LatestAttempt)
+	}
+	if fmt.Sprint(got.Phases) != "[{build success 1} {test stopped 1}]" {
+		t.Fatalf("swept attempt: phases %+v, want build success then test stopped", got.Phases)
+	}
+
+	if _, err := store.db.Exec(`
+		UPDATE attempts SET result = '{"phases":[{"phase":"test","status":"fail"}]}' WHERE id = 'job-swept-a1'
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); fmt.Sprint(got.Phases) != "[{build success 1} {test fail 1}]" {
+		t.Fatalf("with a result: phases %+v, want the result's test status to win", got.Phases)
+	}
+}
+
 func TestRunListCutsResultAndErrorToAFirstLineExcerpt(t *testing.T) {
 	store, _ := newTestStore(t)
 	seedRunSnapshot(t, store, "run-big", runListSnapshot)
