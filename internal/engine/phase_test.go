@@ -1024,6 +1024,127 @@ phases:
 	}
 }
 
+// gatedPhases declares a slow tests_pass gate on an agent phase and on a code
+// phase, so a gate's cancel and ceiling paths are each pinned on both callers
+// of runGates.
+var gatedPhases = map[string]string{
+	"agent phase": `
+phases:
+  - name: build
+    kind: agent
+    owner: builder
+    gates:
+      - {name: tests_pass, command: "sleep 600"}
+`,
+	"code phase": `
+phases:
+  - name: test
+    kind: code
+    command: "true"
+    gates:
+      - {name: tests_pass, command: "sleep 600"}
+`,
+}
+
+func TestCancellationDuringAGateStopsItPromptly(t *testing.T) {
+	for name, phases := range gatedPhases {
+		t.Run(name, func(t *testing.T) {
+			repo := initRepo(t)
+			fake := enginetest.New(enginetest.Step{
+				Text: envelope(map[string]any{"status": "success", "summary": "built"}),
+			})
+			// The phase timeout is far longer than the test may take: only the
+			// cancel can stop the gate in time.
+			runner := newTestRunner(t, fake, &recordingSink{}, func(config *engine.Config) {
+				config.PhaseTimeout = 10 * time.Minute
+				config.AttemptCeiling = 20 * time.Minute
+			})
+			cancelled := make(chan struct{})
+			time.AfterFunc(300*time.Millisecond, func() { close(cancelled) })
+			attempt := testAttempt("name: t\n"+repairRoster+phases, nil, repo)
+			attempt.Cancelled = cancelled
+
+			started := time.Now()
+			outcome := runner.Execute(context.Background(), attempt)
+			if elapsed := time.Since(started); elapsed > 10*time.Second {
+				t.Fatalf("the gate ran on for %s after the cancel", elapsed)
+			}
+			if outcome.State != protocol.AttemptCancelled {
+				t.Fatalf("state = %q (%s), want cancelled", outcome.State, outcome.Error)
+			}
+			if !strings.Contains(outcome.Error, "gate tests_pass") {
+				t.Fatalf("error %q should show the cancel landed mid-gate", outcome.Error)
+			}
+		})
+	}
+}
+
+func TestAGateIsCutAtTheAttemptCeiling(t *testing.T) {
+	for name, phases := range gatedPhases {
+		t.Run(name, func(t *testing.T) {
+			repo := initRepo(t)
+			fake := enginetest.New(enginetest.Step{
+				Text: envelope(map[string]any{"status": "success", "summary": "built"}),
+			})
+			sink := &recordingSink{}
+			// The gate starts well inside the ceiling and its own phase timeout
+			// is far past it: the ceiling must cut the gate, not the timeout.
+			runner := newTestRunner(t, fake, sink, func(config *engine.Config) {
+				config.PhaseTimeout = 10 * time.Minute
+				config.AttemptCeiling = 2 * time.Second
+			})
+
+			started := time.Now()
+			outcome := runner.Execute(context.Background(), testAttempt("name: t\n"+repairRoster+phases, nil, repo))
+			if elapsed := time.Since(started); elapsed > 15*time.Second {
+				t.Fatalf("the gate ran %s, past the 2s ceiling", elapsed)
+			}
+			if outcome.State != protocol.AttemptFailed || !strings.Contains(outcome.Error, "ceiling") {
+				t.Fatalf("outcome = %q (%s), want failed on the ceiling", outcome.State, outcome.Error)
+			}
+			if !sink.has(protocol.EventError, "attempt_ceiling_exceeded") {
+				t.Fatal("the ceiling did not get its own terminal event")
+			}
+			if sink.has(protocol.EventGateFail, "tests_pass") {
+				t.Fatal("a gate cut by the ceiling recorded a verdict")
+			}
+		})
+	}
+}
+
+// A worker stopping cancels the context an agent dies on. The death's
+// rollback must still run its git commands, or a recoverable crash reads as
+// "rollback failed" and aborts the attempt.
+func TestADeathOnAStoppingWorkerStillRollsBack(t *testing.T) {
+	repo := initRepo(t)
+	release := make(chan struct{})
+	fake := enginetest.New(enginetest.Step{
+		Files:   map[string]string{"src/half.go": "package src\n"},
+		WaitFor: release,
+		Crash:   true,
+	})
+	sink := &recordingSink{}
+	runner := newTestRunner(t, fake, sink, nil)
+	ctx, stopWorker := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		stopWorker()
+		close(release)
+	}()
+
+	snapshot := "name: t\n" + repairRoster + `
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	outcome := runner.Execute(ctx, testAttempt(snapshot, nil, repo))
+	if sink.has(protocol.EventError, "rollback_failed") || strings.Contains(outcome.Error, "rollback failed") {
+		t.Fatalf("rollback failed on the stopping worker's context: %s", outcome.Error)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "src", "half.go")); !os.IsNotExist(err) {
+		t.Fatalf("the dead phase's file survived the rollback: %v", err)
+	}
+}
+
 // ---- JSONL sink ------------------------------------------------------------
 
 func TestJSONLSinkWritesOneOrderedLinePerEvent(t *testing.T) {
