@@ -66,6 +66,8 @@ type Store struct {
 	// resolveRef is the base-SHA resolver, injectable for the same reason:
 	// pinning touches the network (KTD9). Nil means the real one.
 	resolveRef func(ctx context.Context, identity, ref string) (string, error)
+	// runStations memoizes parsed run snapshots for GET /api/runs.
+	runStations runStationMemo
 }
 
 const sqlitePragmas = "_pragma=busy_timeout%285000%29&_pragma=foreign_keys%281%29&_pragma=journal_mode%28WAL%29&_txlock=immediate"

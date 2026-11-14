@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
@@ -184,11 +185,28 @@ func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
+// listRuns serves one page of runs, newest first: `limit` (default and cap
+// MaxRunListLimit) and `before=<run id>` to continue after a run already
+// held. The body stays a bare array so a client that ignores paging reads it
+// as before; the next page's cursor rides the X-Next-Before header, absent
+// on the last page (U8 read surface).
 func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := a.store.Runs(r.Context())
+	page := RunListPage{Before: r.URL.Query().Get("before")}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 1 {
+			writeError(w, invalid("invalid_limit", "limit must be a positive integer"))
+			return
+		}
+		page.Limit = limit
+	}
+	runs, next, err := a.store.RunList(r.Context(), page)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if next != "" {
+		w.Header().Set("X-Next-Before", next)
 	}
 	writeJSON(w, http.StatusOK, runs)
 }
