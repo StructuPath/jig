@@ -227,6 +227,17 @@ func projectEvidence(
 
 // ---- reads ------------------------------------------------------------------
 
+// requireAttempt is the attempt sub-resources' existence check. An unknown
+// id is a 404 that names it: an empty page or list would read as "this
+// attempt recorded nothing" to a caller who mistyped the id.
+func (s *Store) requireAttempt(ctx context.Context, attemptID string) error {
+	_, err := s.Attempt(ctx, attemptID)
+	if errors.Is(err, ErrNotFound) {
+		return &ServiceError{Code: "not_found", Message: "attempt " + quote(attemptID) + " not found", Status: 404}
+	}
+	return err
+}
+
 // AttemptEventPage reads one seq-cursor page of an attempt's trace: strictly
 // greater than after, in seq order (KTD8 — cursors ride seq, never rowid).
 func (s *Store) AttemptEventPage(
@@ -237,7 +248,7 @@ func (s *Store) AttemptEventPage(
 		limit = defaultEventPageSize
 	}
 	limit = min(limit, maxEventPageSize)
-	if _, err := s.Attempt(ctx, attemptID); err != nil {
+	if err := s.requireAttempt(ctx, attemptID); err != nil {
 		return page, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
@@ -267,7 +278,11 @@ func (s *Store) AttemptEventPage(
 
 // AttemptGateEvidence reads the recorded gate checks for one attempt: what
 // each gate looked at and what it found, in the order the gates ran (R9).
+// An unknown attempt is not_found (requireAttempt), as on the event page.
 func (s *Store) AttemptGateEvidence(ctx context.Context, attemptID string) ([]GateEvidence, error) {
+	if err := s.requireAttempt(ctx, attemptID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT phase, gate, emission, item, ok, note, created_at
 		FROM gate_results WHERE attempt_id = ?
@@ -301,7 +316,11 @@ func (s *Store) AttemptGateEvidence(ctx context.Context, attemptID string) ([]Ga
 // v1 stores the invalid ones (R7): they are the emissions that exist nowhere
 // else, size-capped here with the full form intact in the attempt-local
 // JSONL. A phase's accepted envelope rides the attempt's own result payload.
+// An unknown attempt is not_found (requireAttempt).
 func (s *Store) AttemptEnvelopes(ctx context.Context, attemptID string) ([]EnvelopeRecord, error) {
+	if err := s.requireAttempt(ctx, attemptID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT phase, emission, valid, body, parse_error, created_at
 		FROM envelopes WHERE attempt_id = ? ORDER BY emission

@@ -347,7 +347,17 @@ func (s *Store) JobPublishRecords(ctx context.Context, jobID string) ([]protocol
 }
 
 func (s *Store) publishRecords(ctx context.Context, where string, argument any) ([]protocol.PublishRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return queryPublishRecords(ctx, s.db, where, argument)
+}
+
+// queryer is what *sql.DB and *sql.Tx share for reads, so a read helper can
+// run alone or inside the snapshot of a larger read (GET /api/runs).
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func queryPublishRecords(ctx context.Context, q queryer, where string, argument any) ([]protocol.PublishRecord, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT p.attempt_id, a.job_id, a.attempt_number, p.step, p.branch,
 		       p.remote_ref, p.pr_url, p.completed_at
 		FROM publish_records p JOIN attempts a ON a.id = p.attempt_id
@@ -528,12 +538,16 @@ func (s *Store) RetryPublish(
 // accepted_unpublished job: release a hold, or retry a publish that did not
 // complete. It carries no lease and names no worker, because the operator
 // has neither. The worker that ran the attempt reads the request while it
-// runs (WorkerPublishRequests) and performs the publish-only retry itself;
-// RetryPublish clears the request in the transaction that grants the lease,
-// so one request is at most one retry.
+// runs (WorkerPublishRequests) and performs the publish-only retry itself.
+// The grant leaves the request on the job and the retry's completion clears
+// it, so a retry the sweeper returns as interrupted is served again (R14) —
+// up to maxPublishRequestInterruptions times, after which the sweeper clears
+// the request and records why, so a retry that crashes its worker cannot
+// loop.
 //
 // A request already waiting is returned unchanged, with its original time:
-// asking twice is not asking for two retries.
+// asking twice is not asking for two retries. A new request starts a fresh
+// interruption count.
 func (s *Store) RequestPublish(ctx context.Context, jobID string) (protocol.Job, error) {
 	now := s.now().UnixMilli()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -554,7 +568,9 @@ func (s *Store) RequestPublish(ctx context.Context, jobID string) (protocol.Job,
 			"only an accepted_unpublished job has a publish to finish")
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET publish_requested_at = COALESCE(publish_requested_at, ?)
+		UPDATE jobs SET publish_requested_at = COALESCE(publish_requested_at, ?),
+		    publish_request_interruptions = CASE WHEN publish_requested_at IS NULL THEN 0
+		        ELSE publish_request_interruptions END
 		WHERE id = ? AND state = 'accepted_unpublished'
 	`, now, jobID); err != nil {
 		return protocol.Job{}, unavailable(err)
@@ -573,7 +589,7 @@ func (s *Store) RequestPublish(ctx context.Context, jobID string) (protocol.Job,
 // it is.
 func (s *Store) WithdrawPublishRequest(ctx context.Context, jobID string) (protocol.Job, error) {
 	result, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET publish_requested_at = NULL WHERE id = ?`, jobID)
+		`UPDATE jobs SET publish_requested_at = NULL, publish_request_interruptions = 0 WHERE id = ?`, jobID)
 	if err != nil {
 		return protocol.Job{}, unavailable(err)
 	}

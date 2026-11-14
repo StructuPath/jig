@@ -83,9 +83,19 @@ Exit codes:
 // running it.
 const workerDrainGrace = 2 * time.Minute
 
+// workerVerbs are the worker's subcommands. Without one, `jig worker` is the
+// worker itself, so its flags and these verbs share the first argument.
+var workerVerbs = []subcommand{
+	{name: "publish-retry", run: workerPublishRetryCommand},
+}
+
 func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	if len(args) > 0 && args[0] == "publish-retry" {
-		return workerPublishRetryCommand(ctx, args[1:], stdout, stderr)
+	if len(args) > 0 {
+		for _, verb := range workerVerbs {
+			if verb.name == args[0] {
+				return verb.run(ctx, args[1:], stdout, stderr)
+			}
+		}
 	}
 	flags := flag.NewFlagSet("jig worker", flag.ContinueOnError)
 	flags.SetOutput(stderr)

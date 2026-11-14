@@ -236,6 +236,18 @@ func TestReportRejectsAnUnparseableWindowWithUsage(t *testing.T) {
 	}
 }
 
+// A window only the server can judge — since after until — is still what
+// the operator typed, so its invalid_report_window rejection exits 2.
+func TestReportAnInvertedWindowIsAUsageError(t *testing.T) {
+	base, stop := startReportServe(t)
+	defer stop()
+	code, _, stderr := jigReport(t, "--server", base,
+		"--since", "2026-02-01T00:00:00Z", "--until", "2026-01-01T00:00:00Z")
+	if code != exitUsage || !strings.Contains(stderr, "invalid_report_window") {
+		t.Fatalf("an inverted window exited %d, want %d\nstderr: %s", code, exitUsage, stderr)
+	}
+}
+
 func TestReportExitsOneWhenTheServerIsUnreachable(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -251,36 +263,9 @@ func TestReportExitsOneWhenTheServerIsUnreachable(t *testing.T) {
 	if stdout != "" {
 		t.Errorf("stdout = %q, want nothing", stdout)
 	}
-	if !strings.Contains(stderr, "jig report: GET /api/report") {
-		t.Errorf("stderr does not name the failed request: %s", stderr)
-	}
-}
-
-func TestReportHintsAtJigServeWhenConnectionRefused(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	listener.Close()
-
-	code, stdout, stderr := jigReport(t, "--server", "http://"+address)
-	if code != exitInfraFailed {
-		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitInfraFailed, stderr)
-	}
-	if stdout != "" {
-		t.Errorf("stdout = %q, want nothing", stdout)
-	}
-	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("stderr has %d lines, want the error and one hint:\n%s", len(lines), stderr)
-	}
-	if !strings.HasPrefix(lines[0], "jig report: GET /api/report") {
-		t.Errorf("first line is not the original error: %q", lines[0])
-	}
-	if !strings.Contains(lines[1], "no control plane answered at http://"+address) ||
-		!strings.Contains(lines[1], "`jig serve`") {
-		t.Errorf("hint does not name the server URL and `jig serve`: %q", lines[1])
+	want := "jig report: no control plane at http://" + address + " (from --server) — start one with: jig serve\n"
+	if stderr != want {
+		t.Errorf("stderr = %q, want the one shared no-control-plane line %q", stderr, want)
 	}
 }
 

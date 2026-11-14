@@ -194,7 +194,8 @@ func (s *Store) CreateTrigger(ctx context.Context, input TriggerInput) (Trigger,
 	`, id, normalized.DefinitionID, normalized.Name, normalized.Kind, configJSON, now, now); err != nil {
 		if isConstraintViolation(err) {
 			return zero, conflict("trigger_exists",
-				"a trigger named "+quote(normalized.Name)+" already exists — update it by id")
+				"a trigger named "+quote(normalized.Name)+" already exists — choose another name, "+
+					"or remove it first with: jig trigger delete <id>")
 		}
 		return zero, unavailable(err)
 	}

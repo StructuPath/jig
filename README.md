@@ -114,6 +114,10 @@ and publishes accepted work as a branch and pull request.
 definition offline, save it, invoke it, and stand up the schedules and GitHub
 polls that invoke it unattended. Every read command takes `--json`.
 
+**`jig runs` and `jig job`** — the operator loop after admission. List and
+show runs, re-admit one at current HEAD, and show, follow, cancel, retry, or
+release a single job.
+
 **`jig report`** — measurement. Jobs, accepts, publish outcomes, CI repair,
 re-runs, and spend over a time window, read from the control plane's ledger.
 
@@ -152,6 +156,12 @@ roster:                      # one entry per agent role
     env: [PATH]              # env allowlist — the ONLY variables it receives
     writes: ["src/**"]       # write allowlist; [] is read-only, omitted is unrestricted
                              # (build output directories go in build_outputs, below)
+  reviewer:
+    model: opus
+    system_prompt: You review a risky change and state approved true or false.
+    user_prompt: "Review the change made for: {{prompt}}"
+    env: [PATH]
+    writes: []               # read-only
 phases:
   - name: build
     kind: agent              # agent | code
@@ -184,270 +194,14 @@ build_outputs: ["bin/**"]    # gitignored directories ANY role may write, read-o
 
 Rules worth knowing before you write one:
 
-- **Envelopes are the only inter-phase contract.** Every agent phase ends
-  with one JSON object carrying at least `status` (`success` or `fail`).
-  Extra fields — `approved`, `changed_files`, `revised` — are what gates,
-  `if:` guards, and repair predicates read. Code phases get an adapter
-  envelope built from their exit status, so a failing test suite enters the
-  repair loop through the same door as a failing agent report.
-- **A verdict is stated, never inferred.** Under `verdict_consistent` a
-  reviewer must write `approved` as a JSON boolean; omitting it is its own
-  gate failure, not a silent rejection. The distinction matters because
-  `on_fail: {when: "approved == false"}` is how a review routes work back to
-  a builder, and a verdict nobody stated must not decide that either way.
-- **Gates verify claims, they do not judge quality.** The registry is
-  `artifacts_exist`, `files_non_empty`, `diff_matches_claims`,
-  `verdict_consistent`, `tests_pass(command)`, and `tests_intact`.
-  Repo-specific verification is a code phase, not a new gate.
-- **A builder cannot cheaply buy green by weakening tests.** `tests_intact`
-  is a tripwire against careless or opportunistic test tampering, not an
-  adversarially complete analysis. Every test file changed since
-  `JIG_BASE_SHA` — committed, uncommitted, or untracked, gitignored
-  included — is compared whole against its base version: both sides are
-  normalized (comments stripped by a lexer that knows strings, regex
-  literals, and Ruby heredocs and %-literals; literals blanked,
-  whitespace collapsed so a token split across lines rejoins), then tests,
-  assertions, and markers are counted. It fails when a test file is
-  deleted, ends with fewer tests (Go `Example` and `Fuzz` functions in a
-  `_test.go` file included), assertions (a Go example's `// Output:` or
-  `// Unordered output:` line included, so deleting expected output is a
-  loss), or `m.Run(` calls, or with
-  more of any marker that stops tests running: a skip or focus (`t.Skip`,
-  `test.only.each`, a vitest options object with `skip`, `only`, `fails`,
-  or `todo` set to anything but `false`, `0`, `null`, `undefined`, or
-  `""` — in any argument position, after any first argument, through
-  `.each(…)(…)`, with the key bare or quoted, as in `test("…", {skip:
-  true}, fn)` or `test(name(), fn, {"only": 1})`, `mark.skip` in any
-  form, `pytest.importorskip(`, `xit`, RSpec `skip: true` or `:focus`), a
-  `//go:build` constraint, an added
-  `TestMain` or `os.Exit(`, `pytestmark`, `__test__ = False`, an aliased
-  `mark`, or a conftest `collect_ignore` or collection hook. Commenting a
-  test out, or wrapping it in `/* */` or a string, is a loss. Counts are
-  per file and per marker kind, so renaming a test inside its file,
-  converting `test(…)` to `test.each(…)`, swapping an assertion for a
-  stronger one, or rewording a skip's message passes, and new tests always
-  do; renaming a test FILE reads as a deletion. What it cannot inspect
-  fails closed: a binary or over-4 MiB test file, a source test file with
-  a NUL byte or a UTF-16/UTF-32 byte-order mark, a comment, string, or
-  heredoc still open at end of file, a tracked test file
-  flagged assume-unchanged or skip-worktree, an embedded git repository
-  holding test files. Untracked files under `node_modules`, Go `vendor`,
-  and Python virtualenvs are skipped, as the runners skip them. Each
-  finding names `path:line` where a changed line shows it, and says what
-  to put back. It covers Go, JavaScript and TypeScript, Python, and
-  Ruby/RSpec in v1, recognizing test files the way `factory.yaml`'s risk
-  classifier does, plus `conftest.py`. When a change is meant to remove
-  tests, say so in the definition: `{name: tests_intact, allow:
-  ["legacy/*_test.go"]}` exempts matching paths. `allow` uses `path.Match`
-  globs against the repo-relative path — `*` stops at `/` and `**` is
-  refused — and is rejected on any other gate. `factory.yaml` and
-  `factory-parallel.yaml` run it on `build`. Known limits: it does not
-  catch an assertion replaced by a trivially true one, a test runner
-  neutered through configuration outside `conftest.py` (jest or pytest
-  config, `package.json`, a `Makefile`), a skip hidden in a non-test
-  helper, a skip hidden inside a JS template-literal expression or behind
-  an exotic string escape, an existing marker whose arguments are widened
-  (`skipif(False)` → `skipif(True)`, edited `collect_ignore` contents,
-  `if testing.Short()` → `if true`), arithmetic that keeps `m.Run(` but
-  discards its result, `pytest.exit(..., 0)`, vitest options passed
-  through a variable (`const opts = {skip: true}`), spread (`{...opts}`)
-  or nested in another object, or written as `{ skip }` shorthand, a
-  gutted `f.Fuzz(...)` body, or changes inside
-  submodules — the reviewers and the risk classifier are the check there.
-- **Nor by silencing the checkers around them.** `tests_intact` also
-  refuses a checker suppression or a "not implemented" stub added to any
-  changed source file, test or not, in the same four languages — committed,
-  uncommitted, or untracked and not gitignored. A suppression is a comment
-  that opens with a directive: Go `//nolint`, `#nosec`, `//lint:ignore`;
-  `eslint-disable` (any form), `oxlint-disable`, `biome-ignore`,
-  `deno-lint-ignore`, `prettier-ignore`, `@ts-ignore`, `@ts-nocheck`,
-  `@ts-expect-error`, `istanbul`/`c8`/`v8 ignore`; Python `# noqa`,
-  `# type: ignore`, `# pyright: ignore`, `# pyre-ignore`/`pyre-fixme`,
-  `# mypy: ignore-errors`, `# pylint: disable`, `# pragma: no cover`,
-  `# ruff: noqa`, `# nosec`, `# fmt: off`/`skip`; Ruby
-  `# rubocop:disable`/`todo`, `# standard:disable`, `# steep:ignore`,
-  `# :nocov:`. A stub is `panic`, `errors.New`, `fmt.Errorf`, `throw`, or
-  `raise` whose message starts "not implemented", "not yet implemented",
-  "unimplemented", or "TODO". Counts are per directive, per file, and one
-  removed anywhere in the change offsets one added elsewhere, so keeping,
-  narrowing, or removing an existing suppression passes, and so does moving
-  one — within its file, or to another by a rename or a split, which
-  `--no-renames` shows as a deletion and a new file;
-  prose that mentions a directive, a directive inside a string, and an
-  abstract method's bare `raise NotImplementedError` pass too. An empty
-  `catch {}` or `except: pass` is not refused: both have legitimate uses
-  (jig's own UI swallows a disabled-storage error), so the reviewers judge
-  them. A justified suppression is refused like any other; exempt its path
-  with `allow`. Unlike a test file, a source file the gate cannot read —
-  over 4 MiB, binary, or left open at end of file by the lexer — is noted
-  as uninspected, not failed, because the builder may not be able to
-  repair a base version the lexer misreads.
-- **Repair loops must be declared and bounded.** `on_fail` is the only loop
-  construct; a cycle or a missing budget is rejected at save time, not
-  discovered at 2 a.m.
-- **Effort is per role, and optional.** `effort` goes to Claude Code as
-  `--effort`, and to Codex as `model_reasoning_effort` (Codex tops out at
-  `xhigh`, so `max` runs there). It sets how much a role thinks and verifies,
-  and thinking is billed as output. A useful split: `medium` for a builder
-  working to a plan, `high` for a reviewer hunting the edge cases the build
-  missed. Omit it to keep the CLI's default for the model, and omit it for
-  `haiku`, which does not take an effort level.
-- **Spend is capped per role, and optional.** `budget_usd` is the most one
-  send by that role may cost; Claude Code enforces it as `--max-budget-usd`.
-  Codex has no such flag, and a cap it cannot enforce fails the send rather
-  than run uncapped — the same posture as a `tools` allowlist there.
-- **Build outputs are a grant, not an allowlist entry.** A read-only
-  reviewer that runs the repository's own check command still writes what
-  it builds, and `writes: []` would breach on it. `build_outputs:
-  ["bin/**"]` names the directories every role — read-only reviewers and
-  parallel-group members included — may write without breaching. A grant
-  covers **gitignored** paths only: a path under a grant that git does not
-  ignore is ordinary content judged by `writes` — a breach for a read-only
-  role, whose message says `declared build output is not gitignored`, and a
-  changed path (committed like any other) for a writing one. Each entry is
-  exactly one of `<dir>/**`, `**/<dir>/**`, or `<dir>/`, with `<dir>`
-  literal; anything else (`bin/*.o`, `*/bin/**`, `b?n/**`, the bare `**`)
-  is refused at save time, and leading or trailing whitespace is refused,
-  not trimmed. Git reports a wholly ignored directory as one entry and a
-  grant matches paths as git enumerates them, so declare the directory git
-  ignores: with `cache/` ignored, `cache/**` covers `cache/bin/x` but
-  `cache/bin/**` does not. `**/<dir>/**` matches the directory at the root
-  and nested. A path tracked in HEAD is never an output, and git metadata
-  never is. Outputs are not changed paths, so jig never stages or publishes
-  one, and `git add -A` in a commit phase never stages an ignored path; a
-  role that commits an output itself (`git add -f`) publishes it under its
-  own `writes`, and from then on it is tracked content. Outputs
-  written during a parallel group survive the group whatever happened to the
-  member that wrote them, and the trace attributes them to the group, not a
-  role. A crashed sequential phase is still rolled back to its snapshot,
-  its new outputs included. Declare only directories no later phase
-  executes: a reviewer could otherwise plant what a test phase runs.
-- **Code phases can report.** A code phase with `reports_fields: true`
-  prints a JSON object as its last output line, and those fields join the
-  envelope view that `if:` guards and `publish.hold_when` read. It is how a
-  deterministic script — a risk classifier scoring paths and diff size — gets
-  a say in routing without a model in the loop. The adapter's own fields
-  (`status`, `passed`, `exit_code`, …) are reserved, and a reported field is
-  protected: a later agent envelope cannot overwrite it. Code phases and
-  gates receive `JIG_BASE_SHA`, the commit the run was pinned to, so a script
-  can diff the whole change without guessing a base from history.
-- **Guards compare as well as test.** `if: revised` runs a phase when a
-  previous envelope set the field truthy; `if: "risk == high"` runs it when
-  the comparison holds, in the same `<field> ==|!= <literal>` language as
-  `on_fail.when`.
-- **Publish can be held.** `publish: {hold_when: "<predicate>"}` is judged
-  after acceptance passes. When it holds, the attempt ends
-  `accepted_unpublished` with the hold recorded, nothing is pushed, and the
-  worktree and branch are retained — the publish-only retry is the human
-  sign-off that releases it. Low-risk work never waits. Write the predicate
-  to fail closed — `risk != low` holds work whose risk was never reported,
-  where `risk == high` would ship it. The sign-off is only as strong as
-  access to the control plane: jig has one trusted operator and no
-  authentication (see *Loopback only*), so the operator's retry is the
-  approval, with no separate approver identity.
-- **Publish can merge.** Add `merge: {method: squash}` under `publish` and
-  start the worker with `--allow-merge` (also supported by `jig start`).
-  `merge`, `squash`, and `rebase` are the supported methods; `ci.wait: true`
-  is required. Both switches default off. A worker without consent leaves
-  these jobs queued. After green CI, Jig merges only its own exact pushed
-  head, including a CI repair's head. Any attempt ever held ends at a PR,
-  even after release; a person's commit is never automatically merged.
-  The immediate GitHub merge API preserves branch protection and refuses
-  required reviews, queues, conflicts, and changed heads. Jig never queues
-  a future merge, rebases a blocked branch, or bypasses protection.
-  A failed merge remains `accepted_unpublished`; use the existing publication
-  retry after the cause is resolved. A stopped worker's `publish-retry` also
-  needs `--allow-merge`, and its registration must retain merge consent.
-  `jig report` counts merged accepts and their share of accepted jobs from
-  the ledger; merge failures appear in the existing publish failure codes.
-  Test on a scratch repository first. There is no post-merge verification or
-  automatic revert. An incorrect change can pass every pre-merge check.
-- **Publish can wait for CI.** `publish: {ci: {wait: true, timeout: 30m}}`
-  adds a fourth publish step after proof: the worker polls the check runs
-  and commit statuses on the branch's head through `gh api`, and the job is
-  `accepted` only when every one is green — the control plane enforces this
-  from the frozen definition, not the worker's word. A red check fails fast;
-  checks still pending at the timeout (default 30m, 1m–6h) fail too; a head
-  with no checks at all passes after two minutes, since that repository runs
-  no CI. Any of these ends the job `accepted_unpublished` with the branch and
-  pull request in place and the red checks named in the result. Fix the
-  branch — push to it yourself — and the publish-only retry judges CI on
-  whatever its head is by then. Neutral and skipped checks count as green.
-  The wait holds a worker slot, and a cancel during it ends the job the same
-  way. Omit `ci` and publish does not wait, exactly as before.
-- **Red CI can be repaired inside the attempt.** `publish: {ci: {wait: true,
-  on_fail: {run: build, budget: 2}}}` gives red CI back to the `run` agent
-  phase instead of ending the job. A round hands it the failing checks and
-  the last 16 KiB of each failed GitHub Actions job's log (at most four logs),
-  framed as data, never instructions; then **every phase after `run`** runs
-  again, gates and repair edges included, and acceptance and `hold_when` are
-  judged anew. Only a fix that passes all of that, is not held, and actually
-  changed something is pushed, non-force, to the same pull request, and CI is
-  awaited again. There is no way to skip phases: `run` must be an agent phase
-  and not the last one. Rounds share the attempt's send budget and wall-clock
-  ceiling, run in a freshly wiped ephemeral HOME, and are fenced by the lease
-  again right before each push. jig never builds on someone else's commit: if
-  CI is red on a head it did not push, no round runs. When the budget runs
-  out, or a round fails, is held, is cancelled, or changes nothing, the job
-  ends `accepted_unpublished` exactly as red CI did before, with every round's
-  heads, changed paths, and outcome in the result. The publish-only retry
-  judges CI but never repairs — a continuation lives only in the process that
-  ran the chain. Budget is 1–3. A fix that weakens a check instead of the
-  code is the risk to design for: `factory.yaml` refuses lost tests, new
-  skips, and new checker suppressions at the build with `tests_intact`, and
-  scores edits to CI or lint
-  configuration, and test files that lose more lines than they gain, as not
-  low, so such a "fix" is held for a person.
-- **A flaky Actions job can be re-run before a round is spent.**
-  `publish: {ci: {wait: true, rerun: {budget: 1}}}` re-runs the failed
-  GitHub Actions jobs on the same head when CI is red on a head jig pushed,
-  before any repair round (or before the job ends red, with no `on_fail`).
-  It first waits until nothing on the head is still running, since GitHub
-  will not re-run a job in a running workflow; then, for each workflow run
-  the failed jobs belong to, it makes one `gh api -X POST
-  repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs` request (per run,
-  not per job: re-running one job would put the run in progress and GitHub
-  would refuse its siblings), checking the lease and cancellation right
-  before each. It then judges that same head again, reading each re-run job
-  as pending until its new run replaces the old red one; if the branch moves
-  meanwhile, the re-run ends `ci_rerun_head_moved`, so a person's fix is
-  never reported as jig's flaky pass. The whole re-run — waiting, requests,
-  and judgement — fits in one CI timeout. GitHub refusing because a
-  workflow run is in progress is waited out and does not spend the budget;
-  any other refusal is recorded and falls through to repair or the end. A
-  re-run GitHub accepted that never finishes, or whose CI cannot be read, is
-  recorded and leaves CI red as it was, so repair still runs. If
-  any red check is not an Actions job (a commit status, another app), no
-  re-run happens. Re-runs never move the branch. The budget, 1–3, is per
-  attempt: a repair round's new head gets only what is left. Every re-run is
-  in the result's `ci_reruns` (`attempt`, `head`, `jobs`, `outcome`), and a
-  pass after one sets `ci_flaky` — it is reported as flaky, never as a clean
-  pass. Re-run waits run on wall-clock time, so time spent on them is time a
-  later repair round no longer has under the attempt's ceiling. The
-  publish-only retry never re-runs. `gh` needs permission to
-  re-run Actions jobs on the repository. `factory.yaml` and
-  `factory-parallel.yaml` both declare `rerun: {budget: 1}`.
-- **A read-only review panel can run in parallel.** `parallel:
-  [review-correctness, review-security, review-maintainability]` runs those
-  phases at once, as one step of the chain. It is opt-in and narrow: one
-  group per definition, two or more consecutive agent phases, each with its
-  own role, every role `writes: []` (declared `build_outputs` excepted;
-  outputs written during the group survive it), and no member's `if:` guard
-  reading a field a sibling reports. Each member runs in its own ephemeral
-  HOME and session and is handed the envelope from BEFORE the group, never a
-  sibling's; results merge in declared order, and the next phase gets the
-  last member's envelope. Any other worktree change while the group runs —
-  including one a crashed member left — rolls back and aborts the attempt.
-  Rejections resolve after every member finishes: the first member in
-  declared order that rejected with budget left dispatches its repair target
-  and charges only its own budget, and then the whole group runs again, so
-  earlier approvals are re-judged. The group runs at most 1 + the sum of its
-  members' budgets times. `examples/definitions/factory-parallel.yaml` is the
-  stock factory with its panel grouped — the same phases, roles, and
-  `publish` block, CI re-runs and repair included; `factory.yaml` itself
-  stays sequential until the parallel panel has been watched on real work.
-- **Validation happens before anything runs.** `jig def validate <file>`
-  is the same check the store applies at save time, offline.
+- **Envelopes are the only inter-phase contract**: each agent phase ends with one JSON object, and its fields are what gates, `if:` guards, and `on_fail.when` read.
+- **Gates verify claims, not quality**, and `tests_intact` refuses lost tests, new skips, and new checker suppressions — [docs/gates.md](docs/gates.md).
+- **Repair loops are declared and bounded**: `on_fail` is the only loop, and a cycle or a missing budget is refused at save time.
+- **`writes` is the write boundary**; `build_outputs` grants gitignored build directories to every role — [build_outputs](docs/definition-reference.md#build_outputs).
+- **Prompt parameters are required**: `jig def validate` lists a definition's `{{name}}`s as `params:`, and `jig def invoke` refuses a run that does not pass each with `--param`.
+- **Publish can hold, wait for CI, repair red CI, re-run flaky jobs, and merge**, each opt-in — [docs/publish.md](docs/publish.md).
+- **A read-only review panel can run in parallel** — [parallel group](docs/definition-reference.md#parallel-group).
+- **Validation happens before anything runs**: `jig def validate <file>` is the save-time check, offline.
 
 ```sh
 jig def validate examples/definitions/simple-sdlc.yaml
@@ -461,6 +215,38 @@ either too), and flags may come before or after the positional arguments.
 Every command that talks to the control plane takes `--server <url>`; its
 default is `$JIG_SERVER` when set, else `http://127.0.0.1:8383`, so point a
 shell at a second instance once with `export JIG_SERVER=http://127.0.0.1:8594`.
+When nothing answers there, the command says so and where the address came
+from: `no control plane at http://127.0.0.1:8383 (from default) — start one
+with: jig serve`.
+
+### Watching and steering runs
+
+```sh
+jig runs list                          # newest first; --limit 0 for all
+jig runs show <run-id>                 # the run and one row per job
+jig job show <job-id>                  # state, pull request, one row per attempt
+jig job show <job-id> --follow         # wait for the verdict: exit 0 accepted, 3 otherwise
+jig job cancel <job-id>                # queued: cancelled now; active: its worker stops it
+jig job retry <job-id>                 # a failed job, as a new attempt from phase 1
+jig runs readmit <run-id>              # same frozen definition and params, at current HEAD
+jig job release <job-id>               # finish an accepted_unpublished job (see below)
+```
+
+`--follow` narrates each state change on stderr and exits 3 when the job
+settles `failed`, `cancelled`, or `accepted_unpublished` (held, or not yet
+published). Only a failed job can be retried; a cancelled one comes back by
+re-admitting its run. Triggers are saved disabled: `jig trigger create`
+prints the `jig trigger enable <id>` that starts one, or pass `--enable`.
+`jig trigger delete <id>` removes a disabled trigger and keeps the runs it
+admitted.
+
+A mistyped command, verb, or flag is answered with the nearest spelling
+(`jig def invoke: unknown flag --parm — did you mean --param?`). For shell
+completion of every command, verb, and flag:
+
+```sh
+jig completion zsh > "${fpath[1]}/_jig"     # or: bash, fish
+```
 
 ---
 
@@ -656,14 +442,13 @@ wrapper script wrong.
 
 `jig serve` binds `127.0.0.1` and refuses a non-loopback address without
 `--allow-non-loopback`. There is no authentication and no TLS: the control
-plane assumes one trusted operator on one machine. Read routes reject untrusted
-Host headers even without an Origin header, preventing DNS-rebound names from
-reading local data. An explicitly enabled non-loopback listener accepts its own
-IP address; reverse proxies must rewrite Host to the listener's authority or
-present the UI token. State-changing routes also
-reject requests whose `Origin` is not the server's own, which is what stops a
-web page you happen to be visiting from driving your control plane through
-your browser.
+plane assumes one trusted operator on one machine. Read routes reject
+untrusted Host headers even without an Origin header, preventing DNS-rebound
+names from reading local data. An explicitly enabled non-loopback listener
+accepts its own IP address; reverse proxies must rewrite Host to the
+listener's authority. State-changing routes also reject requests whose
+`Origin` is not the server's own, which is what stops a web page you happen to
+be visiting from driving your control plane through your browser.
 
 ---
 

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -56,10 +57,11 @@ func (r commandResult) Passed() bool {
 // leaves a manifest its restart reconciliation can stop the group from. A
 // command whose group cannot be recorded does not run on unrecorded: the
 // group is killed, reaped, and the record cleared again in case the failed
-// write half-landed. Only the group is tracked, through its leader: a
-// background process the command leaves running after a normal exit is
-// left alone exactly as before, and once its leader is gone reconciliation
-// cannot verify the group as ours, so it is not signalled.
+// write half-landed. Only the group is tracked, through its leader. A
+// background process the command leaves running in its group is stopped
+// when the shell exits, before the record is cleared, so nothing the
+// command started writes the worktree after the phase ends (R8); a process
+// that left the group is beyond reach (see stopCommandGroup).
 //
 // env is REQUIRED. A nil env means Go hands the child jig's own os.Environ()
 // — every API key the operator exported, and their real HOME — which is
@@ -84,15 +86,42 @@ func runShellCommand(
 	tail := &tailWriter{limit: protocol.MaxCommandOutputTailBytes}
 	lines := &lastLineWriter{limit: protocol.MaxReportLineBytes}
 	output := io.MultiWriter(tail, lines)
-	shell.Stdout = output
-	shell.Stderr = output
-	// Output goes to a Go writer, so Wait also waits for the copy from the
-	// pipe to end — and a process the command backgrounded (`server & go
-	// test`) holds that pipe open after the shell exits. Without a bound, a
-	// gate that exited 0 would hang until the phase timeout (R8).
-	shell.WaitDelay = commandWaitDelay
-	if err := shell.Start(); err != nil {
+	// The output goes through a pipe jig owns, not a Go writer handed to
+	// exec, so Wait returns the moment the shell exits instead of waiting for
+	// every process holding the pipe. A process the command backgrounded
+	// (`server & go test`) holds it after the shell exits; it must be stopped
+	// at that moment, not after a WaitDelay during which it could still write
+	// the worktree, and the gate must not hang on it either (R8).
+	reader, writer, err := os.Pipe()
+	if err != nil {
 		return commandResult{ExitCode: -1, StartError: err.Error()}
+	}
+	shell.Stdout = writer
+	shell.Stderr = writer
+	startErr := shell.Start()
+	// The child has its own copy of the write end; jig's must close, or the
+	// pipe never reports end of output.
+	_ = writer.Close()
+	if startErr != nil {
+		_ = reader.Close()
+		return commandResult{ExitCode: -1, StartError: startErr.Error()}
+	}
+	copied := make(chan struct{})
+	go func() {
+		defer close(copied)
+		_, _ = io.Copy(output, reader)
+	}()
+	// drain ends the output copy: at once when every holder of the pipe is
+	// gone, else after commandWaitDelay — a process that left the group
+	// (setsid) is not stopped and may hold it indefinitely. Closing the read
+	// end unblocks the copy, and waiting for it keeps the tail race-free.
+	drain := func() {
+		select {
+		case <-copied:
+		case <-time.After(commandWaitDelay):
+		}
+		_ = reader.Close()
+		<-copied
 	}
 	// Nothing reaps the shell until its group is recorded: an unreaped
 	// leader keeps its pid, so the group id cannot be reused by a stranger
@@ -102,6 +131,7 @@ func runShellCommand(
 		if err := record(groupID, true); err != nil {
 			_ = syscall.Kill(-shell.Process.Pid, syscall.SIGKILL)
 			_ = shell.Wait()
+			drain()
 			_ = record(groupID, false)
 			return commandResult{ExitCode: -1, RecordError: err.Error()}
 		}
@@ -111,14 +141,17 @@ func runShellCommand(
 	go func() { done <- shell.Wait() }()
 	select {
 	case err := <-done:
+		// The shell has exited, but a process it backgrounded may still be
+		// running in its group. Left alive it could write the worktree after
+		// the phase boundary check (R8). Stop the group before the record is
+		// cleared and before the result is judged; the shell's own exit
+		// status is still the phase result.
+		stopCommandGroup(shell.Process.Pid)
+		drain()
 		last, overflow := lines.Last()
 		result := commandResult{OutputTail: tail.String(), LastLine: last, LastLineOverflow: overflow}
 		if exitError, ok := err.(*exec.ExitError); ok {
 			result.ExitCode = exitError.ExitCode()
-		} else if errors.Is(err, exec.ErrWaitDelay) {
-			// The shell exited 0 and only a backgrounded process still held
-			// the output pipe: a normal exit, judged as one.
-			result.ExitCode = 0
 		} else if err != nil {
 			result.ExitCode = -1
 			result.StartError = err.Error()
@@ -126,20 +159,77 @@ func runShellCommand(
 		return result
 	case <-ctx.Done():
 		_ = syscall.Kill(-shell.Process.Pid, syscall.SIGKILL)
-		// WaitDelay already bounds Wait once the shell is dead; this bounds
-		// the case where the kill itself does not land, so a cancelled phase
-		// always returns.
+		// Wait returns once the shell is dead; this bounds the case where
+		// the kill itself does not land, so a cancelled phase always returns.
 		select {
 		case <-done:
 		case <-time.After(2 * commandWaitDelay):
 		}
+		drain()
 		return commandResult{ExitCode: -1, TimedOut: true, OutputTail: tail.String()}
 	}
 }
 
-// commandWaitDelay is how long Wait keeps reading a command's output after
-// the shell itself has exited, before the pipes are closed.
+// commandWaitDelay is how long output is still read after the shell has
+// exited and its group been stopped, before the pipe is closed.
 const commandWaitDelay = 5 * time.Second
+
+// commandStopGrace is how long a command's leftover group gets to exit on
+// SIGTERM before it is killed. It is short on purpose: the group is still
+// running after its command has finished, so every moment of grace is a
+// moment it can write the worktree, and SIGTERM is not reliable — a shell
+// subshell that receives it between fork and exec can lose it (seen with
+// macOS /bin/sh), leaving the process it then execs untouched.
+const commandStopGrace = 500 * time.Millisecond
+
+// commandKillSettle bounds the wait for a SIGKILLed group to be gone, so
+// the command returns after its group has died rather than while it dies.
+const commandKillSettle = time.Second
+
+// stopCommandGroup TERMs what is left of a command's process group once the
+// shell has exited, waits up to commandStopGrace, then KILLs the rest and
+// waits up to commandKillSettle for it to be gone — the same TERM-then-KILL
+// the runtime adapters and reconciliation use. ESRCH means the group is
+// already empty, which is success.
+//
+// The shell has been reaped by now, but its pid cannot be reused while any
+// process still carries it as a group id, so a non-empty group is still ours.
+// An empty group answers ESRCH unless, in the instant since the reap, a new
+// process took that pid and made itself a group leader — a window too narrow
+// to be worth a second mechanism.
+//
+// A process that left the group (setsid, setpgid) is out of reach, here and
+// on timeout alike: nothing in jig follows it, and it may outlive the phase.
+// Containing those needs a session or cgroup-style boundary jig does not
+// have.
+func stopCommandGroup(groupID int) {
+	if groupID <= 1 {
+		return
+	}
+	if err := syscall.Kill(-groupID, syscall.SIGTERM); err != nil {
+		return
+	}
+	if groupGoneWithin(groupID, commandStopGrace) {
+		return
+	}
+	if err := syscall.Kill(-groupID, syscall.SIGKILL); err != nil {
+		return
+	}
+	_ = groupGoneWithin(groupID, commandKillSettle)
+}
+
+// groupGoneWithin polls until the process group has no members or the wait
+// runs out, and reports which.
+func groupGoneWithin(groupID int, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+		if err := syscall.Kill(-groupID, 0); err != nil {
+			return true
+		}
+	}
+	return false
+}
 
 // reportedFields reads a reports_fields code phase's report: its last
 // non-empty output line, which must be a JSON object. Everything before it

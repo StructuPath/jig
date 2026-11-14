@@ -49,7 +49,8 @@ func (s *Store) CreateDefinition(ctx context.Context, input DefinitionInput) (pr
 	`, id, spec.Name, input.Source, now, now); err != nil {
 		if isConstraintViolation(err) {
 			return protocol.Definition{}, conflict("definition_exists",
-				"a definition named "+quote(spec.Name)+" already exists — update it by id")
+				"a definition named "+quote(spec.Name)+" already exists — update it with: jig def update "+
+					spec.Name+" <file>")
 		}
 		return protocol.Definition{}, unavailable(err)
 	}

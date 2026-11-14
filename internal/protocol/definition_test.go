@@ -846,3 +846,41 @@ func TestAParallelGroupIsRejectedUnlessItsMembersAreConcurrentSafe(t *testing.T)
 		strings.Replace(panelPhases, "owner: c}", `owner: c, if: "risk != low"}`, 1),
 		"parallel: [review-a, review-b, review-c]\n"))
 }
+
+// Boolean literals are checked at save time on every predicate site — repair
+// edges, if: guards, and publish.hold_when — because the engine treats any
+// literal but true/false as no-match on a boolean field (KTD2).
+func TestPredicatesRejectNonBooleanLiteralsOnBooleanFields(t *testing.T) {
+	const head = `
+name: bad
+roster:
+  builder: {model: opus, system_prompt: s, user_prompt: u}
+  reviewer: {model: opus, system_prompt: s, user_prompt: u}
+phases:
+  - {name: build, kind: agent, owner: builder}
+`
+	mustReject(t, head+`  - name: review
+    kind: agent
+    owner: reviewer
+    on_fail: {when: "approved == True", run: build, then: rerun-self, budget: 2}
+`, `"review"`, "must be lowercase")
+	mustReject(t, head+`  - name: review
+    kind: agent
+    owner: reviewer
+    on_fail: {when: "approved == yes", run: build, then: rerun-self, budget: 2}
+`, `"review"`, "boolean field")
+	mustReject(t, head+`  - {name: review, kind: agent, owner: reviewer, if: "approved != 1"}
+`, `"review"`, "if:", "boolean field")
+	mustReject(t, head+`publish:
+  hold_when: "risky == FALSE"
+`, "publish: hold_when", "must be lowercase")
+
+	mustParse(t, head+`  - name: review
+    kind: agent
+    owner: reviewer
+    if: "approved != null"
+    on_fail: {when: "approved == false", run: build, then: rerun-self, budget: 2}
+publish:
+  hold_when: "risk == high"
+`)
+}

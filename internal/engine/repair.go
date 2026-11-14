@@ -18,7 +18,9 @@ import (
 // against an envelope's field map. Literals compare by the field's own
 // type: booleans as true/false, numbers numerically, null as absence-or-
 // null, everything else as strings. A missing field only ever matches the
-// literal `null`.
+// literal `null`, and a boolean field matches only `true` or `false`: any
+// other literal is no-match, so `approved == null` does not hold for a
+// stated `false` and a `True` typo cannot invert the comparison (KTD2).
 func predicateHolds(predicate protocol.EnvelopePredicate, fields map[string]any) bool {
 	equal := literalEquals(fields[predicate.Field], predicate.Literal)
 	if predicate.Op == "!=" {
@@ -32,7 +34,13 @@ func literalEquals(value any, literal string) bool {
 	case nil:
 		return literal == "null"
 	case bool:
-		return (literal == "true") == typed
+		switch literal {
+		case "true":
+			return typed
+		case "false":
+			return !typed
+		}
+		return false
 	case float64:
 		number, err := strconv.ParseFloat(literal, 64)
 		return err == nil && number == typed
