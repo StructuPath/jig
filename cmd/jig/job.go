@@ -166,12 +166,17 @@ func followJob(
 			return detail, context.Canceled
 		case <-ticker.C:
 		}
-		if err := apiCall(ctx, server, http.MethodGet, jobPath, nil, &detail); err != nil {
+		// A fresh value per poll: the API omits a cleared publish_requested_at,
+		// and decoding into the previous detail would keep the stale request,
+		// so a withdrawn release would never read as settled.
+		var next controlplane.JobDetail
+		if err := apiCall(ctx, server, http.MethodGet, jobPath, nil, &next); err != nil {
 			if ctx.Err() != nil {
 				return detail, context.Canceled
 			}
 			return detail, err
 		}
+		detail = next
 	}
 }
 

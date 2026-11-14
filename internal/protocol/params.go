@@ -23,11 +23,19 @@ func isBuiltinTemplateVariable(name string) bool {
 	return name == PromptParameter || name == PreviousEnvelopeVariable || name == HandoffDirVariable
 }
 
-// templatePlaceholder is a {{name}} the engine would substitute: the engine
-// replaces the exact text "{{" + parameter + "}}", so a placeholder with
-// spaces or a leading dot ({{ x }}, {{.X}}) is never a parameter and is not
-// reported.
-var templatePlaceholder = regexp.MustCompile(`\{\{([A-Za-z_][A-Za-z0-9_-]*)\}\}`)
+// templatePlaceholder is a {{name}} the engine would substitute. The engine
+// has no key syntax of its own: composePrompt (internal/engine/phase.go)
+// replaces the literal text "{{" + name + "}}" for every frozen parameter,
+// so {{focus.area}}, {{.Go}} or {{repo/path}} substitute as readily as
+// {{focus}}. The name here is therefore any run of characters an operator
+// can pass with `--param name=value`, bounded by the two things that cannot
+// be a passable name: "=" (parseParameters splits at the first one) and a
+// brace (it would be a different placeholder's delimiter). Whitespace is
+// excluded too, on purpose: {{ x }} is how GitHub Actions (${{ github.sha }}),
+// Handlebars and Go templates write their own expressions, which a prompt
+// quotes as text and the engine leaves literal; refusing those would leave
+// an operator no way to admit the run without corrupting the prompt.
+var templatePlaceholder = regexp.MustCompile(`\{\{([^\s{}=]+)\}\}`)
 
 // ParameterReference is one {{name}} a role's inline user prompt expects a
 // run parameter for.

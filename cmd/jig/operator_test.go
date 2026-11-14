@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
@@ -143,6 +144,36 @@ func TestJobShowFollowExitsWithTheJobsOutcome(t *testing.T) {
 	}
 }
 
+// A withdrawn release settles the follow: the API omits the cleared
+// publish_requested_at, so each poll must decode into a fresh detail or the
+// stale request keeps the job looking pending forever.
+func TestJobShowFollowSettlesWhenAPendingReleaseIsWithdrawn(t *testing.T) {
+	var mutex sync.Mutex
+	gets := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		gets++
+		if gets <= 2 {
+			_, _ = w.Write([]byte(`{"job":{"id":"job-1","state":"accepted_unpublished",` +
+				`"publish_requested_at":"2026-11-14T00:00:00Z"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"job":{"id":"job-1","state":"accepted_unpublished"}}`))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	code, stdout, stderr := jigJob(t, ctx, "show", "job-1", "--follow", "--server", server.URL)
+	if code != exitRejected || ctx.Err() != nil {
+		t.Fatalf("follow after a withdrawn release exited %d (ctx %v), want %d:\n%s%s",
+			code, ctx.Err(), exitRejected, stdout, stderr)
+	}
+	if strings.Contains(stdout, "publish requested") {
+		t.Fatalf("follow reported the withdrawn request as still pending:\n%s", stdout)
+	}
+}
+
 func TestATriggerIsCreatedDisabledUnlessEnabledAndCanBeDeleted(t *testing.T) {
 	repo := initRepo(t)
 	base, stop := startServe(t, t.TempDir(), "--no-github-poll")
@@ -194,7 +225,7 @@ roster:
   surveyor:
     model: haiku
     system_prompt: You survey a repository and change nothing.
-    user_prompt: "Task: {{prompt}}. Focus on {{focus}}. Notes go in {{handoff_dir}}."
+    user_prompt: "Task: {{prompt}}. Focus on {{focus}}, area {{focus.area}}. Notes go in {{handoff_dir}}."
     env: [PATH]
     writes: []
 phases:
@@ -211,7 +242,7 @@ func TestInvokeRefusesAPromptParameterThatWasNotPassed(t *testing.T) {
 		t.Fatal(err)
 	}
 	validated := runDef(t, exitAccepted, "validate", path)
-	if !strings.Contains(validated, "  params: focus\n") {
+	if !strings.Contains(validated, "  params: focus, focus.area\n") {
 		t.Fatalf("validate does not list the expected params:\n%s", validated)
 	}
 	if listed := runDef(t, exitAccepted, "validate", stockDefinition("scout.yaml")); strings.Contains(listed, "params:") {
@@ -227,8 +258,14 @@ func TestInvokeRefusesAPromptParameterThatWasNotPassed(t *testing.T) {
 	if !strings.HasPrefix(refused, want) || !strings.Contains(refused, "Usage: jig def invoke") {
 		t.Fatalf("invoke without --param focus:\n%s\nwant it to open with %q", refused, want)
 	}
-	runDef(t, exitAccepted, "invoke", "survey", "--instructions", "look",
+	// A dotted key substitutes like any other, so it is refused like any other.
+	dotted := runDefStderr(t, exitUsage, "invoke", "survey", "--instructions", "look",
 		"--repo", repo, "--param", "focus=tests", "--server", base)
+	if !strings.HasPrefix(dotted, `jig def invoke: missing_param: role "surveyor" user_prompt references {{focus.area}}; pass --param focus.area=<value>`+"\n") {
+		t.Fatalf("invoke without --param focus.area:\n%s", dotted)
+	}
+	runDef(t, exitAccepted, "invoke", "survey", "--instructions", "look",
+		"--repo", repo, "--param", "focus=tests", "--param", "focus.area=cli", "--server", base)
 
 	code, _, stderr := jigCommand(t, triggerCommand, "create", "--def", "survey", "--name", "n",
 		"--cron", "0 3 * * *", "--timezone", "America/Denver", "--repo", repo, "--instructions", "x",

@@ -271,8 +271,11 @@ missing_param: role "surveyor" user_prompt references {{focus}}; pass --param fo
 
 for every inline `user_prompt` placeholder that names neither a built-in
 below nor a `--param`. A `user_prompt_path` file is read from the worktree
-at run time and cannot be checked ahead of it. Only `{{name}}` written with
-no spaces, `name` starting with a letter or `_`, is a placeholder.
+at run time and cannot be checked ahead of it. A placeholder is `{{name}}`
+where `name` is any text with no whitespace, braces or `=`, the names
+`--param name=value` can pass: `{{focus.area}}`, `{{.Go}}` and
+`{{repo/path}}` all count. Forms with spaces, such as `{{ x }}` or
+`${{ github.sha }}`, are never checked and reach the agent as written.
 
 | Variable | Value | If the template omits it |
 |---|---|---|
