@@ -577,10 +577,14 @@ func (e *execution) ceilingExceeded() bool { return time.Now().After(e.deadline)
 func (e *execution) commandContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	bounded, stopDeadline := context.WithDeadline(ctx, e.deadline)
 	bounded, stop := context.WithCancel(bounded)
+	// Read the channels here, not in the goroutine: a parallel group resets
+	// a member's stop between rounds (runMembers), and that write is ordered
+	// after this caller returns, not after the goroutine has looked.
+	cancelled, groupStop := e.attempt.Cancelled, e.stop
 	go func() {
 		select {
-		case <-e.attempt.Cancelled:
-		case <-e.stop:
+		case <-cancelled:
+		case <-groupStop:
 		case <-bounded.Done():
 		}
 		stop()
