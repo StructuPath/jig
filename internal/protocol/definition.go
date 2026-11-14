@@ -349,8 +349,18 @@ type EnvelopePredicate struct {
 // error rather than a guard on a field literally named "risk = high".
 func IsPredicate(guard string) bool { return len(strings.Fields(guard)) > 1 }
 
+// booleanEnvelopeFields are the envelope fields jig itself reads as
+// booleans: `approved` is the review verdict the verdict_consistent gate
+// requires to be a JSON boolean. A predicate on one of them may compare
+// only against true, false, or null (absence).
+var booleanEnvelopeFields = map[string]bool{"approved": true}
+
 // ParsePredicate parses a declared envelope predicate, rejecting anything
-// that is not exactly `<field> <==|!=> <literal>`.
+// that is not exactly `<field> <==|!=> <literal>`. Boolean literals are
+// checked here, at save time, because the engine compares a boolean field
+// only against exactly `true` or `false` and treats anything else as
+// no-match (KTD2): `approved == True` would otherwise save and never hold,
+// so a repair edge keyed on it would silently never fire.
 func ParsePredicate(expression string) (EnvelopePredicate, error) {
 	fields := strings.Fields(expression)
 	if len(fields) != 3 {
@@ -361,11 +371,26 @@ func ParsePredicate(expression string) (EnvelopePredicate, error) {
 		return EnvelopePredicate{}, fmt.Errorf(
 			"predicate %q: operator %q is not \"==\" or \"!=\"", expression, fields[1])
 	}
-	return EnvelopePredicate{
+	predicate := EnvelopePredicate{
 		Field:   fields[0],
 		Op:      fields[1],
 		Literal: strings.Trim(fields[2], `"'`),
-	}, nil
+	}
+	folded := strings.ToLower(predicate.Literal)
+	if (folded == "true" || folded == "false") && predicate.Literal != folded {
+		return EnvelopePredicate{}, fmt.Errorf(
+			"predicate %q: boolean literal %q must be lowercase %q", expression, predicate.Literal, folded)
+	}
+	if booleanEnvelopeFields[predicate.Field] {
+		switch predicate.Literal {
+		case "true", "false", "null":
+		default:
+			return EnvelopePredicate{}, fmt.Errorf(
+				"predicate %q: %q is a boolean field; compare it with true, false, or null, not %q",
+				expression, predicate.Field, predicate.Literal)
+		}
+	}
+	return predicate, nil
 }
 
 // ParseDefinition decodes definition YAML strictly — unknown fields are
