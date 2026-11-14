@@ -11,10 +11,12 @@
 import { useCallback, useMemo } from "react";
 import type { ReactNode } from "react";
 import { api, parseAttemptSummary } from "./api";
-import { formatDuration, isTerminalAttempt, projectName, taskHeading } from "./format";
+import { formatDuration, isTerminalAttempt, projectName, stateLabel, taskHeading, taskState } from "./format";
 import { buildLane } from "./lanes";
 import { useAttemptEvents, usePolled } from "./polling";
-import { buildStations, isLocalDelivery, verdictFor } from "./stations";
+import { buildStations, verdictFor } from "./stations";
+import { isLocalDelivery, jobOpen, jobStatus, runTone } from "./status";
+import type { JobStatus } from "./status";
 import type { Attempt, JobDetail, Run, TraceEvent } from "./types";
 import { Link } from "./ui";
 
@@ -38,7 +40,8 @@ function FloorRow({ run, nowMs }: { run: Run; nowMs: number }) {
   const settled = SETTLED_RUNS.includes(run.state);
   const loadView = useCallback(() => api.run(run.id), [run.id]);
   const view = usePolled(loadView, settled ? 0 : 4000, `floor:run:${run.id}`);
-  const jobID = view.data?.jobs?.[0]?.id;
+  const jobs = view.data?.jobs ?? [];
+  const jobID = jobs.length === 1 ? jobs[0].id : undefined;
   const title = taskHeading(run);
   const project = (run.targets ?? []).map((target) => projectName(target.repository)).join(", ");
   const name = <td className="floor-job"><Link href={`/runs/${run.id}`}>{title}</Link><small>{project}</small></td>;
@@ -47,16 +50,45 @@ function FloorRow({ run, nowMs }: { run: Run; nowMs: number }) {
     <tr className={`floor-row floor-row-${run.state}`}>
       {jobID
         ? <FloorJob jobID={jobID} run={run} name={name} settled={settled} nowMs={nowMs} />
-        : <Unlit state={run.state} name={name} />}
+        : jobs.length > 1 ? <ManyJobs run={run} count={jobs.length} name={name} />
+        : <Unlit status={runStatus(run)} name={name} />}
     </tr>
   );
 }
 
-/** Unlit is a row with nothing to light yet: no job, or no attempt. */
-function Unlit({ state, name }: { state: string; name: ReactNode }) {
+/**
+ * ManyJobs is a run over several repositories. No one job speaks for it, so
+ * the row shows the run's state in the same words and colour as its board
+ * card and run header, and counts the jobs rather than lighting one job's
+ * stations.
+ */
+function ManyJobs({ run, count, name }: { run: Run; count: number; name: ReactNode }) {
+  const state = taskState(run);
   return (
     <>
-      <td><span className="floor-state floor-state-idle">{state}</span></td>
+      <td><span className={`floor-state floor-state-${runTone(state)}`}>{stateLabel(state)}</span></td>
+      {name}
+      <td className="floor-mono">{count} jobs</td>
+      <td className="floor-mono">—</td>
+      <td className="floor-mono">—</td>
+    </>
+  );
+}
+
+/**
+ * runStatus is a row's status before its job detail is known: the run state in
+ * the words and colour its board card and run header use for the same case.
+ */
+function runStatus(run: Run): Pick<JobStatus, "word" | "tone"> {
+  const state = taskState(run);
+  return { word: stateLabel(state), tone: runTone(state) };
+}
+
+/** Unlit is a row with nothing to light yet: no job, or no attempt. */
+function Unlit({ status, name }: { status: Pick<JobStatus, "word" | "tone">; name: ReactNode }) {
+  return (
+    <>
+      <td><span className={`floor-state floor-state-${status.tone}`}>{status.word}</span></td>
       {name}
       <td><span className="floor-none">—</span></td>
       <td className="floor-mono">—</td>
@@ -69,30 +101,32 @@ function FloorJob({ jobID, run, name, settled, nowMs }: {
   jobID: string; run: Run; name: ReactNode; settled: boolean; nowMs: number;
 }) {
   const loadJob = useCallback(() => api.job(jobID), [jobID]);
-  const job = usePolled(loadJob, settled ? 0 : 4000, `floor:job:${jobID}`);
+  // A settled run's job still changes while it is open (jobOpen): a publish
+  // retry leaves the run `mixed` and moves the job from Held on.
+  const job = usePolled(loadJob, (detail) => settled && detail && !jobOpen(detail) ? 0 : 4000, `floor:job:${jobID}`);
   const attempt = job.data?.attempts?.at(-1);
-  if (!job.data || !attempt) return <Unlit state={job.data ? "queued" : run.state} name={name} />;
+  if (!job.data || !attempt) return <Unlit status={job.data ? jobStatus({ jobState: job.data.job.state }) : runStatus(run)} name={name} />;
   // Only a live attempt follows its trace; a finished one is lit from its
   // result, so a floor of finished jobs polls nothing.
   return isTerminalAttempt(attempt.state)
-    ? <Cells detail={job.data} attempt={attempt} events={NO_EVENTS} name={name} nowMs={nowMs} />
-    : <LiveCells detail={job.data} attempt={attempt} name={name} nowMs={nowMs} />;
+    ? <Cells detail={job.data} run={run} attempt={attempt} events={NO_EVENTS} name={name} nowMs={nowMs} />
+    : <LiveCells detail={job.data} run={run} attempt={attempt} name={name} nowMs={nowMs} />;
 }
 
-function LiveCells(props: { detail: JobDetail; attempt: Attempt; name: ReactNode; nowMs: number }) {
+function LiveCells(props: { detail: JobDetail; run: Run; attempt: Attempt; name: ReactNode; nowMs: number }) {
   const { events } = useAttemptEvents(props.attempt.id, props.attempt.state);
   return <Cells {...props} events={events} />;
 }
 
-function Cells({ detail, attempt, events, name, nowMs }: {
-  detail: JobDetail; attempt: Attempt; events: TraceEvent[]; name: ReactNode; nowMs: number;
+function Cells({ detail, run, attempt, events, name, nowMs }: {
+  detail: JobDetail; run: Run; attempt: Attempt; events: TraceEvent[]; name: ReactNode; nowMs: number;
 }) {
   const lane = useMemo(() => buildLane(attempt, events), [attempt, events]);
   const stations = useMemo(
     () => buildStations(detail.stations, detail.delivery, attempt, lane, events, detail.publish ?? [], nowMs),
     [detail, attempt, lane, events, nowMs],
   );
-  const verdict = verdictFor(attempt, stations, detail.delivery);
+  const verdict = verdictFor(attempt, stations, detail.delivery, run.parameters?.task_mode === "ask");
   const started = Date.parse(attempt.started_at ?? attempt.created_at);
   const ended = attempt.completed_at ? Date.parse(attempt.completed_at) : nowMs;
   const pullRequest = (detail.publish ?? []).find((record) => record.attempt_id === attempt.id && record.pr_url)?.pr_url;
@@ -100,14 +134,21 @@ function Cells({ detail, attempt, events, name, nowMs }: {
   const publish = parseAttemptSummary(attempt.result)?.publish;
   const publishState = typeof publish === "string" ? publish : publish?.state;
   const passed = stations.filter((station) => station.state === "pass").length;
+  // A stop is named in words, not only in red: a screen reader and a
+  // colour-blind operator both need to know which station failed.
+  const failed = stations.filter((station) => station.state === "bad").map((station) => station.label);
+  const lampsLabel = `${passed} of ${stations.length} stations passed${failed.length ? `; failed: ${failed.join(", ")}` : ""}`;
 
   return (
     <>
-      <td><span className={`floor-state floor-state-${verdict.tone}`}>{verdict.word}</span></td>
+      <td>
+        <span className={`floor-state floor-state-${verdict.tone}`}>{verdict.word}</span>
+        {verdict.station && <small className="floor-station">{verdict.station}</small>}
+      </td>
       {name}
       <td>
-        {stations.length === 0 ? <span className="floor-none">—</span> : <span className="floor-lamps" role="img" aria-label={`${passed} of ${stations.length} stations passed`}>
-          {stations.map((station) => <i key={station.name} className={`floor-lamp floor-lamp-${station.state}`} title={`${station.label}: ${station.note || station.state}`} />)}
+        {stations.length === 0 ? <span className="floor-none">—</span> : <span className="floor-lamps" role="img" aria-label={lampsLabel}>
+          {stations.map((station) => <i key={station.name} className={`floor-lamp floor-lamp-${station.state}`} title={`${station.label}: ${station.note || station.state}`}>{station.state === "bad" ? "✕" : null}</i>)}
         </span>}
       </td>
       <td className="floor-mono">{Number.isFinite(started) ? formatDuration(Math.max(0, ended - started)) : "—"}</td>

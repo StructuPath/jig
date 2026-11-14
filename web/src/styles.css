@@ -184,8 +184,12 @@ h4 {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
-  overflow-wrap: anywhere;
+  /* break-word, not anywhere: a cell may wrap a word that cannot fit, but
+     the column is never squeezed below its longest word ("RELE ASE"). */
+  overflow-wrap: break-word;
 }
+.table th, .table .cell-nowrap, .table button { white-space: nowrap; }
+.table .cell-path { overflow-wrap: anywhere; min-width: 16ch; }
 
 .table th,
 .table td {
@@ -216,7 +220,6 @@ h4 {
   background: var(--panel-2);
   font-size: 13px;
   white-space: nowrap;
-  text-transform: capitalize;
 }
 
 .badge .dot {
@@ -227,6 +230,7 @@ h4 {
 }
 
 .badge-accepted .dot,
+.badge-tone-good .dot,
 .badge-ready .dot,
 .badge-complete .dot,
 .badge-success .dot,
@@ -240,6 +244,7 @@ h4 {
 }
 
 .badge-failed .dot,
+.badge-tone-bad .dot,
 .badge-lost .dot,
 .badge-fail .dot {
   background: var(--bad);
@@ -248,7 +253,8 @@ h4 {
 .badge-queued .dot,
 .badge-preparing .dot,
 .badge-mixed .dot,
-.badge-stale .dot,
+.badge-tone-warn .dot,
+.badge-tone-live .dot,
 .badge-accepted_unpublished .dot {
   background: var(--warn);
 }
@@ -531,7 +537,7 @@ summary { cursor: pointer; }
 .outcome { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
 .outcome p { margin: 8px 0 0; }
 section[id] { scroll-margin-top: 20px; }
-button:disabled { cursor: wait; opacity: 0.6; }
+button:disabled { cursor: not-allowed; opacity: 0.6; }
 .task-form fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .task-form label { display: block; font-weight: 650; margin: 20px 0 8px; }
 .task-form label:first-child { margin-top: 0; }
@@ -578,7 +584,9 @@ button:disabled { cursor: wait; opacity: 0.6; }
 .task-card > .subtle { font-size: 11px; }
 .task-card > a { display: inline-block; margin-top: 10px; font-size: 12px; }
 .task-card-ready, .task-card-complete { border-left: 2px solid #82965e; }
-.task-card-failed { border-left: 2px solid var(--bad); }
+.task-card-failed, .task-card-tone-bad { border-left: 2px solid var(--bad); }
+.task-card-tone-good { border-left: 2px solid #82965e; }
+.task-card-tone-warn { border-left: 2px solid var(--warn); }
 .task-card .badge { font-size: 10px; padding: 2px 7px; }
 .outcome { border-radius: 12px; background: linear-gradient(120deg, #293323, #1e2720); border-color: #50613d; padding: 24px; }
 .outcome h3 { font-size: 25px; letter-spacing: -.035em; }
@@ -648,12 +656,17 @@ button { font: 700 12px/1 var(--cond); letter-spacing: .16em; text-transform: up
 .verdict-good { color: var(--ok); }
 .verdict-live { color: var(--accent); }
 .verdict-bad { color: var(--bad); }
+.verdict-warn { color: var(--warn); }
 .verdict-idle { color: var(--muted); }
 
 .stop-banner { margin: 18px 0 0; padding: 12px 16px; border: 1px solid var(--bad); border-left-width: 6px; }
 .stop-banner p { margin: 0; font: 13px/1.5 var(--mono); overflow-wrap: anywhere; }
 .stop-banner p + p { margin-top: 6px; font-family: inherit; }
 .stop-banner strong { display: block; font: 700 15px/1.3 var(--cond); letter-spacing: .12em; text-transform: uppercase; color: var(--bad); }
+.stop-banner-warn { border-color: var(--warn); }
+.stop-banner-warn strong { color: var(--warn); }
+.stop-banner details { margin-top: 6px; }
+.stop-banner pre { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); }
 
 /* The station line. The track is drawn behind the lamps; it moves only
    while the attempt is live. */
@@ -668,10 +681,10 @@ button { font: 700 12px/1 var(--cond); letter-spacing: .16em; text-transform: up
 .station strong { display: block; margin-top: 10px; font: 700 14px/1.1 var(--cond); letter-spacing: .1em; text-transform: uppercase; }
 .station-time { display: block; font: 600 13px/1.5 var(--mono); }
 .station-note { display: block; font: 11px/1.4 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
-.station-wait .lamp, .station-skip .lamp { border-color: var(--off); color: #6f6d60; box-shadow: 0 0 0 4px var(--bg); }
+.station-wait .lamp, .station-skip .lamp { border-color: var(--muted); color: var(--muted); box-shadow: 0 0 0 4px var(--bg); }
 .station-skip .lamp { border-style: dashed; }
 .station-wait strong, .station-skip strong { color: var(--muted); }
-.station-wait .station-time, .station-skip .station-time { color: var(--off); }
+.station-wait .station-time, .station-skip .station-time { color: var(--muted); }
 .station-live .lamp { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 4px var(--bg), 0 0 22px rgba(255, 176, 0, .6); animation: lamp 1.4s ease-in-out infinite; }
 .station-live .station-time { color: var(--accent); }
 .station-bad .lamp, .station-held .lamp { border-color: var(--bad); background: var(--bad); color: var(--bg); box-shadow: 0 0 0 4px var(--bg), 0 0 22px rgba(255, 90, 60, .55); }
@@ -725,13 +738,16 @@ button { font: 700 12px/1 var(--cond); letter-spacing: .16em; text-transform: up
 .floor-state-good { color: var(--ok); }
 .floor-state-live { color: var(--accent); }
 .floor-state-bad { color: var(--bad); }
+.floor-state-warn { color: var(--warn); }
 .floor-state-idle { color: var(--muted); }
+.floor-station { display: block; margin-top: 4px; font: 11px/1.5 var(--mono); color: var(--muted); white-space: nowrap; }
 .floor-mono { font: 12px/1.3 var(--mono); color: var(--muted); white-space: nowrap; }
-.floor-none { color: var(--off); }
+.floor-none { color: var(--muted); }
 .floor-lamps { display: inline-flex; gap: 3px; flex-wrap: wrap; max-width: 190px; }
-.floor-lamp { width: 11px; height: 11px; border-radius: 50%; background: var(--ok); }
-.floor-lamp-wait { background: var(--line); }
-.floor-lamp-skip { background: transparent; border: 1px dashed var(--off); }
+.floor-lamp { display: inline-grid; place-content: center; width: 11px; height: 11px; border-radius: 50%; background: var(--ok); color: var(--bg); font: normal 700 9px/1 var(--mono); }
+/* A waiting lamp is a ring: the dark fill alone is 1.4:1 on the page. */
+.floor-lamp-wait { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
+.floor-lamp-skip { background: transparent; border: 1px dashed var(--muted); }
 .floor-lamp-live { background: var(--accent); animation: lamp-dot 1.4s ease-in-out infinite; }
 .floor-lamp-bad, .floor-lamp-held { background: var(--bad); }
 @keyframes lamp-dot { 50% { opacity: .35; } }
@@ -797,5 +813,5 @@ button { font: 700 12px/1 var(--cond); letter-spacing: .16em; text-transform: up
   .feed li { grid-template-columns: 70px 52px minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .badge-running .dot, .line-moving::before, .station-live .lamp { animation: none; }
+  .badge-running .dot, .line-moving::before, .station-live .lamp, .floor-lamp-live, .tool-running { animation: none; }
 }

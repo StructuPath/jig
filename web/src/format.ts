@@ -58,7 +58,8 @@ export function parseTime(value: string | undefined | null): number | null {
 }
 
 // formatDuration renders a span the way an operator reads it: sub-second in
-// milliseconds, minutes and hours once they matter.
+// milliseconds, minutes and hours once they matter, and days past two days:
+// "98d 12h" reads where "2365h 28m" has to be divided in the head.
 export function formatDuration(milliseconds: number): string {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return "—";
   if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`;
@@ -68,7 +69,24 @@ export function formatDuration(milliseconds: number): string {
   const rest = Math.round(seconds - minutes * 60);
   if (minutes < 60) return `${minutes}m ${rest}s`;
   const hours = Math.floor(minutes / 60);
-  return `${hours}h ${minutes - hours * 60}m`;
+  if (hours < 48) return `${hours}h ${minutes - hours * 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours - days * 24}h`;
+}
+
+// formatAge is how long ago a time was, for a column of items that can be
+// minutes or weeks old: a clock time alone hides that an item is days old.
+// The full date and time belong in the cell's title.
+export function formatAge(value: string | undefined | null, nowMs: number): string {
+  const time = parseTime(value);
+  if (time === null) return "—";
+  const seconds = Math.max(0, Math.floor((nowMs - time) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
 }
 
 // formatStopwatch is a duration as a station reads it: m:ss, or h:mm:ss once
@@ -128,5 +146,8 @@ export function stateLabel(state: string): string {
     mixed: "Mixed results", live: "Online", stale: "Offline", active: "In progress",
     ready: "Ready to review", complete: "Complete",
   };
-  return labels[state] ?? state.replace(/_/g, " ");
+  // Capitalised here rather than by CSS, which would also capitalise every
+  // word of a multi-word label ("Accepted · Not Published").
+  const label = labels[state] ?? state.replace(/_/g, " ");
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }

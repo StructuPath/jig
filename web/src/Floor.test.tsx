@@ -101,9 +101,11 @@ afterEach(() => vi.unstubAllGlobals());
 
 it("lights a finished job's row from its result, without reading its trace", async () => {
   render(<Floor runs={[run("run-done", "accepted", "Hint when no control plane answers")]} nowMs={NOW} />);
-  // The row's cells are replaced as its job detail arrives, so the row is
-  // found through the verdict that only the finished detail produces.
-  const row = within((await screen.findByText("Accepted")).closest("tr") as HTMLElement);
+  // The row's cells are replaced as its job detail arrives, and the run
+  // state already reads "Accepted" before then, so the row is found through
+  // the lamps that only the finished detail produces.
+  const row = within((await screen.findByRole("img", { name: "5 of 5 stations passed" })).closest("tr") as HTMLElement);
+  expect(row.getByText("Accepted")).toBeVisible();
   expect(row.getByText("Hint when no control plane answers")).toBeVisible();
   // Three phases plus publish and CI, all proven.
   expect(row.getByRole("img", { name: "5 of 5 stations passed" })).toBeVisible();
@@ -132,7 +134,7 @@ it("keeps a row lit while its run changes state", async () => {
 
 it("labels a job the form kept local as kept local, not held", async () => {
   render(<Floor runs={[run("run-local", "accepted", "Local change")]} nowMs={NOW} />);
-  const row = within((await screen.findByText("Ready")).closest("tr") as HTMLElement);
+  const row = within((await screen.findByText("Ready to review")).closest("tr") as HTMLElement);
   expect(row.getByText("kept local")).toBeVisible();
   expect(row.queryByText("held")).toBeNull();
 });
@@ -141,7 +143,9 @@ it("keeps a row readable when the run has no job yet", async () => {
   render(<Floor runs={[run("run-empty", "active", "Queued work")]} nowMs={NOW} />);
   const row = within((await screen.findByText("Queued work")).closest("tr") as HTMLElement);
   await waitFor(() => expect(requests).toContain("/api/runs/run-empty"));
-  expect(row.getByText("active")).toBeVisible();
+  // Before any job exists the row reads the run state as its board card and
+  // run header do.
+  expect(row.getByText("In progress")).toBeVisible();
 });
 
 it("starts a saved workflow as itself, on the runtime it pins", async () => {
@@ -157,10 +161,11 @@ it("starts a saved workflow as itself, on the runtime it pins", async () => {
   const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
 
-  // A workflow pinned to a runtime no online worker runs cannot start.
+  // A workflow pinned to a runtime no online worker runs still starts: the
+  // server queues it, and the note says it waits for that runtime.
   fireEvent.change(select, { target: { value: "d-codex" } });
-  expect(start).toBeDisabled();
-  expect(screen.getByText("No online worker runs codex. Check Workers before starting.")).toBeVisible();
+  expect(start).toBeEnabled();
+  expect(screen.getByText("No online worker runs codex — the job waits in the queue until one does.")).toBeVisible();
 
   fireEvent.change(select, { target: { value: "d-factory" } });
   fireEvent.click(start);
@@ -185,7 +190,7 @@ async function fillSavedWorkflow(project: string, instructions: string) {
 it("passes a continuation to a saved workflow: earlier result as context, earlier branch as base", async () => {
   window.history.replaceState({}, "", "/?continue=run-0");
   render(<Tasks />);
-  expect(await screen.findByText(/Starts from the earlier task's branch jig\/job-0\/1/)).toBeVisible();
+  expect(await screen.findByText(/Starts from the earlier job's branch jig\/job-0\/1/)).toBeVisible();
   fireEvent.click(await fillSavedWorkflow("github.com/owner/repo", "Keep going"));
   await waitFor(() => expect(window.location.pathname).toBe("/runs/run-new"));
   expect(posted).toMatchObject({

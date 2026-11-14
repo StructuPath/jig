@@ -5,7 +5,7 @@ import { useCallback, useState } from "react";
 import { api } from "./api";
 import { TaskBoard } from "./TaskBoard";
 import { Floor } from "./Floor";
-import { formatClock } from "./format";
+import { formatAge, formatClock, formatDateTime } from "./format";
 import { useNow, usePolled } from "./polling";
 import { Empty, ErrorBanner, Link, Loading, StatusBadge } from "./ui";
 
@@ -14,6 +14,7 @@ export function Queue() {
   const { data, error, loading } = usePolled(load, 2000, "queue");
   const loadFleet = useCallback(() => api.fleet(), []);
   const fleet = usePolled(loadFleet, 3000, "queue-workers");
+  const nowMs = useNow(30000);
 
   if (loading && !data) return <Loading label="Loading queue…" />;
   if (!data) return <ErrorBanner error={error} />;
@@ -24,7 +25,7 @@ export function Queue() {
       <header className="view-header">
         <div>
           <h1>Work queue</h1>
-          <p className="subtle">Live work appears here. Completed and older runs are in Run history.</p>
+          <p className="subtle">Live work appears here. Finished jobs are in Jobs.</p>
           <p className="subtle">Observed {formatClock(data.observed_at)}</p>
         </div>
         <div className="counters">
@@ -52,8 +53,8 @@ export function Queue() {
         <section className="panel">
           <h2>No work is running</h2>
           <p>The queue is empty. Opening an old run does not restart it.</p>
-          <p><Link href="/">Start a new task →</Link></p>
-          <Link href="/runs">Browse previous results →</Link>
+          <p><Link href="/">Start a job on the Floor →</Link></p>
+          <Link href="/runs">Browse finished jobs →</Link>
         </section>
       ) : (
         <table className="table">
@@ -88,7 +89,7 @@ export function Queue() {
                     "—"
                   )}
                 </td>
-                <td>{formatClock(entry.enqueued_at)}</td>
+                <td className="cell-nowrap" title={formatDateTime(entry.enqueued_at)}>{formatAge(entry.enqueued_at, nowMs)}</td>
               </tr>
             ))}
           </tbody>
@@ -115,7 +116,7 @@ export function Runs() {
     setLayout(next);
     try { localStorage.setItem("jig-tasks-layout", next); } catch { /* The switch still applies for this visit. */ }
   };
-  if (loading && !data) return <Loading label="Loading runs…" />;
+  if (loading && !data) return <Loading label="Loading jobs…" />;
   if (!data) return <ErrorBanner error={error} />;
 
   return (
@@ -132,7 +133,7 @@ export function Runs() {
       </header>
       <ErrorBanner error={error} />
       {data.length === 0 ? (
-        <Empty title="No tasks yet" detail="Start a task from the New task page." />
+        <Empty title="No jobs yet" detail="Start a job from the Floor." />
       ) : layout === "board" ? (
         <TaskBoard runs={data} />
       ) : (

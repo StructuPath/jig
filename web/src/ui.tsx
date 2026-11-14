@@ -5,12 +5,23 @@ import type { ReactNode } from "react";
 import { APIError } from "./api";
 import { stateLabel } from "./format";
 import { navigate } from "./router";
+import type { JobStatus } from "./status";
 
 export function StatusBadge({ state }: { state: string }) {
   return (
     <span className={`badge badge-${state}`}>
       <span className="dot" />
       {stateLabel(state)}
+    </span>
+  );
+}
+
+/** JobBadge shows the shared job status (status.ts) in its tone's colour. */
+export function JobBadge({ status }: { status: Pick<JobStatus, "word" | "tone"> }) {
+  return (
+    <span className={`badge badge-tone-${status.tone}`}>
+      <span className="dot" />
+      {status.word}
     </span>
   );
 }

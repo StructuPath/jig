@@ -89,7 +89,7 @@ describe("buildStations", () => {
     expect(states(views)).toMatchObject({ "classify-risk": "held", "review-risk": "pass", publish: "held", ci: "wait" });
     expect(views.find((view) => view.name === "classify-risk")?.note).toBe("risk high");
     expect(views.find((view) => view.name === "ci")?.note).toBe("held");
-    expect(verdictFor(held, views, factory)).toEqual({ word: "Held", tone: "bad" });
+    expect(verdictFor(held, views, factory)).toEqual({ word: "Held", tone: "warn" });
   });
 
   it("does not alarm on the task form's own local delivery", () => {
@@ -102,7 +102,7 @@ describe("buildStations", () => {
     const views = buildStations(chain.slice(0, 2), local, kept, buildLane(kept, []), [], [], BASE);
     expect(states(views)).toEqual({ plan: "pass", build: "pass", publish: "skip" });
     expect(views.at(-1)?.note).toBe("kept local");
-    expect(verdictFor(kept, views, local)).toEqual({ word: "Ready", tone: "good" });
+    expect(verdictFor(kept, views, local)).toEqual({ word: "Ready to review", tone: "good" });
   });
 
   it("stops at the station that failed and leaves the rest not run", () => {
