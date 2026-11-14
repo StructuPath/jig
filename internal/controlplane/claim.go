@@ -180,8 +180,14 @@ func (s *Store) Claim(ctx context.Context, workerID string, input protocol.Claim
 	for _, value := range candidates {
 		spec, err := protocol.ParseDefinition([]byte(value.snapshot))
 		if err != nil {
-			// A frozen snapshot that no longer parses cannot be executed;
-			// skip it rather than blocking the queue behind it.
+			// A frozen snapshot that no longer parses cannot be executed, and
+			// editing the definition cannot repair it: the run froze it (R2).
+			// A rule tightened after the freeze is how this happens. Fail the
+			// job here, with the parser's diagnostic, so it does not sit
+			// queued forever behind a silent skip; then keep claiming.
+			if err := failUnparseableSnapshot(ctx, tx, value.jobID, err, nowMillis); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if !envNamesSubset(spec.RequiredEnvNames(), advertised) {
@@ -283,6 +289,38 @@ func (s *Store) commitEmptyClaim(ctx context.Context, tx *sql.Tx, workerID, requ
 		return nil, unavailable(err)
 	}
 	return nil, nil
+}
+
+// snapshotInvalidCode prefixes the attempt error of a job failed at claim
+// because its run's frozen snapshot no longer parses.
+const snapshotInvalidCode = "snapshot_invalid"
+
+// failUnparseableSnapshot fails a queued job whose snapshot no longer parses,
+// inside the claim transaction: the queued attempt goes `failed` with the
+// parser diagnostic, the job `failed`, and the run is re-aggregated — the
+// same ledger shape as every other attempt failure. The guards re-check
+// `queued`, so a job that moved on meanwhile is left alone. The writes
+// commit with the claim (or the empty claim), so a rolled-back claim undoes
+// them and the next claim repeats them.
+func failUnparseableSnapshot(ctx context.Context, tx *sql.Tx, jobID string, cause error, nowMillis int64) error {
+	diagnostic := boundedError(snapshotInvalidCode +
+		": the run's frozen definition snapshot no longer parses: " + cause.Error())
+	result, err := tx.ExecContext(ctx, `
+		UPDATE attempts SET state = 'failed', error = ?, completed_at = ?
+		WHERE job_id = ? AND state = 'queued'
+	`, diagnostic, nowMillis, jobID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = 'failed', updated_at = ? WHERE id = ? AND state = 'queued'
+	`, nowMillis, jobID); err != nil {
+		return unavailable(err)
+	}
+	return applyRunAggregationForJob(ctx, tx, jobID, nowMillis)
 }
 
 func envNamesSubset(required []string, advertised map[string]bool) bool {
