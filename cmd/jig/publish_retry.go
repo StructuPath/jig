@@ -30,7 +30,7 @@ import (
 	"github.com/StructuPath/JIG-Software-Factory/internal/worker"
 )
 
-const workerPublishRetryUsage = `Usage: jig worker publish-retry [flags] <job-id>
+const workerPublishRetryUsage = `Usage: jig worker publish-retry <job-id> [flags]
 
 Finish publishing an accepted_unpublished job — a held release, a pull
 request that failed to open, CI that was red — without re-running any
@@ -45,7 +45,8 @@ worker uses. Stop that worker first — the data directory is locked while
 either one runs.
 
 Flags:
-  --server <url>         control plane base URL (default http://127.0.0.1:8383)
+  --server <url>         control plane base URL
+                         (default $JIG_SERVER or http://127.0.0.1:8383)
   --data <dir>           the worker data directory the attempt ran in
                          (default ~/.jig/worker)
   --commit-author-name   author name on jig's publish commit
@@ -76,18 +77,20 @@ func workerPublishRetryCommand(ctx context.Context, args []string, stdout, stder
 	flags := flag.NewFlagSet("jig worker publish-retry", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, workerPublishRetryUsage) }
-	serverURL := flags.String("server", "http://"+defaultServerAuthority, "control plane URL")
+	serverURL := serverFlag(flags)
 	dataDir := flags.String("data", defaultWorkerDataDir(), "worker data directory")
 	authorName := flags.String("commit-author-name", "jig", "publish commit author name")
 	authorEmail := flags.String("commit-author-email", "jig@localhost", "publish commit author email")
 	baseBranch := flags.String("base-branch", "", "pull-request base branch")
 	allowMerge := flags.Bool("allow-merge", false, "allow exact-head merge on retry")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
-	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" || *dataDir == "" {
-		flags.Usage()
-		return exitUsage
+	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
+		return usageError(stderr, "jig worker publish-retry", "exactly one job id is required", workerPublishRetryUsage)
+	}
+	if *dataDir == "" {
+		return usageError(stderr, "jig worker publish-retry", "--data is required", workerPublishRetryUsage)
 	}
 	jobID := flags.Arg(0)
 	if ctx == nil {

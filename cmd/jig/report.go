@@ -31,7 +31,7 @@ accepts, publish outcomes, CI repair, flaky-check re-runs, and spend. The
 control plane computes it from its ledger; nothing is written.
 
 Flags:
-  --server <url>   control plane URL (default http://127.0.0.1:8383)
+  --server <url>   control plane URL (default $JIG_SERVER or http://127.0.0.1:8383)
   --since <when>   window start: a duration back from now (7d, 24h, 90m) or
                    an RFC3339 timestamp (default: 7 days before --until)
   --until <when>   window end, RFC3339 (default: now)
@@ -54,12 +54,11 @@ func reportCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	flags, server, asJSON := defFlags("jig report", stderr, reportUsage)
 	sinceFlag := flags.String("since", "", "window start: a duration back from now or RFC3339")
 	untilFlag := flags.String("until", "", "window end, RFC3339")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintf(stderr, "jig report: unexpected argument %q\n\n%s", flags.Arg(0), reportUsage)
-		return exitUsage
+		return usageError(stderr, "jig report", fmt.Sprintf("unexpected argument %q", flags.Arg(0)), reportUsage)
 	}
 	query := url.Values{}
 	if *sinceFlag != "" {

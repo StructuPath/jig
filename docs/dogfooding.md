@@ -230,16 +230,15 @@ Aim for at least 20 jobs that wait for CI. Below that, a single job moves a
 rate by 5 points or more, and the thresholds in section 3 are not
 meaningful. Report counts, not rates, until you get there.
 
-Invoke each job with flags before the definition id:
+Invoke each job by the definition's name or id:
 
 ```sh
-jig def invoke \
+jig def invoke <definition> \
     --instructions "fix the off-by-one in the pagination cursor described in issue #41" \
-    --repo "github.com/$REPO" \
-    <definition-id>
+    --repo "github.com/$REPO"
 ```
 
-The command prints the run and its job id. Record the job id.
+The command prints the run, its job id, and the run's UI page. Record the job id.
 
 ### 2.3 Size the chain against the attempt ceiling
 

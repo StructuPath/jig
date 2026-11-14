@@ -145,15 +145,7 @@ func (w *Worker) ClaimOnce(ctx context.Context) (*protocol.Attempt, error) {
 	if w.activeCount() >= w.config.Capacity {
 		return nil, nil
 	}
-	token, err := mintLeaseToken()
-	if err != nil {
-		return nil, err
-	}
-	requestID, err := newUUID()
-	if err != nil {
-		return nil, err
-	}
-	claim, err := w.client.Claim(ctx, protocol.ClaimRequest{RequestID: requestID, LeaseToken: token})
+	claim, token, err := w.claim(ctx)
 	if err != nil || claim == nil {
 		return nil, err
 	}
@@ -164,6 +156,65 @@ func (w *Worker) ClaimOnce(ctx context.Context) (*protocol.Attempt, error) {
 		return nil, err
 	}
 	return attempt, nil
+}
+
+// claimResendDelays spaces the resends of one claim request after a
+// transport failure; a variable so tests need not wait.
+var claimResendDelays = []time.Duration{500 * time.Millisecond, time.Second}
+
+// claim makes one claim request under a freshly minted token and request id.
+// A transport failure leaves it unknown whether the server committed the
+// claim, so the same (request_id, token) pair is resent before anything new
+// is minted: the server replays a committed claim for that pair (R4), and a
+// new pair would strand the committed attempt preparing under a token no
+// worker holds until the sweeper calls it lost.
+func (w *Worker) claim(ctx context.Context) (*protocol.Claim, string, error) {
+	token, err := mintLeaseToken()
+	if err != nil {
+		return nil, "", err
+	}
+	requestID, err := newUUID()
+	if err != nil {
+		return nil, "", err
+	}
+	request := protocol.ClaimRequest{RequestID: requestID, LeaseToken: token}
+	claim, err := w.client.Claim(ctx, request)
+	for _, delay := range claimResendDelays {
+		if err == nil || !retryable(err) {
+			break
+		}
+		if waitErr := sleepContext(ctx, delay); waitErr != nil {
+			return nil, "", err
+		}
+		claim, err = w.client.Claim(ctx, request)
+	}
+	if err != nil || claim == nil {
+		return nil, "", err
+	}
+	return claim, token, nil
+}
+
+// retryable reports whether a request may be resent unchanged: a transport
+// error or a 5xx answer is uncertainty about whether the server acted, while
+// any 4xx answer is a verdict that repeating cannot change.
+func retryable(err error) bool {
+	var apiError *APIError
+	if errors.As(err, &apiError) {
+		return apiError.Status >= 500
+	}
+	return true
+}
+
+// sleepContext waits for delay or until ctx ends, whichever comes first.
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // runClaimLoop polls for work while capacity is free, running each claimed
@@ -183,17 +234,7 @@ func (w *Worker) runClaimLoop(ctx context.Context) {
 		// its work is already done.
 		w.servePublishRequests(ctx, &attempts)
 		for w.activeCount() < w.config.Capacity {
-			token, err := mintLeaseToken()
-			if err != nil {
-				w.logger.Warn("claim_failed", "error", err)
-				break
-			}
-			requestID, err := newUUID()
-			if err != nil {
-				w.logger.Warn("claim_failed", "error", err)
-				break
-			}
-			claim, err := w.client.Claim(ctx, protocol.ClaimRequest{RequestID: requestID, LeaseToken: token})
+			claim, token, err := w.claim(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
 					w.logger.Warn("claim_failed", "error", err)
@@ -303,11 +344,24 @@ func (w *Worker) runAttempt(ctx context.Context, claim *protocol.Claim, token st
 	return &attempt, nil
 }
 
+// completionRetryDelays spaces the retries of one completion after a
+// transport failure or a 5xx answer, about two minutes in all; a variable so
+// tests need not wait.
+var completionRetryDelays = []time.Duration{
+	time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+	15 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+}
+
+// completeAttempt reports the terminal outcome, retrying while the outcome's
+// fate is uncertain. The caller's heartbeat keeps renewing the lease during
+// the retries, so a timeout, a busy database, or a server restart does not
+// turn finished work — possibly an already-merged PR — into a swept-lost
+// attempt. Repeating is safe because the control plane replays a terminal
+// completion for the owning token and keeps the first stored outcome (R6).
+// Only a verdict (a 4xx answer, including a lost lease) or a cancelled
+// context ends the retries early.
 func (w *Worker) completeAttempt(ctx context.Context, lease *attemptLease, outcome Outcome) (protocol.Attempt, error) {
-	if err := lease.freshen(ctx); err != nil {
-		return protocol.Attempt{}, fmt.Errorf("freshen lease before completion: %w", err)
-	}
-	return w.client.CompleteAttempt(ctx, lease.attemptID, protocol.CompleteAttemptRequest{
+	request := protocol.CompleteAttemptRequest{
 		LeaseToken: lease.token,
 		State:      outcome.State,
 		Result:     boundedText(outcome.Result, protocol.MaxResultBytes),
@@ -315,7 +369,26 @@ func (w *Worker) completeAttempt(ctx context.Context, lease *attemptLease, outco
 		// The hold travels as a field of its own, not only inside the result
 		// summary: the control plane records it and never parses a result.
 		PublishHold: boundedText(outcome.PublishHold, protocol.MaxPublishDiagnosticBytes),
-	})
+	}
+	attempt, err := w.completeAttemptOnce(ctx, lease, request)
+	for _, delay := range completionRetryDelays {
+		if err == nil || !retryable(err) || lease.lostVerdict() != nil {
+			break
+		}
+		w.logger.Warn("attempt_completion_retry", "attempt_id", lease.attemptID, "error", err)
+		if waitErr := sleepContext(ctx, delay); waitErr != nil {
+			break
+		}
+		attempt, err = w.completeAttemptOnce(ctx, lease, request)
+	}
+	return attempt, err
+}
+
+func (w *Worker) completeAttemptOnce(ctx context.Context, lease *attemptLease, request protocol.CompleteAttemptRequest) (protocol.Attempt, error) {
+	if err := lease.freshen(ctx); err != nil {
+		return protocol.Attempt{}, fmt.Errorf("freshen lease before completion: %w", err)
+	}
+	return w.client.CompleteAttempt(ctx, lease.attemptID, request)
 }
 
 // primaryRuntime names the first probed runtime for the attempt record

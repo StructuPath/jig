@@ -12,19 +12,37 @@ import (
 	"time"
 )
 
+const startUsage = `Usage: jig start [--no-open] [--allow-merge]
+
+Start Jig for one person on this machine: the control plane on
+http://127.0.0.1:8383 (unless one already answers there, with GitHub polling
+off) and a worker on your signed-in Codex, then open the UI in your browser.
+Leave it running; Ctrl+C stops the worker and any server it started.
+
+Flags:
+  --no-open       do not open the browser; print the address instead
+  --allow-merge   allow never-held jobs to merge when their definition
+                  opts in
+
+Exit codes:
+  0  stopped cleanly on Ctrl+C, or Jig was already running and ready
+  1  the server or worker could not start, or did not become ready
+  2  usage error
+`
+
 // Use the existing commands so startup preserves their cancellation and
 // worker-drain behavior. Stop the worker before stopping an owned server.
 func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("jig start", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() { fmt.Fprint(stderr, startUsage) }
 	noOpen := flags.Bool("no-open", false, "do not open the browser")
 	allowMerge := flags.Bool("allow-merge", false, "allow exact-head merge for opted-in definitions")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "Usage: jig start [--no-open] [--allow-merge]")
-		return exitUsage
+		return usageError(stderr, "jig start", fmt.Sprintf("unexpected argument %q", flags.Arg(0)), startUsage)
 	}
 	url := "http://" + defaultServerAuthority
 	client := &http.Client{Timeout: time.Second}

@@ -36,3 +36,17 @@ func TestRepairChainCannotReplayTheParallelGroup(t *testing.T) {
 		t.Fatalf("rerun-chain across the parallel group: got %v", err)
 	}
 }
+
+// rerun-self dispatches the repair target alone just as rerun-chain does, so
+// a parallel member is no valid target for either.
+func TestARepairEdgeCannotTargetAParallelMember(t *testing.T) {
+	for _, then := range []string{RepairThenRerunSelf, RepairThenRerunChain} {
+		t.Run(then, func(t *testing.T) {
+			phases := strings.Replace(panelPhases, `{name: check, kind: code, command: "true"}`,
+				`{name: check, kind: code, command: "false", on_fail: {run: review-b, then: `+then+`, budget: 1}}`, 1)
+			mustParse(t, parallelPanel("", phases, ""))
+			mustReject(t, parallelPanel("", phases, "parallel: [review-a, review-b, review-c]\n"),
+				`phase "check"`, `"review-b"`, "parallel")
+		})
+	}
+}

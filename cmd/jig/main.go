@@ -13,7 +13,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
+
+	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
 
 // version is jig's release identity, stamped at build time with
@@ -72,13 +75,62 @@ func run(ctx context.Context, args []string) int {
 	case "report":
 		return reportCommand(ctx, args[1:], os.Stdout, os.Stderr)
 	case "version", "--version":
-		fmt.Fprintf(os.Stdout, "jig %s\n", version)
+		fmt.Fprintln(os.Stdout, versionLine())
 		return 0
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stdout, usage)
 		return 0
 	default:
+		if suggestion := closestCommand(args[0]); suggestion != "" {
+			fmt.Fprintf(os.Stderr, "jig: unknown command %q — did you mean %q?\n\n%s",
+				args[0], suggestion, usage)
+			return 2
+		}
 		fmt.Fprintf(os.Stderr, "jig: unknown command %q\n\n%s", args[0], usage)
 		return 2
 	}
+}
+
+// closestCommand is the dispatch vocabulary's nearest spelling of a
+// mistyped command, for "did you mean", or "".
+func closestCommand(word string) string {
+	return protocol.ClosestMatch(word, []string{
+		"start", "serve", "worker", "run", "def", "trigger", "job", "report", "version", "help"})
+}
+
+// versionLine names the release and, when the Go toolchain stamped it, the
+// commit the binary was built from: a "dev" build is still traceable to a
+// revision, and "+dirty" says it was built from uncommitted changes.
+func versionLine() string {
+	line := "jig " + version
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return line
+	}
+	var revision, built string
+	dirty := false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.time":
+			built = setting.Value
+		case "vcs.modified":
+			dirty = setting.Value == "true"
+		}
+	}
+	if revision == "" {
+		return line
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if dirty {
+		revision += "+dirty"
+	}
+	line += " (" + revision
+	if built != "" {
+		line += ", " + built
+	}
+	return line + ")"
 }
