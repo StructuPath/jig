@@ -201,15 +201,15 @@ In a second terminal, save a definition and admit a run:
 ./bin/jig def create examples/definitions/two-phase.yaml
 ./bin/jig def list
 
-./bin/jig def invoke \
+./bin/jig def invoke two-phase \
     --instructions "write the note this repository is missing" \
-    --repo "$PWD" \
-    <definition-id>
+    --repo .
 ```
 
-Flags come before the definition id. Go's flag parser stops at the first
-positional argument, so `def invoke <id> --repo …` silently drops every flag
-after the id and exits 2 with a usage dump.
+A definition is named by its id or its name, and flags may come before or
+after it. A relative `--repo` path such as `.` is resolved to an absolute
+path before it is sent. The command prints the run's UI page, and a note
+when no worker is online yet.
 
 The run fans out into one job per target repository, each pinned to that
 repository's HEAD at admission. Nothing runs yet: jobs are queued until a
@@ -320,7 +320,7 @@ A trigger admits runs without you. A nightly scout:
 
 ```sh
 ./bin/jig trigger create \
-    --def <definition-id> \
+    --def <definition> \
     --name nightly-scout \
     --kind schedule \
     --cron "0 3 * * *" \
@@ -333,7 +333,7 @@ Or one that works GitHub issues as they appear:
 
 ```sh
 ./bin/jig trigger create \
-    --def <definition-id> \
+    --def <definition> \
     --name triage \
     --kind github_issue \
     --repo github.com/you/your-repo \
