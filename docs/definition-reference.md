@@ -24,7 +24,7 @@ phases:
 ```
 
 ```sh
-go run ./cmd/jig def validate hello.yaml
+jig def validate hello.yaml
 # ok hello.yaml — definition "hello", 1 phase(s), 1 role(s)
 jig run --def hello.yaml . "what is this repo?"
 ```
@@ -40,7 +40,9 @@ handoff directory, and the envelope instruction, all appended by jig (see
   as `on_fial` is a parse error, not a silently dropped field.
 - `jig def validate <file>...` runs the same `ParseDefinition` the control
   plane runs at save time, offline. Exit code 0 is valid, 2 is a usage or
-  validation error. `--json` prints the verdicts as JSON.
+  validation error. `--json` prints the verdicts as JSON. A definition whose
+  user prompts reference [parameters](#template-variables) gets a second
+  line, `params: focus, scope`, naming what every invocation must pass.
 - Validation stops at the first error. Every message names the element at
   fault.
 
@@ -79,6 +81,15 @@ One entry per agent role under `roster:`.
 Exactly one of `system_prompt` / `system_prompt_path` is required, and exactly
 one of `user_prompt` / `user_prompt_path` is required. Setting both of a pair
 is an error.
+
+**Effort and spend.** `effort` sets how much a role thinks and verifies, and
+thinking is billed as output. Codex tops out at `xhigh`, so `max` runs there
+as `xhigh`. A useful split: `medium` for a builder working to a plan, `high`
+for a reviewer hunting the edge cases the build missed. Omit it to keep the
+CLI's default for the model, and omit it for `haiku`, which does not take an
+effort level. `budget_usd` is the most one send by that role may cost.
+Codex has no such flag, and a cap it cannot enforce fails rather than run
+uncapped — the same posture as a `tools` allowlist there.
 
 ## Phase block
 
@@ -176,6 +187,17 @@ receives the last member's envelope. Rules (`validateParallel`):
 - `publish.ci.on_fail.run` must not be a member.
 - No `rerun-chain` edge may replay a member.
 
+How the group runs: each member runs in its own ephemeral HOME and session
+and is handed the envelope from before the group, never a sibling's. Any
+other worktree change while the group runs — including one a crashed member
+left — rolls back and aborts the attempt. Rejections resolve after every
+member finishes: the first member in declared order that rejected with
+budget left dispatches its repair target and charges only its own budget,
+and then the whole group runs again, so earlier approvals are re-judged. The
+group runs at most 1 + the sum of its members' budgets times.
+`examples/definitions/factory-parallel.yaml` is the stock factory with its
+review panel grouped; `factory.yaml` stays sequential.
+
 ## build_outputs
 
 Each entry is a directory grant of exactly one shape, with a literal `<dir>`:
@@ -184,8 +206,26 @@ gitignored paths that are not tracked in `HEAD`. A non-ignored path under a
 grant is ordinary content judged by `writes`. jig never stages an output. It
 is never merged into `writes`.
 
+Why it exists: a read-only reviewer that runs the repository's own check
+command still writes what it builds, and `writes: []` would breach on it. A
+grant lets every role — read-only reviewers and parallel-group members
+included — write those directories without breaching. A path under a grant
+that git does not ignore breaches a read-only role with `declared build
+output is not gitignored`, and is a changed path (committed like any other)
+for a writing one.
+
 Declare the directory git ignores: with `cache/` ignored, `cache/**` covers
-`cache/bin/x` but `cache/bin/**` does not. Refused: empty entries, leading or
+`cache/bin/x` but `cache/bin/**` does not. Git reports a wholly ignored
+directory as one entry, and a grant matches paths as git enumerates them.
+A path tracked in `HEAD` is never an output, and git metadata never is.
+`git add -A` in a commit phase never stages an ignored path; a role that
+commits an output itself (`git add -f`) publishes it under its own `writes`,
+and from then on it is tracked content. Outputs written during a parallel
+group survive the group whatever happened to the member that wrote them,
+and the trace attributes them to the group, not a role. A crashed
+sequential phase is still rolled back to its snapshot, its new outputs
+included. Declare only directories no later phase executes: a reviewer could
+otherwise plant what a test phase runs. Refused: empty entries, leading or
 trailing whitespace, NUL or line breaks, absolute paths, a leading `-` or
 `:`, any `..` or `.git` segment, all-wildcard patterns, file-level patterns
 (`bin/*.o`), and wildcards inside `<dir>` (`*/bin/**`, `b?n/**`).
@@ -210,13 +250,27 @@ trailing whitespace, NUL or line breaks, absolute paths, a leading `-` or
 Substitution applies to the user prompt only (`user_prompt` or the content
 of `user_prompt_path`), in one pass over the template. Text that a
 substitution inserts is never scanned again, so a parameter value that
-contains `{{handoff_dir}}` stays literal. A `{{name}}` with no matching
-parameter is left as is. Source: `composePrompt` in `internal/engine/phase.go`.
+contains `{{handoff_dir}}` stays literal. Source: `composePrompt` in
+`internal/engine/phase.go`.
+
+Parameters have no defaults. The engine leaves a `{{name}}` with no matching
+parameter as it is, so the CLI refuses that run before it is admitted:
+`jig def invoke` and `jig trigger create` read the saved definition and stop
+with exit 2 and
+
+```
+missing_param: role "surveyor" user_prompt references {{focus}}; pass --param focus=<value>
+```
+
+for every inline `user_prompt` placeholder that names neither a built-in
+below nor a `--param`. A `user_prompt_path` file is read from the worktree
+at run time and cannot be checked ahead of it. Only `{{name}}` written with
+no spaces, `name` starting with a letter or `_`, is a placeholder.
 
 | Variable | Value | If the template omits it |
 |---|---|---|
 | `{{prompt}}` | The run's prompt. `jig run … "<prompt>"` sets it directly. `jig def invoke --instructions …` and triggers compose it from the trusted instructions and any untrusted context, frozen at admission. | Not appended. Reference it, or the agent never sees the task. |
-| `{{<param>}}` | The value of `--param <param>=<value>` on `jig def invoke` (repeatable). `--param prompt=…` together with instructions is refused (`ambiguous_prompt`). | Not appended. |
+| `{{<param>}}` | The value of `--param <param>=<value>` on `jig def invoke` or `jig trigger create` (repeatable). Required: an unset one is refused at invoke (`missing_param`). `--param prompt=…` together with instructions is refused (`ambiguous_prompt`). | Not appended. |
 | `{{previous_envelope}}` | The raw JSON of the previous phase's envelope, or `(none)` for the first phase. After a repair dispatch it is the failing envelope; after a parallel group it is the last member's envelope. | Appended as a `## Previous envelope` section. |
 | `{{handoff_dir}}` | A per-attempt directory outside the worktree for notes to later phases. It needs no `writes` entry. | Appended as a `## Handoff directory` section. |
 
@@ -396,6 +450,9 @@ build_outputs: ["bin/**"]                 # gitignored bin/ is writable by every
 
 ## See also
 
+- [gates.md](gates.md) — what gates verify, and what `tests_intact` refuses
+  in detail.
+- [publish.md](publish.md) — holds, CI waits, CI repair, re-runs, and merge.
 - [`examples/definitions/`](../examples/definitions/) — the stock definitions,
   validated in CI by `just definitions`.
 - [README: Authoring a definition](../README.md#authoring-a-definition).
