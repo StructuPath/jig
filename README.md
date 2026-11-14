@@ -121,6 +121,8 @@ re-runs, and spend over a time window, read from the control plane's ledger.
 
 ## Authoring a definition
 
+Every field, gate, template variable, and validation rule: [docs/definition-reference.md](docs/definition-reference.md).
+
 A definition is data, not a script. Seven stock ones ship in
 `examples/definitions/`:
 
