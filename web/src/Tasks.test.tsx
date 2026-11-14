@@ -55,12 +55,12 @@ it("names each starter by a hash of its final source, runtime pin included", asy
   }
 });
 
-function mockServer({ online = true, fail = false } = {}) {
+function mockServer({ online = true, fail = false, definitions = [] as unknown[] } = {}) {
   const fetch = vi.fn(async (url: string, init?: RequestInit) => {
     const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
     if (url === "/api/workers") return json({ workers: online ? [{ live: true, runtimes: [{ name: "codex" }] }] : [] });
     if (url === "/api/definitions" && init?.method === "POST") return json({ id: "definition-1" });
-    if (url === "/api/definitions") return json([]);
+    if (url === "/api/definitions") return json(definitions);
     if (url === "/api/runs" && init?.method === "POST") return fail ? json({ error: { code: "invalid_repository", message: "Project folder was not found." } }, 400) : json({ run: { id: "run-1" }, jobs: [] });
     return json([]);
   });
@@ -74,7 +74,7 @@ it("starts a task from the form and opens its progress without terminal steps", 
   fireEvent.click(screen.getByRole("radio", { name: /Get an answer/ }));
   fireEvent.change(screen.getByLabelText("1. Project"), { target: { value: "/tmp/project" } });
   fireEvent.change(screen.getByLabelText("3. What should Codex do?"), { target: { value: "Explain this project" } });
-  const start = screen.getByRole("button", { name: "Start task" });
+  const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
   fireEvent.click(start);
   await waitFor(() => expect(window.location.pathname).toBe("/runs/run-1"));
@@ -91,8 +91,8 @@ it("keeps the task text when admission fails", async () => {
   fireEvent.click(screen.getByRole("radio", { name: /Get an answer/ }));
   fireEvent.change(screen.getByLabelText("1. Project"), { target: { value: "/missing" } });
   fireEvent.change(screen.getByLabelText("3. What should Codex do?"), { target: { value: "My task" } });
-  await waitFor(() => expect(screen.getByRole("button", { name: "Start task" })).toBeEnabled());
-  fireEvent.click(screen.getByRole("button", { name: "Start task" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Start job" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Start job" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("Project folder was not found");
   expect(screen.getByLabelText("3. What should Codex do?")).toHaveValue("My task");
   expect(window.location.pathname).toBe("/");
@@ -102,7 +102,7 @@ it("lets agents choose the directive without making the user fill the task box",
   const fetch = mockServer();
   render(<Tasks />);
   fireEvent.change(screen.getByLabelText("1. Project"), { target: { value: "/tmp/project" } });
-  const start = screen.getByRole("button", { name: "Start task" });
+  const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
   fireEvent.click(start);
   await waitFor(() => expect(window.location.pathname).toBe("/runs/run-1"));
@@ -112,11 +112,33 @@ it("lets agents choose the directive without making the user fill the task box",
   expect(body.instructions).toContain("choose one useful improvement");
 });
 
-it("does not submit a task when no Codex worker is online", async () => {
-  mockServer({ online: false });
+it("starts a job with no worker online and says the job waits", async () => {
+  const fetch = mockServer({ online: false });
   render(<Tasks />);
-  expect(await screen.findByText("Codex is offline. Check Workers before starting.")).toBeVisible();
-  expect(screen.getByRole("button", { name: "Start task" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("1. Project"), { target: { value: "/tmp/project" } });
+  expect(await screen.findByText(/No worker is online — the job waits until you run/)).toBeVisible();
+  // A starter job runs on Codex; plain `jig worker` runs Claude Code and
+  // would leave it queued.
+  expect(screen.getByText("jig worker --runtime codex", { selector: "code" })).toBeVisible();
+  const start = screen.getByRole("button", { name: "Start job" });
+  await waitFor(() => expect(start).toBeEnabled());
+  fireEvent.click(start);
+  await waitFor(() => expect(window.location.pathname).toBe("/runs/run-1"));
+  expect(fetch.mock.calls.some(([url, init]) => url === "/api/runs" && init?.method === "POST")).toBe(true);
+});
+
+it("names the runtime a saved workflow pins in the no-worker command", async () => {
+  mockServer({ online: false, definitions: [
+    { id: "d-pinned", name: "pinned", source: "name: pinned\nruntime: claude-code\n" },
+    { id: "d-any", name: "any", source: "name: any\n" },
+  ] });
+  render(<Tasks />);
+  const saved = await screen.findByRole("radio", { name: /Run a saved workflow/ });
+  await waitFor(() => expect(saved).toBeEnabled());
+  fireEvent.click(saved);
+  expect(await screen.findByText("jig worker --runtime claude-code", { selector: "code" })).toBeVisible();
+  fireEvent.change(screen.getByLabelText("Workflow"), { target: { value: "d-any" } });
+  expect(screen.getByText("jig worker", { selector: "code" })).toBeVisible();
 });
 
 it("opens a follow-up with the same project and an explicit Make changes choice", async () => {
@@ -125,7 +147,7 @@ it("opens a follow-up with the same project and an explicit Make changes choice"
   render(<Tasks />);
   expect(screen.getByLabelText("1. Project")).toHaveValue("github.com/example/project");
   expect(screen.getByRole("radio", { name: /Make changes/ })).toBeChecked();
-  expect(screen.getByText("This task will change files in a separate working folder.")).toBeVisible();
+  expect(screen.getByText("This job will change files in a separate working folder.")).toBeVisible();
 });
 
 it("never lets an ask task publish, whatever delivery is requested", async () => {
@@ -152,7 +174,7 @@ it("starts a pull-request task whose definition releases the publish hold", asyn
   render(<Tasks />);
   fireEvent.click(screen.getByRole("radio", { name: /Open a pull request/ }));
   fireEvent.change(screen.getByLabelText("3. What should Codex do?"), { target: { value: "Fix the bug" } });
-  const start = screen.getByRole("button", { name: "Start task" });
+  const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
   fireEvent.click(start);
   await waitFor(() => expect(window.location.pathname).toBe("/runs/run-1"));
@@ -177,10 +199,10 @@ it("continues an earlier task with its result as context and its pushed branch a
   });
   window.history.replaceState({}, "", "/?mode=build&continue=run-0");
   render(<Tasks />);
-  expect(await screen.findByText(/Starts from the earlier task's branch jig\/job-0\/1/)).toBeVisible();
+  expect(await screen.findByText(/Starts from the earlier job's branch jig\/job-0\/1/)).toBeVisible();
   expect(screen.getByLabelText("1. Project")).toHaveValue("github.com/example/project");
   fireEvent.change(screen.getByLabelText("3. What should Codex do?"), { target: { value: "Reviewed. Let's keep going." } });
-  const start = screen.getByRole("button", { name: "Start task" });
+  const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
   fireEvent.click(start);
   await waitFor(() => expect(window.location.pathname).toBe("/runs/run-1"));

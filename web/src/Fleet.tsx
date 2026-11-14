@@ -85,7 +85,7 @@ export function Fleet() {
                 <th>State</th>
                 <th>Runtime</th>
                 <th>Slots</th>
-                <th>Env</th>
+                <th>Env vars</th>
                 <th>Last heartbeat</th>
               </tr>
             </thead>

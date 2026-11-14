@@ -134,7 +134,7 @@ it("shows the empty state, not five empty columns, when there are no tasks", asy
     mockStorage(layout);
     mockAPI({ runs: [] });
     const { unmount } = render(<Runs />);
-    expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
+    expect(await screen.findByText("No jobs yet")).toBeInTheDocument();
     expect(screen.queryAllByRole("region")).toHaveLength(0);
     unmount();
   }

@@ -4,8 +4,8 @@
 // the operator has to say they looked.
 import { useCallback, useState } from "react";
 import { api } from "./api";
-import { formatClock, shortID } from "./format";
-import { usePolled } from "./polling";
+import { formatAge, formatDateTime, shortID } from "./format";
+import { useNow, usePolled } from "./polling";
 import { Empty, ErrorBanner, Link, Loading } from "./ui";
 
 export function Worktrees() {
@@ -13,6 +13,7 @@ export function Worktrees() {
   const { data, error, loading, refresh } = usePolled(load, 5000, "worktrees");
   const [confirming, setConfirming] = useState<string | null>(null);
   const [actionError, setActionError] = useState<Error | null>(null);
+  const nowMs = useNow(30000);
 
   const release = async (attemptID: string) => {
     try {
@@ -50,7 +51,7 @@ export function Worktrees() {
       {data.length === 0 ? (
         <Empty title="Nothing retained" detail="Every attempt's worktree was disposed cleanly." />
       ) : (
-        <table className="table">
+        <table className="table table-worktrees">
           <thead>
             <tr>
               <th>Repository</th>
@@ -65,14 +66,14 @@ export function Worktrees() {
             {data.map((entry) => (
               <tr key={entry.attempt_id}>
                 <td>{entry.repository}</td>
-                <td>
+                <td className="cell-path">
                   <code>{entry.path}</code>
                 </td>
                 <td>{entry.reason}</td>
-                <td>
+                <td className="cell-nowrap">
                   <Link href={`/jobs/${entry.attempt_id}`}>{shortID(entry.attempt_id)}</Link>
                 </td>
-                <td>{formatClock(entry.created_at)}</td>
+                <td className="cell-nowrap" title={formatDateTime(entry.created_at)}>{formatAge(entry.created_at, nowMs)}</td>
                 <td>
                   {confirming === entry.attempt_id ? (
                     <span className="confirm">

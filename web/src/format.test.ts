@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runtimeLabel, taskHeading, workflowName } from "./format";
+import { formatAge, formatDuration, runtimeLabel, taskHeading, workflowName } from "./format";
 import { automaticGoal } from "./starters";
 import type { Run } from "./types";
 
@@ -47,5 +47,23 @@ describe("runtimeLabel", () => {
     expect(runtimeLabel("claude-code")).toBe("Claude Code");
     expect(runtimeLabel(undefined)).toBe("The agent");
     expect(runtimeLabel("pi")).toBe("The agent");
+  });
+});
+
+describe("formatDuration", () => {
+  it("switches to days past 48 hours", () => {
+    expect(formatDuration(47 * 3_600_000 + 5 * 60_000)).toBe("47h 5m");
+    expect(formatDuration((2365 * 60 + 28) * 60_000)).toBe("98d 13h");
+  });
+});
+
+describe("formatAge", () => {
+  const now = Date.parse("2026-11-14T12:00:00Z");
+  it("reads an old item in days, not as a clock time", () => {
+    expect(formatAge("2026-11-14T11:59:30Z", now)).toBe("just now");
+    expect(formatAge("2026-11-14T11:15:00Z", now)).toBe("45 min ago");
+    expect(formatAge("2026-11-13T09:00:00Z", now)).toBe("27 h ago");
+    expect(formatAge("2026-11-11T09:00:00Z", now)).toBe("3 d ago");
+    expect(formatAge(null, now)).toBe("—");
   });
 });

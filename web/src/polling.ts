@@ -45,8 +45,10 @@ export interface Polled<T> {
 /**
  * usePolled fetches on mount and on an interval, keeping the last good value
  * when a refresh fails — a stale view with a visible error beats a blank one.
+ * The interval may be read from the last value, so a view polls until what
+ * it shows can no longer change and then stops; 0 means no further polls.
  */
-export function usePolled<T>(load: () => Promise<T>, intervalMs: number, key: string): Polled<T> {
+export function usePolled<T>(load: () => Promise<T>, every: number | ((data: T | null) => number), key: string): Polled<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
@@ -54,6 +56,7 @@ export function usePolled<T>(load: () => Promise<T>, intervalMs: number, key: st
   const visible = useVisible();
   const loadRef = useRef(load);
   loadRef.current = load;
+  const intervalMs = typeof every === "function" ? every(data) : every;
 
   useEffect(() => {
     setData(null);
