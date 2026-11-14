@@ -13,7 +13,8 @@ import type { Run } from "./types";
 import { ErrorBanner } from "./ui";
 
 interface RunStatus {
-  status: JobStatus;
+  /** A run over several jobs has none and falls back to its run state. */
+  status: JobStatus | null;
   /** The job can still change (jobOpen), so its status is read again. */
   open: boolean;
 }
@@ -21,11 +22,11 @@ interface RunStatus {
 // runStatus is a one-job run's shared job status (status.ts), read from the
 // same job detail the job list and the run header read, so the card and its
 // column say what they say — queued, preparing, running or settled. A run
-// over several jobs, or one whose detail fails to load, has none and falls
-// back to its run state.
-async function runStatus(run: Run): Promise<RunStatus | null> {
+// over several jobs has none and falls back to its run state; so does one
+// whose detail fails to load, which stays open so the read is tried again.
+async function runStatus(run: Run): Promise<RunStatus> {
   const view = await api.run(run.id);
-  if (view.jobs?.length !== 1) return null;
+  if (view.jobs?.length !== 1) return { status: null, open: run.state === "active" };
   const detail = await api.job(view.jobs[0].id);
   const status = jobStatus({ jobState: detail.job.state, attempt: detail.attempts?.at(-1), delivery: detail.delivery, ask: run.parameters?.task_mode === "ask" });
   return { status, open: run.state === "active" || jobOpen(detail) };
@@ -44,26 +45,38 @@ export function TaskBoard({ runs }: { runs: Run[] }) {
   //
   // Every one-job run reads its job status, active runs too, so a card never
   // says "In progress" beside a header that says "Queued". A status that can
-  // no longer change is kept per run and state and not read again; the poll
-  // runs while any run is active or any job is open, and stops when none is.
+  // no longer change is kept per run, state and update time and not read
+  // again; a run that turns active drops what was kept, so a retried run
+  // that settles again is read afresh. The poll runs while any run is
+  // active, any job is open or any read failed, and stops when none is.
   const runsRef = useRef(runs);
   runsRef.current = runs;
-  const closed = useRef(new Map<string, JobStatus>());
+  const closed = useRef(new Map<string, { key: string; status: JobStatus | null }>());
   const runsKey = runs.map((run) => `${run.id}:${run.state}`).join(",");
   const loadStatuses = useCallback(async (): Promise<Statuses> => {
     const list = runsRef.current;
-    const results = await Promise.allSettled(list.map(async (run) => {
-      const kept = closed.current.get(`${run.id}:${run.state}`);
-      return kept ? { status: kept, open: false } : runStatus(run);
+    const keyOf = (run: Run) => `${run.state}:${run.updated_at}`;
+    const results = await Promise.allSettled(list.map(async (run): Promise<RunStatus & { kept?: boolean }> => {
+      if (run.state === "active") closed.current.delete(run.id);
+      const kept = closed.current.get(run.id);
+      return kept?.key === keyOf(run) ? { status: kept.status, open: false, kept: true } : runStatus(run);
     }));
+    // A read that began before its run changed (a retry made it active) is
+    // stale and is not kept.
+    const current = new Map(runsRef.current.map((run) => [run.id, keyOf(run)]));
     const byRun = new Map<string, JobStatus>();
     let open = false;
     results.forEach((result, index) => {
       const run = list[index];
-      if (result.status !== "fulfilled" || !result.value) return;
-      byRun.set(run.id, result.value.status);
+      if (result.status !== "fulfilled") {
+        open = true;
+        return;
+      }
+      if (result.value.status) byRun.set(run.id, result.value.status);
       if (result.value.open) open = true;
-      else closed.current.set(`${run.id}:${run.state}`, result.value.status);
+      else if (!result.value.kept && current.get(run.id) === keyOf(run)) {
+        closed.current.set(run.id, { key: keyOf(run), status: result.value.status });
+      }
     });
     return { byRun, open };
   }, []);
