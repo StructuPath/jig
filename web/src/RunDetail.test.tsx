@@ -195,6 +195,19 @@ describe("swim lanes", () => {
     expect(screen.queryByText(/Evidence · publish/)).toBeNull();
   });
 
+  it("shows a stop's error once: its first line in the banner, the rest one click away", async () => {
+    mockAPI({});
+    render(<AttemptLane compact attempt={attempt({
+      state: "failed", completed_at: at(9_000),
+      error: "phase \"build\" failed\nexit status 1\nsee the worktree",
+      result: JSON.stringify({ phases: [{ phase: "build", kind: "agent", status: "fail" }] }),
+    })} nowMs={BASE + 10_000} />);
+    const banner = await screen.findByRole("status");
+    expect(within(banner).getByText("phase \"build\" failed")).toBeVisible();
+    expect(within(banner).getByText("Full error")).toBeVisible();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("keeps the answer visible when a code check follows it", async () => {
     mockAPI({});
     render(<AttemptLane compact taskMode="ask" attempt={attempt({

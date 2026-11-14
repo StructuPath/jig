@@ -11,6 +11,8 @@
 import { parseAttemptSummary } from "./api";
 import { isTerminalAttempt, parseTime } from "./format";
 import type { Lane } from "./lanes";
+import { isLocalDelivery, jobStatus } from "./status";
+import type { Tone } from "./status";
 import type { Attempt, AttemptSummary, Delivery, PhaseResult, PublishRecord, Station, TraceEvent } from "./types";
 
 export type StationState = "pass" | "live" | "wait" | "skip" | "bad" | "held";
@@ -75,10 +77,6 @@ function publishState(summary: AttemptSummary | null): { state?: string; code?: 
   return typeof publish === "string" ? { state: publish } : { state: publish.state, code: publish.code };
 }
 
-/** isLocalDelivery is the task form's own hold: work kept local on purpose. */
-export function isLocalDelivery(delivery: Delivery | undefined): boolean {
-  return (delivery?.hold_when ?? "").includes("jig_ui_delivery");
-}
 
 function pullRequestNumber(url: string | undefined): string | null {
   const match = /\/pull\/(\d+)/.exec(url ?? "");
@@ -233,29 +231,18 @@ export function buildStations(
 
 export interface Verdict {
   word: string;
-  tone: "good" | "live" | "bad" | "idle";
+  tone: Tone;
 }
 
-/** verdictFor is the one word the job page leads with. */
-export function verdictFor(attempt: Attempt, stations: StationView[], delivery: Delivery | undefined): Verdict {
-  const summary = parseAttemptSummary(attempt.result);
-  const outcome = publishState(summary);
-  switch (attempt.state) {
-    case "queued": return { word: "Queued", tone: "idle" };
-    case "preparing": return { word: "Preparing", tone: "live" };
-    case "running": {
-      const live = stations.find((station) => station.state === "live");
-      return { word: live ? live.label : "Running", tone: "live" };
-    }
-    case "accepted": return { word: "Accepted", tone: "good" };
-    case "accepted_unpublished":
-      if (outcome.state === "held") return isLocalDelivery(delivery) ? { word: "Ready", tone: "good" } : { word: "Held", tone: "bad" };
-      if (outcome.code === "publish_empty_changeset" || outcome.state === "not_attempted") return { word: "Done", tone: "good" };
-      return { word: "Unpublished", tone: "bad" };
-    case "cancelled": return { word: "Cancelled", tone: "idle" };
-    case "lost": return { word: "Lost", tone: "bad" };
-    default: return { word: "Stopped", tone: "bad" };
-  }
+/**
+ * verdictFor is the one word the job page leads with: the shared job status
+ * (status.ts), with a running attempt named by its live station.
+ */
+export function verdictFor(attempt: Attempt, stations: StationView[], delivery: Delivery | undefined, ask = false): Verdict {
+  const { word, tone } = jobStatus({ attempt, delivery, ask });
+  if (attempt.state !== "running") return { word, tone };
+  const live = stations.find((station) => station.state === "live");
+  return { word: live ? live.label : word, tone };
 }
 
 export interface FeedLine {

@@ -12,10 +12,16 @@
 //   - Every run lands in exactly one column (R4). A state the fold does not
 //     recognise goes to Needs review — an unknown state should reach a
 //     human, not vanish.
+//
+// A settled run whose one job's status is known (status.ts) lands in that
+// status's column, so the board and the job list never disagree about the
+// same job. Run state alone is the fallback: it cannot tell a held job from
+// one with nothing to publish, since both make the run `mixed`.
 import { taskState } from "./format";
+import type { ColumnID, JobStatus } from "./status";
 import type { QueueEntry, Run } from "./types";
 
-export type ColumnID = "waiting" | "running" | "review" | "done" | "stopped";
+export type { ColumnID };
 
 /** columns is the board's fixed display order. */
 export const columns: ReadonlyArray<{ id: ColumnID; label: string }> = [
@@ -38,11 +44,12 @@ export interface Column {
  * source for the held-publication `mixed` mapping, so terminal placement
  * reads it rather than `run.state`.
  */
-export function runColumn(run: Run, jobStates: string[] | undefined): ColumnID {
+export function runColumn(run: Run, jobStates: string[] | undefined, status?: JobStatus): ColumnID {
   if (run.state === "active") {
     if (jobStates?.length && jobStates.every((state) => state === "queued")) return "waiting";
     return "running";
   }
+  if (status) return status.column;
   switch (taskState(run)) {
     case "accepted":
     case "complete":
@@ -60,7 +67,7 @@ export function runColumn(run: Run, jobStates: string[] | undefined): ColumnID {
  * order (the API lists newest first) within each column. A null queue means
  * the queue poll failed; active runs then fall to Running (KTD6).
  */
-export function buildBoard(runs: Run[], queue: QueueEntry[] | null): Column[] {
+export function buildBoard(runs: Run[], queue: QueueEntry[] | null, statuses?: ReadonlyMap<string, JobStatus>): Column[] {
   const jobStates = new Map<string, string[]>();
   for (const entry of queue ?? []) {
     const states = jobStates.get(entry.run_id);
@@ -69,6 +76,6 @@ export function buildBoard(runs: Run[], queue: QueueEntry[] | null): Column[] {
   }
   const board = columns.map((column) => ({ ...column, runs: [] as Run[] }));
   const byID = new Map(board.map((column) => [column.id, column]));
-  for (const run of runs) byID.get(runColumn(run, jobStates.get(run.id)))!.runs.push(run);
+  for (const run of runs) byID.get(runColumn(run, jobStates.get(run.id), statuses?.get(run.id)))!.runs.push(run);
   return board;
 }

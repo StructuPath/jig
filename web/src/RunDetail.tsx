@@ -13,11 +13,12 @@ import { attemptOutcome, publishAction } from "./outcomes";
 import { useAttemptEvents, useNow, usePolled } from "./polling";
 import { StationLine, TimingStrip } from "./StationLine";
 import { buildFeed, buildStations, verdictFor } from "./stations";
+import { jobStatus } from "./status";
 import { SwimLane } from "./SwimLane";
 import { taskSteps } from "./starters";
 import type { TaskMode } from "./starters";
-import type { Attempt, Delivery, PhaseResult, PublishRecord, Station } from "./types";
-import { Empty, ErrorBanner, Link, Loading, StatusBadge } from "./ui";
+import type { Attempt, Delivery, Job, PhaseResult, PublishRecord, Run, Station } from "./types";
+import { Empty, ErrorBanner, JobBadge, Link, Loading, StatusBadge } from "./ui";
 
 export function RunDetail({ runID }: { runID: string }) {
   const load = useCallback(() => api.run(runID), [runID]);
@@ -30,7 +31,7 @@ export function RunDetail({ runID }: { runID: string }) {
   const parameters = Object.entries(data.run.parameters ?? {});
   return (
     <div className="view">
-      <p><Link href="/">← New task</Link> · <Link href="/runs">My tasks</Link></p>
+      <p><Link href="/">← Floor</Link> · <Link href="/runs">Jobs</Link></p>
       <header className="view-header">
         <div>
           <h1 className="task-heading">{taskHeading(data.run)}</h1>
@@ -38,7 +39,7 @@ export function RunDetail({ runID }: { runID: string }) {
             {data.run.targets.map((target) => projectName(target.repository)).join(", ")} · {formatDateTime(data.run.created_at)}
           </p>
         </div>
-        <StatusBadge state={taskState(data.run)} />
+        <RunStatus run={data.run} jobs={data.jobs} />
       </header>
       <ErrorBanner error={error} />
       <section className="panel directive"><h2>{data.run.parameters?.task_mode === "auto" ? "Agents choose the directive" : data.run.parameters?.task_mode === "build" ? "Directive · make changes" : data.run.parameters?.task_mode === "ask" ? "Question · get an answer" : `Workflow · ${workflowName(data.run) ?? "saved definition"}`}</h2><details open={taskTitle(data.run).length <= 250}><summary>View your instructions</summary><p>{taskTitle(data.run)}</p></details>
@@ -72,6 +73,19 @@ export function RunDetail({ runID }: { runID: string }) {
       )}
     </div>
   );
+}
+
+const SETTLED_RUNS = ["accepted", "failed", "cancelled", "mixed"];
+
+// RunStatus is the run header's badge. A one-job run shows its job's status,
+// the same word and colour as the job list and the board; a run over several
+// repositories has no single job to speak for it and keeps the run state.
+function RunStatus({ run, jobs }: { run: Run; jobs: Job[] }) {
+  const jobID = jobs.length === 1 ? jobs[0].id : null;
+  const load = useCallback(() => jobID ? api.job(jobID) : Promise.resolve(null), [jobID]);
+  const { data } = usePolled(load, SETTLED_RUNS.includes(run.state) ? 0 : 3000, `run-status:${jobID ?? run.id}:${run.state}`);
+  if (!jobID || !data) return <StatusBadge state={taskState(run)} />;
+  return <JobBadge status={jobStatus({ jobState: data.job.state, attempt: data.attempts?.at(-1), delivery: data.delivery, ask: run.parameters?.task_mode === "ask" })} />;
 }
 
 export function JobDetail({ jobID }: { jobID: string }) {
@@ -136,7 +150,6 @@ export function JobPanel({
   if (!data) return <ErrorBanner error={error} />;
   const attempts = data.attempts ?? [];
   const latest = attempts.at(-1);
-  const ready = latest && attemptOutcome(latest).title === "Task complete · kept local";
   const publish = publishAction(data.job.state, latest, data.delivery);
   const publishRequested = Boolean(data.job.publish_requested_at);
 
@@ -158,7 +171,7 @@ export function JobPanel({
           </p>}
         </div>
         <div className="panel-actions">
-          <StatusBadge state={ready ? taskMode === "ask" ? "complete" : "ready" : data.job.state} />
+          <JobBadge status={jobStatus({ jobState: data.job.state, attempt: latest, delivery: data.delivery, ask: taskMode === "ask" })} />
           {data.job.state === "failed" && <button type="button" disabled={pending} onClick={() => void act("retry")}>Retry same workflow</button>}
           {["queued", "active"].includes(data.job.state) && <button type="button" disabled={pending || data.job.cancellation_requested} onClick={() => void act("cancel")}>
             {data.job.cancellation_requested ? "Cancellation requested" : "Cancel"}
@@ -253,7 +266,14 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
     : chain, [chain, taskMode]);
   const stations = useMemo(() => buildStations(visibleChain, delivery, attempt, lane, events, publish, nowMs),
     [visibleChain, delivery, attempt, lane, events, publish, nowMs]);
-  const verdict = verdictFor(attempt, stations, delivery);
+  const verdict = verdictFor(attempt, stations, delivery, taskMode === "ask");
+  // A stop or a wait on a person leads with a banner. The banner carries the
+  // error's first line and the whole text one click away, so the evidence
+  // below does not print the same error again.
+  const banner = verdict.tone === "bad" || verdict.tone === "warn";
+  const held = verdict.word === "Held";
+  const errorText = attempt.error?.trim() || null;
+  const errorLine = errorText?.split("\n")[0] ?? null;
   const feed = useMemo(() => buildFeed(events), [events]);
   const timeline = <SwimLane lane={lane} nowMs={nowMs} onSelectPhase={setOpenPhase} />;
   const lastEvent = events.at(-1);
@@ -308,10 +328,14 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
         </p>
       </section>
 
-      {verdict.tone === "bad" && <div className="stop-banner" role="status">
-        <p><strong>{verdict.word === "Held" ? "Held for a person" : outcome.title}</strong>
-          {verdict.word === "Held" ? summary?.publish_hold ?? "The workflow held publication." : attempt.error?.split("\n")[0] ?? outcome.detail}</p>
-        <p className="subtle">{verdict.word === "Held" && jobID
+      {banner && <div className={`stop-banner stop-banner-${verdict.tone}`} role="status">
+        <p><strong>{held ? "Held for a person" : outcome.title}</strong>
+          {held ? summary?.publish_hold ?? "The workflow held publication." : errorLine ?? outcome.detail}</p>
+        {errorText && (held || errorText !== errorLine) && <details>
+          <summary>Full error</summary>
+          <pre>{errorText}</pre>
+        </details>}
+        <p className="subtle">{held && jobID
           ? <>To release it, use <strong>Release hold</strong> above, or run <code>jig job release {jobID}</code>. The worker that ran this job publishes it as a pull request; Jig does not merge held work.</>
           : outcome.next}</p>
       </div>}
@@ -352,7 +376,7 @@ export function AttemptLane({ attempt, nowMs, compact = false, taskMode, station
       {taskMode === "auto" && planSummary && <section className="directive"><h3>Agent's directive</h3><p>{planSummary}</p><p className="subtle">The builder receives the full plan automatically. No input is needed here.</p></section>}
       <details className="evidence"><summary>Technical activity</summary>{timeline}</details>
       <ErrorBanner error={error} />
-      <AttemptEvidence attempt={attempt} openPhase={evidencePhase} compact />
+      <AttemptEvidence attempt={attempt} openPhase={evidencePhase} compact hideError={banner} />
     </div>
   );
 }
@@ -367,10 +391,13 @@ export function AttemptEvidence({
   attempt,
   openPhase,
   compact = false,
+  hideError = false,
 }: {
   attempt: Attempt;
   openPhase: string | null;
   compact?: boolean;
+  /** Set when the stop banner above already shows the attempt's error. */
+  hideError?: boolean;
 }) {
   const terminal = isTerminalAttempt(attempt.state);
   const loadGates = useCallback(() => api.attemptGates(attempt.id), [attempt.id]);
@@ -419,7 +446,7 @@ export function AttemptEvidence({
         );
         return compact && index !== lastReport ? <details className="evidence" key={`${phase.phase}-${phase.phase_attempt}`}><summary>{phase.kind === "code" ? "Check" : "Earlier step"}: {phase.phase}</summary>{card}</details> : card;
       })}
-      {attempt.error && <p className="attempt-error" role="alert">{attempt.error}</p>}
+      {attempt.error && !hideError && <p className="attempt-error" role="alert">{attempt.error}</p>}
       <ErrorBanner error={gates.error} />
       <ErrorBanner error={invalid.error} />
       {attempt.result && !summary && <details className="evidence"><summary>Unrecognized result · view original record</summary><pre>{attempt.result}</pre></details>}

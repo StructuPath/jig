@@ -132,7 +132,7 @@ it("keeps a row lit while its run changes state", async () => {
 
 it("labels a job the form kept local as kept local, not held", async () => {
   render(<Floor runs={[run("run-local", "accepted", "Local change")]} nowMs={NOW} />);
-  const row = within((await screen.findByText("Ready")).closest("tr") as HTMLElement);
+  const row = within((await screen.findByText("Ready to review")).closest("tr") as HTMLElement);
   expect(row.getByText("kept local")).toBeVisible();
   expect(row.queryByText("held")).toBeNull();
 });
@@ -157,10 +157,11 @@ it("starts a saved workflow as itself, on the runtime it pins", async () => {
   const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
 
-  // A workflow pinned to a runtime no online worker runs cannot start.
+  // A workflow pinned to a runtime no online worker runs still starts: the
+  // server queues it, and the note says it waits for that runtime.
   fireEvent.change(select, { target: { value: "d-codex" } });
-  expect(start).toBeDisabled();
-  expect(screen.getByText("No online worker runs codex. Check Workers before starting.")).toBeVisible();
+  expect(start).toBeEnabled();
+  expect(screen.getByText("No online worker runs codex — the job waits in the queue until one does.")).toBeVisible();
 
   fireEvent.change(select, { target: { value: "d-factory" } });
   fireEvent.click(start);
@@ -185,7 +186,7 @@ async function fillSavedWorkflow(project: string, instructions: string) {
 it("passes a continuation to a saved workflow: earlier result as context, earlier branch as base", async () => {
   window.history.replaceState({}, "", "/?continue=run-0");
   render(<Tasks />);
-  expect(await screen.findByText(/Starts from the earlier task's branch jig\/job-0\/1/)).toBeVisible();
+  expect(await screen.findByText(/Starts from the earlier job's branch jig\/job-0\/1/)).toBeVisible();
   fireEvent.click(await fillSavedWorkflow("github.com/owner/repo", "Keep going"));
   await waitFor(() => expect(window.location.pathname).toBe("/runs/run-new"));
   expect(posted).toMatchObject({

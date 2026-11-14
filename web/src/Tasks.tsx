@@ -10,8 +10,9 @@ import type { Continuation } from "./continuation";
 import { startHelp } from "./startHelp";
 import { automaticGoal, canPublish, defaultModel, starterSource } from "./starters";
 import type { Delivery, TaskMode } from "./starters";
+import type { JobStatus } from "./status";
 import type { Run } from "./types";
-import { ErrorBanner, Link, StatusBadge } from "./ui";
+import { ErrorBanner, JobBadge, Link, StatusBadge } from "./ui";
 
 function storedProject(): string | null {
   try { return localStorage.getItem("jig-project"); } catch { return null; /* Browser storage can be disabled. */ }
@@ -80,7 +81,14 @@ export function Tasks() {
   const workflows = (definitions.data ?? []).filter((definition) => !definition.name.startsWith("jig-task-"));
   const workflow = saved ? workflows.find((definition) => definition.id === workflowID) ?? workflows[0] : undefined;
   const pinned = workflow ? /^runtime:[ \t]*["']?([\w-]+)/m.exec(workflow.source)?.[1] : undefined;
-  const ready = saved ? Boolean(workflow) && (pinned ? liveRuntimes.includes(pinned) : liveRuntimes.length > 0) : codexReady;
+  // The server queues a job whether or not a worker is online, so a missing
+  // worker does not block Start: the note under the button says the job
+  // waits. Only a saved-workflow choice with no workflow cannot start.
+  const ready = saved ? Boolean(workflow) : true;
+  const runnable = saved ? (pinned ? liveRuntimes.includes(pinned) : liveRuntimes.length > 0) : codexReady;
+  const waitNote = liveRuntimes.length === 0
+    ? <>No worker is online — the job waits until you run <code>jig worker</code>.</>
+    : `No online worker runs ${saved ? pinned ?? "any runtime" : "Codex"} — the job waits in the queue until one does.`;
   const taskNeeded = saved || mode !== "auto";
   const nowMs = useNow(1000);
 
@@ -147,7 +155,7 @@ export function Tasks() {
         </fieldset>}
         {continueID && <div className="notice continuation" role="status">
           {continuation ? <><strong>Continuing:</strong> {continuation.title.split("\n")[0]}
-            <p className="subtle">{continuation.ref ? `Starts from the earlier task's branch ${continuation.ref}, so its changes are included.` : continuation.keptLocal ? "The earlier changes were kept local and never pushed, so this task starts from the project's latest commit without them. The earlier directive and result are passed along as context." : "This task starts from the project's latest commit. The earlier directive and result are passed along as context."}</p></> : "Loading the earlier task…"}
+            <p className="subtle">{continuation.ref ? `Starts from the earlier job's branch ${continuation.ref}, so its changes are included.` : continuation.keptLocal ? "The earlier changes were kept local and never pushed, so this job starts from the project's latest commit without them. The earlier directive and result are passed along as context." : "This job starts from the project's latest commit. The earlier directive and result are passed along as context."}</p></> : "Loading the earlier job…"}
         </div>}
         <details className="goal-options" open={taskNeeded}><summary>{taskNeeded ? "Your directive" : "Add a goal or limits (optional)"}</summary>
         <label htmlFor="task">{saved ? "3. Instructions" : mode === "auto" ? "3. Goal or limits (optional)" : "3. What should Codex do?"}</label>
@@ -167,23 +175,23 @@ export function Tasks() {
         <ErrorBanner error={fleet.error} />
         <ErrorBanner error={definitions.error} />
         <div className="start-row">
-          <button className="primary" type="submit" disabled={pending || !ready || Boolean(fleet.error) || !repository.trim() || (taskNeeded && !task.trim()) || (!saved && !model.trim()) || Boolean(continueID && !continuation)}>{pending ? "Starting…" : saved ? "Start job" : "Start task"}</button>
-          <span className="subtle">{saved
-            ? ready ? `Runs ${workflow?.name ?? "the workflow"} on ${pinned ?? "an online worker"}.` : fleet.loading ? "Checking workers…" : `No online worker runs ${pinned ?? "any runtime"}. Check Workers before starting.`
-            : codexReady ? `Uses your signed-in Codex. ${publishing ? "Passing work becomes a pull request." : "Results stay local."}` : fleet.loading ? "Checking Codex…" : "Codex is offline. Check Workers before starting."}</span>
+          <button className="primary" type="submit" disabled={pending || !ready || Boolean(fleet.error) || !repository.trim() || (taskNeeded && !task.trim()) || (!saved && !model.trim()) || Boolean(continueID && !continuation)}>{pending ? "Starting…" : "Start job"}</button>
+          <span className="subtle">{!fleet.data && fleet.loading ? "Checking workers…" : !runnable ? waitNote : saved
+            ? `Runs ${workflow?.name ?? "the workflow"} on ${pinned ?? "an online worker"}.`
+            : `Uses your signed-in Codex. ${publishing ? "Passing work becomes a pull request." : "Results stay local."}`}</span>
         </div>
-        {!saved && <p className="task-intent"><strong>{mode === "ask" ? "This task will return an answer." : "This task will change files in a separate working folder."}</strong> {mode === "ask" ? "Choose Make changes if you want Codex to implement something." : publishing ? "Your original project stays untouched; review and merge the pull request on GitHub." : "Your original project stays untouched. Nothing reaches GitHub unless you choose Open a pull request."}</p>}
+        {!saved && <p className="task-intent"><strong>{mode === "ask" ? "This job will return an answer." : "This job will change files in a separate working folder."}</strong> {mode === "ask" ? "Choose Make changes if you want Codex to implement something." : publishing ? "Your original project stays untouched; review and merge the pull request on GitHub." : "Your original project stays untouched. Nothing reaches GitHub unless you choose Open a pull request."}</p>}
       </fieldset>
     </form>
   </div>;
 }
 
-export function TaskCard({ run }: { run: Run }) {
+export function TaskCard({ run, status }: { run: Run; status?: JobStatus }) {
   const title = taskHeading(run);
-  return <article className={`panel task-card task-card-${taskState(run)}`}>
-      <div className="task-card-meta"><span className="task-project">{run.targets.map((target) => projectName(target.repository)).join(", ")}</span><StatusBadge state={taskState(run)} /></div>
+  return <article className={`panel task-card task-card-${status ? `tone-${status.tone}` : taskState(run)}`}>
+      <div className="task-card-meta"><span className="task-project">{run.targets.map((target) => projectName(target.repository)).join(", ")}</span>{status ? <JobBadge status={status} /> : <StatusBadge state={taskState(run)} />}</div>
       <h3><Link href={`/runs/${run.id}`}>{title}</Link></h3>
       <p className="subtle">{formatDateTime(run.created_at)}</p>
-      <Link href={`/runs/${run.id}`}>Open task →</Link>
+      <Link href={`/runs/${run.id}`}>Open job →</Link>
     </article>;
 }
