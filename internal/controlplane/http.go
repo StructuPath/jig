@@ -185,7 +185,7 @@ func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := a.store.Runs(r.Context())
+	runs, err := a.store.RunList(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return

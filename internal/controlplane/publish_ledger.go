@@ -346,14 +346,14 @@ func (s *Store) JobPublishRecords(ctx context.Context, jobID string) ([]protocol
 	return s.publishRecords(ctx, `a.job_id = ?`, jobID)
 }
 
-func (s *Store) publishRecords(ctx context.Context, where string, argument any) ([]protocol.PublishRecord, error) {
+func (s *Store) publishRecords(ctx context.Context, where string, arguments ...any) ([]protocol.PublishRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT p.attempt_id, a.job_id, a.attempt_number, p.step, p.branch,
 		       p.remote_ref, p.pr_url, p.completed_at
 		FROM publish_records p JOIN attempts a ON a.id = p.attempt_id
 		WHERE `+where+`
 		ORDER BY a.attempt_number, p.completed_at, p.step
-	`, argument)
+	`, arguments...)
 	if err != nil {
 		return nil, unavailable(err)
 	}
