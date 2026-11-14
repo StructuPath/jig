@@ -376,6 +376,9 @@ func ParseDefinition(source []byte) (*DefinitionSpec, error) {
 	decoder.KnownFields(true)
 	var spec DefinitionSpec
 	if err := decoder.Decode(&spec); err != nil {
+		if named := unknownFieldError(source); named != nil {
+			return nil, fmt.Errorf("parse definition: %w", named)
+		}
 		return nil, fmt.Errorf("parse definition: %w", err)
 	}
 	if err := spec.Validate(); err != nil {
@@ -530,6 +533,16 @@ func (spec *DefinitionSpec) validateParallel(phases map[string]PhaseSpec) error 
 		seen[spec.Publish.CI.OnFail.Run] {
 		return fmt.Errorf("publish: ci: on_fail: run phase %q is a parallel group member; "+
 			"a CI repair round cannot start inside the group", spec.Publish.CI.OnFail.Run)
+	}
+	// A repair dispatch runs its target alone, whatever "then" is —
+	// rerun-chain was already kept out of the group by the edge check, and
+	// rerun-self is no different: a member run that way is outside the
+	// group's read-only, concurrent boundary.
+	for _, phase := range spec.Phases {
+		if phase.OnFail != nil && seen[phase.OnFail.Run] {
+			return fmt.Errorf("phase %q: on_fail: run phase %q is a parallel group member; "+
+				"a repair edge cannot run a member outside the group", phase.Name, phase.OnFail.Run)
+		}
 	}
 	return nil
 }

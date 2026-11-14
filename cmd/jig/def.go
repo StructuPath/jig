@@ -38,20 +38,21 @@ Author and invoke job definitions against a running control plane.
 Commands:
   validate <file>              parse and validate a definition file locally
   create <file>                save a new definition
-  update <id> <file>           replace a definition's source in place
+  update <def> <file>          replace a definition's source in place
   list                         list saved definitions
-  show <id>                    print one definition, source included
-  invoke --repo <r> ... <id>   admit a run of a definition
+  show <def>                   print one definition, source included
+  invoke <def> --repo <r> ...  admit a run of a definition
 
-Flags come before the positional argument — ` + "`jig def show --json <id>`" + `,
-never ` + "`jig def show <id> --json`" + `, which stops flag parsing at the id
-and reports a usage error.
+<def> is a definition's id or its name. Flags may come before or after the
+positional arguments; everything after a bare -- is positional.
 
 Flags:
-  --server <url>   control plane URL (default http://127.0.0.1:8383)
+  --server <url>   control plane URL (default $JIG_SERVER or http://127.0.0.1:8383)
   --json           emit the API object instead of the prose report
   --instructions   (invoke) the trusted, operator-authored prompt half
-  --repo <r>       (invoke) a target repository; repeatable
+  --repo <r>       (invoke) a target repository, repeatable: a local path
+                   (relative paths resolve here), file:///path, or
+                   github.com/owner/repo
   --param k=v      (invoke) an extra frozen run parameter; repeatable
 
 Exit codes:
@@ -65,14 +66,16 @@ const triggerUsage = `Usage: jig trigger <command> [flags]
 Manage standing admission triggers: cron schedules and GitHub polls.
 
 Commands:
-  create   save a trigger
-  list     list triggers with their counters and diagnostics
-  show <id>   print one trigger
+  create        save a trigger
+  list          list triggers with their counters and diagnostics
+  show <id>     print one trigger
   enable <id>
   disable <id>
 
+Flags may come before or after the positional arguments.
+
 Create flags:
-  --def <id>            definition the trigger admits (required)
+  --def <def>           definition the trigger admits, by id or name (required)
   --name <name>         human name (required)
   --kind <kind>         schedule | github_issue | github_pull_request
   --instructions <text> trusted prompt half, frozen at save (required)
@@ -87,9 +90,39 @@ Create flags:
   --poll-seconds <n>    (github) how often ` + "`gh`" + ` may be spent
 
 Common flags:
-  --server <url>   control plane URL (default http://127.0.0.1:8383)
+  --server <url>   control plane URL (default $JIG_SERVER or http://127.0.0.1:8383)
   --json           emit the API object instead of the prose report
+
+Exit codes:
+  0  success
+  1  the control plane could not be reached, or rejected the request
+  2  usage or validation error
 `
+
+// Per-subcommand usage: what a usage error prints after naming the problem,
+// so the operator reads one command's synopsis rather than the whole family.
+const (
+	defValidateUsage = "Usage: jig def validate [--json] <file>...\n"
+	defCreateUsage   = "Usage: jig def create [--server <url>] [--json] <file>\n"
+	defUpdateUsage   = "Usage: jig def update [--server <url>] [--json] <def> <file>\n"
+	defListUsage     = "Usage: jig def list [--server <url>] [--json]\n"
+	defShowUsage     = "Usage: jig def show [--server <url>] [--json] <def>\n"
+	defInvokeUsage   = `Usage: jig def invoke <def> --instructions <text> --repo <r> [--repo <r>]...
+                      [--param k=v]... [--server <url>] [--json]
+
+<def> is the definition's id or name. Run jig def --help for every flag.
+`
+	triggerCreateUsage = `Usage: jig trigger create --def <def> --name <name> --instructions <text> --repo <r>
+                       [--kind <kind>] [--cron <expr>] [--timezone <IANA>] [...]
+
+Run jig trigger --help for every flag.
+`
+	triggerListUsage = "Usage: jig trigger list [--server <url>] [--json]\n"
+)
+
+func triggerIDUsage(action string) string {
+	return "Usage: jig trigger " + action + " [--server <url>] [--json] <id>\n"
+}
 
 // apiTimeout bounds one CLI request. Admission resolves refs (KTD9), which
 // touches the network, so it is generous rather than snappy.
@@ -141,14 +174,13 @@ type validationReport struct {
 func defValidate(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("jig def validate", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	flags.Usage = func() { fmt.Fprint(stderr, defUsage) }
+	flags.Usage = func() { fmt.Fprint(stderr, defValidateUsage) }
 	asJSON := flags.Bool("json", false, "emit the verdicts as JSON")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() == 0 {
-		fmt.Fprint(stderr, defUsage)
-		return exitUsage
+		return usageError(stderr, "jig def validate", "a definition file is required", defValidateUsage)
 	}
 	reports := make([]validationReport, 0, flags.NArg())
 	failed := false
@@ -189,13 +221,12 @@ func defValidate(args []string, stdout, stderr io.Writer) int {
 }
 
 func defCreate(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig def create", stderr, defUsage)
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	flags, server, asJSON := defFlags("jig def create", stderr, defCreateUsage)
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 1 {
-		fmt.Fprint(stderr, defUsage)
-		return exitUsage
+		return usageError(stderr, "jig def create", "exactly one definition file is required", defCreateUsage)
 	}
 	source, code := readDefinitionSource(flags.Arg(0), stderr)
 	if code != exitAccepted {
@@ -205,43 +236,54 @@ func defCreate(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if err := apiCall(ctx, *server, http.MethodPost, "/api/definitions",
 		controlplane.DefinitionInput{Source: source}, &definition); err != nil {
 		fmt.Fprintf(stderr, "jig def create: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	return reportDefinition(stdout, stderr, definition, *asJSON)
 }
 
 func defUpdate(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig def update", stderr, defUsage)
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	flags, server, asJSON := defFlags("jig def update", stderr, defUpdateUsage)
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 2 {
-		fmt.Fprint(stderr, defUsage)
-		return exitUsage
+		return usageError(stderr, "jig def update", "a definition and a file are required", defUpdateUsage)
 	}
 	source, code := readDefinitionSource(flags.Arg(1), stderr)
 	if code != exitAccepted {
 		return code
 	}
+	definitionID, err := resolveDefinition(ctx, *server, flags.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "jig def update: %v\n", err)
+		return apiExit(err)
+	}
 	var definition protocol.Definition
 	if err := apiCall(ctx, *server, http.MethodPut,
-		"/api/definitions/"+url.PathEscape(flags.Arg(0)),
+		"/api/definitions/"+url.PathEscape(definitionID),
 		controlplane.DefinitionInput{Source: source}, &definition); err != nil {
+		if isNotFound(err) {
+			err = definitionNotFound(flags.Arg(0))
+		}
 		fmt.Fprintf(stderr, "jig def update: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	return reportDefinition(stdout, stderr, definition, *asJSON)
 }
 
 func defList(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig def list", stderr, defUsage)
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	flags, server, asJSON := defFlags("jig def list", stderr, defListUsage)
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
+	}
+	if flags.NArg() != 0 {
+		return usageError(stderr, "jig def list",
+			fmt.Sprintf("unexpected argument %q", flags.Arg(0)), defListUsage)
 	}
 	var definitions []protocol.Definition
 	if err := apiCall(ctx, *server, http.MethodGet, "/api/definitions", nil, &definitions); err != nil {
 		fmt.Fprintf(stderr, "jig def list: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *asJSON {
 		return emitJSON(stdout, stderr, definitions)
@@ -259,19 +301,26 @@ func defList(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 }
 
 func defShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig def show", stderr, defUsage)
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	flags, server, asJSON := defFlags("jig def show", stderr, defShowUsage)
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 1 {
-		fmt.Fprint(stderr, defUsage)
-		return exitUsage
+		return usageError(stderr, "jig def show", "exactly one definition id or name is required", defShowUsage)
+	}
+	definitionID, err := resolveDefinition(ctx, *server, flags.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "jig def show: %v\n", err)
+		return apiExit(err)
 	}
 	var definition protocol.Definition
 	if err := apiCall(ctx, *server, http.MethodGet,
-		"/api/definitions/"+url.PathEscape(flags.Arg(0)), nil, &definition); err != nil {
+		"/api/definitions/"+url.PathEscape(definitionID), nil, &definition); err != nil {
+		if isNotFound(err) {
+			err = definitionNotFound(flags.Arg(0))
+		}
 		fmt.Fprintf(stderr, "jig def show: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *asJSON {
 		return emitJSON(stdout, stderr, definition)
@@ -287,18 +336,22 @@ func defShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 // keeps the trusted and untrusted prompt halves apart (KTD11): what the CLI
 // sends as instructions is operator-authored by definition.
 func defInvoke(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig def invoke", stderr, defUsage)
+	flags, server, asJSON := defFlags("jig def invoke", stderr, defInvokeUsage)
 	instructions := flags.String("instructions", "", "trusted prompt half")
 	var repositories repeatedFlag
 	flags.Var(&repositories, "repo", "target repository (repeatable)")
 	var parameters repeatedFlag
 	flags.Var(&parameters, "param", "extra run parameter k=v (repeatable)")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
-	if flags.NArg() != 1 || len(repositories) == 0 || strings.TrimSpace(*instructions) == "" {
-		fmt.Fprint(stderr, defUsage)
-		return exitUsage
+	switch {
+	case flags.NArg() != 1:
+		return usageError(stderr, "jig def invoke", "exactly one definition id or name is required", defInvokeUsage)
+	case strings.TrimSpace(*instructions) == "":
+		return usageError(stderr, "jig def invoke", "--instructions is required", defInvokeUsage)
+	case len(repositories) == 0:
+		return usageError(stderr, "jig def invoke", "at least one --repo is required", defInvokeUsage)
 	}
 	frozen := make(map[string]string, len(parameters))
 	for _, entry := range parameters {
@@ -311,17 +364,25 @@ func defInvoke(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	targets := make([]controlplane.InvocationTarget, 0, len(repositories))
 	for _, repository := range repositories {
-		targets = append(targets, controlplane.InvocationTarget{Repository: repository})
+		targets = append(targets, controlplane.InvocationTarget{Repository: cliRepository(repository)})
+	}
+	definitionID, err := resolveDefinition(ctx, *server, flags.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "jig def invoke: %v\n", err)
+		return apiExit(err)
 	}
 	var view controlplane.RunView
 	if err := apiCall(ctx, *server, http.MethodPost, "/api/runs", controlplane.RunInvocation{
-		DefinitionID: flags.Arg(0),
+		DefinitionID: definitionID,
 		Instructions: *instructions,
 		Parameters:   frozen,
 		Targets:      targets,
 	}, &view); err != nil {
+		if isNotFound(err) {
+			err = definitionNotFound(flags.Arg(0))
+		}
 		fmt.Fprintf(stderr, "jig def invoke: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *asJSON {
 		return emitJSON(stdout, stderr, view)
@@ -330,6 +391,12 @@ func defInvoke(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	for _, job := range view.Jobs {
 		fmt.Fprintf(stdout, "  job %s  %s  base %s  %s\n",
 			job.ID, job.Repository, job.BaseSHA, job.State)
+	}
+	fmt.Fprintf(stdout, "view: %s\n", runViewURL(*server, view.Run.ID))
+	// Queued work waits for a worker; saying so here saves the operator
+	// watching a run that nothing will claim.
+	if liveWorkers(ctx, *server) == 0 {
+		fmt.Fprintln(stdout, "note: no worker is online; start one with: jig worker")
 	}
 	return exitAccepted
 }
@@ -387,8 +454,8 @@ func triggerCommand(ctx context.Context, args []string, stdout, stderr io.Writer
 }
 
 func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig trigger create", stderr, triggerUsage)
-	definitionID := flags.String("def", "", "definition id")
+	flags, server, asJSON := defFlags("jig trigger create", stderr, triggerCreateUsage)
+	definitionRef := flags.String("def", "", "definition id or name")
 	name := flags.String("name", "", "trigger name")
 	kind := flags.String("kind", controlplane.TriggerSchedule, "trigger kind")
 	instructions := flags.String("instructions", "", "trusted prompt half")
@@ -401,12 +468,22 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 	flags.Var(&repositories, "repo", "repository (repeatable)")
 	flags.Var(&labels, "label", "required label (repeatable)")
 	flags.Var(&baseBranches, "base-branch", "pull-request base branch (repeatable)")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
-	if flags.NArg() != 0 || *definitionID == "" || *name == "" || len(repositories) == 0 {
-		fmt.Fprint(stderr, triggerUsage)
-		return exitUsage
+	const command = "jig trigger create"
+	switch {
+	case flags.NArg() != 0:
+		return usageError(stderr, command, fmt.Sprintf("unexpected argument %q", flags.Arg(0)), triggerCreateUsage)
+	case *definitionRef == "":
+		return usageError(stderr, command, "--def is required", triggerCreateUsage)
+	case *name == "":
+		return usageError(stderr, command, "--name is required", triggerCreateUsage)
+	case len(repositories) == 0:
+		return usageError(stderr, command, "at least one --repo is required", triggerCreateUsage)
+	}
+	for i := range repositories {
+		repositories[i] = cliRepository(repositories[i])
 	}
 
 	config := controlplane.TriggerConfig{
@@ -437,15 +514,23 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 		config.Repository = repositories[0]
 	}
 
+	definitionID, err := resolveDefinition(ctx, *server, *definitionRef)
+	if err != nil {
+		fmt.Fprintf(stderr, "jig trigger create: %v\n", err)
+		return apiExit(err)
+	}
 	var trigger controlplane.Trigger
 	if err := apiCall(ctx, *server, http.MethodPost, "/api/triggers", controlplane.TriggerInput{
 		Name:         *name,
-		DefinitionID: *definitionID,
+		DefinitionID: definitionID,
 		Kind:         *kind,
 		Config:       config,
 	}, &trigger); err != nil {
+		if isNotFound(err) {
+			err = definitionNotFound(*definitionRef)
+		}
 		fmt.Fprintf(stderr, "jig trigger create: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *asJSON {
 		return emitJSON(stdout, stderr, trigger)
@@ -455,14 +540,18 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 }
 
 func triggerList(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig trigger list", stderr, triggerUsage)
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	flags, server, asJSON := defFlags("jig trigger list", stderr, triggerListUsage)
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
+	}
+	if flags.NArg() != 0 {
+		return usageError(stderr, "jig trigger list",
+			fmt.Sprintf("unexpected argument %q", flags.Arg(0)), triggerListUsage)
 	}
 	var triggers []controlplane.Trigger
 	if err := apiCall(ctx, *server, http.MethodGet, "/api/triggers", nil, &triggers); err != nil {
 		fmt.Fprintf(stderr, "jig trigger list: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *asJSON {
 		return emitJSON(stdout, stderr, triggers)
@@ -478,19 +567,18 @@ func triggerList(ctx context.Context, args []string, stdout, stderr io.Writer) i
 }
 
 func triggerShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags, server, asJSON := defFlags("jig trigger show", stderr, triggerUsage)
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	flags, server, asJSON := defFlags("jig trigger show", stderr, triggerIDUsage("show"))
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 1 {
-		fmt.Fprint(stderr, triggerUsage)
-		return exitUsage
+		return usageError(stderr, "jig trigger show", "exactly one trigger id is required", triggerIDUsage("show"))
 	}
 	var trigger controlplane.Trigger
 	if err := apiCall(ctx, *server, http.MethodGet,
 		"/api/triggers/"+url.PathEscape(flags.Arg(0)), nil, &trigger); err != nil {
 		fmt.Fprintf(stderr, "jig trigger show: %v\n", err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *asJSON {
 		return emitJSON(stdout, stderr, trigger)
@@ -506,19 +594,18 @@ func triggerSetEnabled(
 	if enabled {
 		action = "enable"
 	}
-	flags, server, asJSON := defFlags("jig trigger "+action, stderr, triggerUsage)
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	flags, server, asJSON := defFlags("jig trigger "+action, stderr, triggerIDUsage(action))
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
 	if flags.NArg() != 1 {
-		fmt.Fprint(stderr, triggerUsage)
-		return exitUsage
+		return usageError(stderr, "jig trigger "+action, "exactly one trigger id is required", triggerIDUsage(action))
 	}
 	var trigger controlplane.Trigger
 	if err := apiCall(ctx, *server, http.MethodPost,
 		"/api/triggers/"+url.PathEscape(flags.Arg(0))+"/"+action, nil, &trigger); err != nil {
 		fmt.Fprintf(stderr, "jig trigger %s: %v\n", action, err)
-		return exitInfraFailed
+		return apiExit(err)
 	}
 	if *asJSON {
 		return emitJSON(stdout, stderr, trigger)
@@ -577,7 +664,7 @@ func defFlags(name string, stderr io.Writer, usage string) (*flag.FlagSet, *stri
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, usage) }
-	server := flags.String("server", "http://"+defaultServerAuthority, "control plane URL")
+	server := serverFlag(flags)
 	asJSON := flags.Bool("json", false, "emit the API object as JSON")
 	return flags, server, asJSON
 }
@@ -651,11 +738,8 @@ func apiRejection(status int, body []byte) error {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &document); err == nil && document.Error.Message != "" {
-		if document.Error.Code != "" {
-			return fmt.Errorf("%s: %s", document.Error.Code, document.Error.Message)
-		}
-		return fmt.Errorf("%s", document.Error.Message)
+		return &apiError{Status: status, Code: document.Error.Code, Message: document.Error.Message}
 	}
-	return fmt.Errorf("control plane returned %d: %s",
-		status, strings.TrimSpace(string(body)))
+	return &apiError{Status: status, Message: fmt.Sprintf("control plane returned %d: %s",
+		status, strings.TrimSpace(string(body)))}
 }

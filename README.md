@@ -121,6 +121,8 @@ re-runs, and spend over a time window, read from the control plane's ledger.
 
 ## Authoring a definition
 
+Every field, gate, template variable, and validation rule: [docs/definition-reference.md](docs/definition-reference.md).
+
 A definition is data, not a script. Seven stock ones ship in
 `examples/definitions/`:
 
@@ -451,8 +453,14 @@ Rules worth knowing before you write one:
 jig def validate examples/definitions/simple-sdlc.yaml
 jig def create examples/definitions/simple-sdlc.yaml
 jig def list --json
-jig def invoke --instructions "add a --version flag" --repo github.com/you/repo <definition-id>
+jig def invoke simple-sdlc --instructions "add a --version flag" --repo github.com/you/repo
 ```
+
+A definition is named by its id or its name (`trigger create --def` takes
+either too), and flags may come before or after the positional arguments.
+Every command that talks to the control plane takes `--server <url>`; its
+default is `$JIG_SERVER` when set, else `http://127.0.0.1:8383`, so point a
+shell at a second instance once with `export JIG_SERVER=http://127.0.0.1:8594`.
 
 ---
 
@@ -637,7 +645,7 @@ Every command uses the same four, so `jig` is scriptable:
 |---|---|
 | `0` | accepted — the work passed and the verdict is yes |
 | `1` | infrastructure failure — jig could not deliver a verdict |
-| `2` | usage or definition-validation error |
+| `2` | usage or validation error — a bad flag or argument, an invalid definition, or the control plane's `invalid_*` rejection of a request |
 | `3` | rejected — jig worked and the answer was no (including a cancelled run) |
 
 `1` and `3` are deliberately distinct. "The agent's work was rejected" and

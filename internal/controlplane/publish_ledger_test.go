@@ -570,7 +570,8 @@ func heldJob(t *testing.T, store *Store, runID string) *protocol.Claim {
 
 // The operator's request carries no lease and names no worker. It is
 // recorded on the job, listed for the worker that ran the attempt and for no
-// other, and consumed by the retry it asks for: one request, one retry.
+// other, and consumed by the completion of the retry it asks for: one
+// request, one retry.
 func TestAPublishRequestIsListedForItsWorkerAndConsumedByTheRetry(t *testing.T) {
 	store, clock := newTestStore(t)
 	registerTestWorker(t, store, 1)
@@ -617,8 +618,10 @@ func TestAPublishRequestIsListedForItsWorkerAndConsumedByTheRetry(t *testing.T) 
 	if err != nil {
 		t.Fatalf("publish retry: %v", err)
 	}
-	if retry.Job.PublishRequestedAt != nil {
-		t.Fatal("the granted retry left its request on the job")
+	// The grant does not consume the request — an interrupted retry must be
+	// served again — but the running job no longer lists it.
+	if retry.Job.PublishRequestedAt == nil || !retry.Job.PublishRequestedAt.Equal(first) {
+		t.Fatalf("the granted retry moved its request to %v, want %v", retry.Job.PublishRequestedAt, first)
 	}
 	if left, err := store.WorkerPublishRequests(ctx, workerA); err != nil || len(left) != 0 {
 		t.Fatalf("requests after the retry was granted = %+v (err=%v), want none", left, err)
@@ -634,6 +637,40 @@ func TestAPublishRequestIsListedForItsWorkerAndConsumedByTheRetry(t *testing.T) 
 	if job, err := store.Job(ctx, claim.Job.ID); err != nil || job.State != protocol.JobAcceptedUnpublished ||
 		job.PublishRequestedAt != nil {
 		t.Fatalf("job after a failed retry = %+v (err=%v), want accepted_unpublished with no request", job, err)
+	}
+}
+
+// The retry an operator's Release started is interrupted: its worker died
+// mid-publish and the sweeper returns the job to accepted_unpublished. The
+// request was never served, so it must still be pending and listed for the
+// worker, not silently dropped with the lost lease.
+func TestAPublishRequestSurvivesAnInterruptedRetry(t *testing.T) {
+	store, clock := newTestStore(t)
+	registerTestWorker(t, store, 1)
+	claim := heldJob(t, store, "run-1")
+	ctx := context.Background()
+
+	requested, err := store.RequestPublish(ctx, claim.Job.ID)
+	if err != nil {
+		t.Fatalf("request publish: %v", err)
+	}
+	if _, err := store.RetryPublish(ctx, claim.Job.ID,
+		protocol.PublishRetryRequest{WorkerID: workerA, LeaseToken: tokenB}); err != nil {
+		t.Fatalf("publish retry: %v", err)
+	}
+	sweepUntilSettled(t, store, clock, claim.Attempt.ID)
+
+	job, err := store.Job(ctx, claim.Job.ID)
+	if err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if job.State != protocol.JobAcceptedUnpublished || job.PublishRequestedAt == nil ||
+		!job.PublishRequestedAt.Equal(*requested.PublishRequestedAt) {
+		t.Fatalf("job after an interrupted retry = %+v, want accepted_unpublished with the request pending", job)
+	}
+	mine, err := store.WorkerPublishRequests(ctx, workerA)
+	if err != nil || len(mine) != 1 || mine[0].JobID != claim.Job.ID {
+		t.Fatalf("requests after an interrupted retry = %+v (err=%v), want the request again", mine, err)
 	}
 }
 

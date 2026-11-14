@@ -53,7 +53,7 @@ func NewServer(ctx context.Context, store *Store, config ServerConfig) (*Server,
 	if !config.AllowNonLoopback {
 		if err := validateLoopbackAddress(ctx, address); err != nil {
 			return nil, fmt.Errorf(
-				"refusing to bind %q: %w (set AllowNonLoopback to opt in explicitly)", address, err)
+				"refusing to bind %q: %w (pass --allow-non-loopback to opt in explicitly)", address, err)
 		}
 	}
 	logger := config.Logger

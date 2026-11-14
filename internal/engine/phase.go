@@ -565,6 +565,54 @@ func (e *execution) cancelled() bool {
 
 func (e *execution) ceilingExceeded() bool { return time.Now().After(e.deadline) }
 
+// commandContext derives the context a jig-side command runs on — a code
+// phase's command and every tests_pass gate — so the signals that end an
+// agent send in flight (agentSender.send) end the command too: cancellation
+// (R5), a parallel group sibling's stop, and the attempt ceiling. Without it
+// a gate ran on its own phase timeout alone, so a cancel landing mid-gate let
+// the tests run on for up to that long, and a gate started just under the
+// ceiling ran that far past it, once per correction loop. runShellCommand
+// still applies the phase timeout on top: the command stops at whichever
+// comes first. The caller reads which one through interrupted.
+func (e *execution) commandContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	bounded, stopDeadline := context.WithDeadline(ctx, e.deadline)
+	bounded, stop := context.WithCancel(bounded)
+	go func() {
+		select {
+		case <-e.attempt.Cancelled:
+		case <-e.stop:
+		case <-bounded.Done():
+		}
+		stop()
+	}()
+	return bounded, func() { stop(); stopDeadline() }
+}
+
+// interrupted maps a command that commandContext cut short onto the phase
+// run that ends the attempt, with the same outcomes a send gets: cancelled,
+// stopped, or the ceiling. Read before the context's cancel func runs. Nil
+// means the command ended on its own and its result is a verdict. A
+// cancellation is reported even when the command beat it to the finish,
+// matching the check between phases.
+func (e *execution) interrupted(bounded context.Context, during string) *phaseRun {
+	if e.cancelled() {
+		return &phaseRun{outcome: phaseCancelled, failure: "cancelled during " + during}
+	}
+	if bounded.Err() == nil {
+		return nil
+	}
+	select {
+	case <-e.stop:
+		return &phaseRun{outcome: phaseStopped, failure: "stopped during " + during +
+			": a parallel group sibling ended the attempt"}
+	default:
+	}
+	if errors.Is(bounded.Err(), context.DeadlineExceeded) {
+		return &phaseRun{outcome: phaseCeiling, failure: "attempt wall-clock ceiling exceeded during " + during}
+	}
+	return nil
+}
+
 func (e *execution) freshenLease(ctx context.Context) {
 	if e.attempt.FreshenLease == nil {
 		return
@@ -911,14 +959,20 @@ func (e *execution) phaseCorrectionBudget(phase protocol.PhaseSpec) int {
 // runGates runs every configured gate against the envelope, records the
 // evidence, and returns the merged report. Every corrected envelope re-runs
 // ALL gates, never only the failed one (R9).
+//
+// A non-nil phaseRun means a gate was cut by cancellation, a group stop, or
+// the ceiling (commandContext): the attempt ends on that outcome, and the
+// cut gate records no evidence — it never reached a verdict.
 func (e *execution) runGates(
 	ctx context.Context, phase protocol.PhaseSpec, envelope parsedEnvelope, attempt int,
-) (protocol.GateReport, error) {
+) (protocol.GateReport, *phaseRun, error) {
 	var merged protocol.GateReport
 	env := e.phaseEnv(phase)
+	gateCtx, stopGates := e.commandContext(ctx)
+	defer stopGates()
 	for _, gate := range phase.Gates {
 		report, err := runGate(gateContext{
-			ctx:      ctx,
+			ctx:      gateCtx,
 			worktree: e.attempt.WorktreePath,
 			envelope: envelope,
 			baseSHA:  e.attempt.BaseSHA,
@@ -926,8 +980,11 @@ func (e *execution) runGates(
 			timeout:  e.timeouts,
 			record:   e.commandRecorder(),
 		}, gate)
+		if run := e.interrupted(gateCtx, "gate "+gate.Name+" of phase "+phase.Name); run != nil {
+			return merged, run, nil
+		}
 		if err != nil {
-			return merged, err
+			return merged, nil, err
 		}
 		e.gateReports[gate.Name] = report
 		merged.Checks = append(merged.Checks, report.Checks...)
@@ -941,7 +998,7 @@ func (e *execution) runGates(
 			"violations": report.Violations(),
 		})
 	}
-	return merged, nil
+	return merged, nil, nil
 }
 
 // commandRecorder is the record callback for jig-side commands — a code
@@ -1032,21 +1089,16 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 	})
 
 	env := e.phaseEnv(phase)
-	// Cancellation during a code phase kills the command's process group via
-	// context cancellation, then reports cancelled rather than a phase fail.
-	commandCtx, stopCommand := context.WithCancel(ctx)
-	go func() {
-		select {
-		case <-e.attempt.Cancelled:
-			stopCommand()
-		case <-commandCtx.Done():
-		}
-	}()
+	// Cancellation or the ceiling during a code phase kills the command's
+	// process group via context cancellation, then reports cancelled or the
+	// ceiling rather than a phase fail (commandContext).
+	commandCtx, stopCommand := e.commandContext(ctx)
 	result := runShellCommand(commandCtx, e.attempt.WorktreePath, phase.Command, env, e.timeouts.phase,
 		e.commandRecorder())
+	cut := e.interrupted(commandCtx, "phase "+phase.Name)
 	stopCommand()
-	if e.cancelled() {
-		return phaseRun{outcome: phaseCancelled, failure: "cancelled during phase " + phase.Name}
+	if cut != nil {
+		return *cut
 	}
 	if result.RecordError != "" {
 		// Not the command's failure: it was stopped before it could earn a
@@ -1073,7 +1125,10 @@ func (e *execution) runCodePhase(ctx context.Context, phase protocol.PhaseSpec) 
 	// Gates verify the adapter envelope's claims too; there is no session to
 	// correct, so a violation is a phase failure that the repair edge (if
 	// declared) routes like any other code-phase failure.
-	report, gateErr := e.runGates(ctx, phase, envelope, entry)
+	report, cut, gateErr := e.runGates(ctx, phase, envelope, entry)
+	if cut != nil {
+		return *cut
+	}
 	if gateErr != nil {
 		return e.failInfra(phase.Name, gateErr.Error())
 	}
@@ -1277,7 +1332,13 @@ func (e *execution) runAgentPhaseAttempt(
 			PhaseAttempt: entry, Error: detail, StartedAt: &started,
 		})
 		if !e.grouped {
-			if rollbackErr := restoreSnapshot(ctx, e.attempt.WorktreePath, before); rollbackErr != nil {
+			// Detached like the boundary check above: a worker stopping is
+			// what killed the agent, so on the live context the first git
+			// command fails "context canceled" and a recoverable death reads
+			// as "rollback failed". Each git command keeps its own
+			// GitCommandTimeout, so the rollback still cannot hang.
+			rollbackErr := restoreSnapshot(context.WithoutCancel(ctx), e.attempt.WorktreePath, before)
+			if rollbackErr != nil {
 				e.emit.emit(protocol.EventError, phase.Name, "rollback_failed",
 					map[string]string{"error": rollbackErr.Error()})
 				return phaseRun{outcome: phaseAborted,
@@ -1377,7 +1438,10 @@ func (e *execution) runAgentPhaseAttempt(
 			return fail(parseDetail)
 		}
 
-		report, gateErr := e.runGates(ctx, phase, envelope, gateAttempt)
+		report, cut, gateErr := e.runGates(ctx, phase, envelope, gateAttempt)
+		if cut != nil {
+			return terminalExit(*cut, cut.failure)
+		}
 		if gateErr != nil {
 			// jig could not run the gate: there is nothing for the agent to
 			// correct, so this ends the phase without a correction send.

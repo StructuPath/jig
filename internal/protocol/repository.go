@@ -65,11 +65,15 @@ func NormalizeRepositoryIdentity(value string) (string, error) {
 		}
 		return "file://" + filepath.ToSlash(canonical), nil
 	}
-	// Bare host/path identities like "github.com/owner/repo".
-	if host, path, found := strings.Cut(value, "/"); found && strings.Contains(host, ".") && path != "" {
+	// Bare host/path identities like "github.com/owner/repo". A leading dot
+	// is a relative path ("./repo", "../repo"), never a host.
+	if host, path, found := strings.Cut(value, "/"); found && strings.Contains(host, ".") &&
+		!strings.HasPrefix(host, ".") && path != "" {
 		return normalizeHostPath(host, path), nil
 	}
-	return "", fmt.Errorf("repository identity %q is not a recognized form", value)
+	return "", fmt.Errorf("repository identity %q is not a recognized form: "+
+		"use an absolute path (/path/to/repo), file:///path/to/repo, "+
+		"github.com/owner/repo, or a git remote URL", value)
 }
 
 func normalizeHostPath(host, path string) string {

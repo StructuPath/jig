@@ -37,7 +37,8 @@ an in-process run pinned at the repository's current HEAD, execute the
 phase chain with the embedded store, and print the trace path and outcome.
 No standing server, no publish.
 
-Flags (before the positional arguments):
+Flags (before or after the positional arguments; everything after a bare
+-- is positional):
   --def <file>     definition YAML file (required)
   --data <dir>     data directory for the store, traces, and scratch
                    (default ~/.jig)
@@ -82,12 +83,19 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	runtimeName := flags.String("runtime", runtimeClaudeCode, "agent CLI runtime")
 	asJSON := flags.Bool("json", false, "emit the structured result as JSON")
 	noSeedAuth := flags.Bool("no-seed-auth", false, "do not seed runtime auth material")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
-	if *defPath == "" || *dataDir == "" || flags.NArg() != 2 {
-		flags.Usage()
-		return exitUsage
+	switch {
+	case *defPath == "":
+		return usageError(stderr, "jig run", "--def is required", runUsage)
+	case *dataDir == "":
+		return usageError(stderr, "jig run", "--data is required", runUsage)
+	case flags.NArg() != 2:
+		return usageError(stderr, "jig run",
+			fmt.Sprintf("a repository path and a prompt are required, got %d argument(s)", flags.NArg()), runUsage)
+	case unknownRuntime(*runtimeName) != "":
+		return usageError(stderr, "jig run", unknownRuntime(*runtimeName), runUsage)
 	}
 
 	source, err := os.ReadFile(*defPath)

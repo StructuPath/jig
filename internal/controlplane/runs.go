@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
@@ -244,7 +245,14 @@ func (s *Store) resolveBaseSHA(ctx context.Context, identity, ref string) (strin
 	// to ask a human for credentials: an admission must fail loudly, never
 	// block on a prompt nobody is watching.
 	command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	// A helper git spawned (an ssh ControlMaster) can outlive git and hold
+	// the output pipe, and killing git on timeout does not reach it: bound
+	// Wait so an admission cannot hang, and keep a clean exit's output.
+	command.WaitDelay = 5 * time.Second
 	output, err := command.Output()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
 	if err != nil {
 		detail := ""
 		var exit *exec.ExitError

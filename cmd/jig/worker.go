@@ -52,7 +52,8 @@ publish-retry finishes an accepted_unpublished job's publish as this
 worker, without re-running any phase; see jig worker publish-retry --help.
 
 Flags:
-  --server <url>         control plane base URL (default http://127.0.0.1:8383)
+  --server <url>         control plane base URL
+                         (default $JIG_SERVER or http://127.0.0.1:8383)
   --data <dir>           worker data directory: repo cache, worktrees,
                          manifests, traces, scratch (default ~/.jig/worker)
   --runtime <name>       agent CLI to run rosters on: claude-code (default)
@@ -89,7 +90,7 @@ func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	flags := flag.NewFlagSet("jig worker", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, workerUsage) }
-	serverURL := flags.String("server", "http://"+defaultServerAuthority, "control plane URL")
+	serverURL := serverFlag(flags)
 	dataDir := flags.String("data", defaultWorkerDataDir(), "worker data directory")
 	runtimeName := flags.String("runtime", runtimeClaudeCode, "agent CLI runtime")
 	capacity := flags.Int("capacity", 1, "concurrent attempt slots")
@@ -99,12 +100,17 @@ func workerCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	authorEmail := flags.String("commit-author-email", "jig@localhost", "publish commit author email")
 	baseBranch := flags.String("base-branch", "", "pull-request base branch")
 	allowMerge := flags.Bool("allow-merge", false, "allow exact-head merge for opted-in definitions")
-	if err := flags.Parse(args); err != nil {
-		return exitUsage
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
 	}
-	if flags.NArg() != 0 || *dataDir == "" {
-		flags.Usage()
-		return exitUsage
+	if flags.NArg() != 0 {
+		return usageError(stderr, "jig worker", fmt.Sprintf("unexpected argument %q", flags.Arg(0)), workerUsage)
+	}
+	if *dataDir == "" {
+		return usageError(stderr, "jig worker", "--data is required", workerUsage)
+	}
+	if problem := unknownRuntime(*runtimeName); problem != "" {
+		return usageError(stderr, "jig worker", problem, workerUsage)
 	}
 	if ctx == nil {
 		ctx = context.Background()
