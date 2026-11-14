@@ -10,8 +10,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/protocol"
 )
@@ -132,8 +135,15 @@ func TestRunListSummarizesEachJobsLatestAttemptForZeroOneAndManyAttempts(t *test
 		t.Fatalf("one attempt: %+v", one)
 	}
 	if one[0].Job.State != protocol.JobAccepted || one[0].LatestAttempt.State != protocol.AttemptAccepted ||
-		one[0].LatestAttempt.StartedAt == nil || one[0].LatestAttempt.CompletedAt == nil || one[0].LatestAttempt.Result == "" {
-		t.Fatalf("one attempt: state, timestamps or result missing: %+v", one[0].LatestAttempt)
+		one[0].LatestAttempt.StartedAt == nil || one[0].LatestAttempt.CompletedAt == nil || one[0].LatestAttempt.ResultExcerpt == "" {
+		t.Fatalf("one attempt: state, timestamps or result excerpt missing: %+v", one[0].LatestAttempt)
+	}
+	if one[0].LatestAttempt.Result != "" || one[0].LatestAttempt.ResultTruncated {
+		t.Fatalf("one attempt: summary carries the result body %q (truncated %v), want only the excerpt",
+			one[0].LatestAttempt.Result, one[0].LatestAttempt.ResultTruncated)
+	}
+	if fmt.Sprint(one[0].Phases) != "[{build success 1}]" {
+		t.Fatalf("one attempt: phases %+v, want build passed from the result", one[0].Phases)
 	}
 	if len(one[0].Publish) != 1 || one[0].Publish[0].PullRequestURL != "https://github.com/acme/one/pull/7" {
 		t.Fatalf("one attempt: publish %+v, want the PR record", one[0].Publish)
@@ -179,7 +189,7 @@ func TestRunListQueryCountDoesNotGrowWithTheNumberOfRuns(t *testing.T) {
 		original := store.db
 		store.db = counting
 		defer func() { store.db = original }()
-		if _, err := store.RunList(context.Background()); err != nil {
+		if _, _, err := store.RunList(context.Background(), RunListPage{}); err != nil {
 			t.Fatalf("run list: %v", err)
 		}
 		return queries.Load()
@@ -202,11 +212,11 @@ func TestRunListQueryCountDoesNotGrowWithTheNumberOfRuns(t *testing.T) {
 		t.Fatalf("queries: %d for 2 runs, %d for 150 runs; want the same count", few, many)
 	}
 	// Zero would mean the counter saw nothing, not that the read is cheap.
-	if many != 4 {
-		t.Fatalf("queries: %d, want 4 (runs, jobs, latest attempts, publish records)", many)
+	if many != 6 {
+		t.Fatalf("queries: %d, want 6 (runs, jobs, latest attempts, publish records, phase events, result phases)", many)
 	}
 
-	items, err := store.RunList(context.Background())
+	items, _, err := store.RunList(context.Background(), RunListPage{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,4 +287,349 @@ func (c countingConn) PrepareContext(ctx context.Context, query string) (driver.
 		return preparer.PrepareContext(ctx, query)
 	}
 	return c.Conn.Prepare(query)
+}
+
+// BeginTx passes transaction options through, so the list's read-only
+// transaction opens on a counting connection as it does on the store's own.
+func (c countingConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	return c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
+}
+
+// A retry between the list's job read and its attempt read showed a job
+// failed with its latest attempt queued. The list reads one snapshot, so
+// every row is a state the ledger was in while retries land concurrently.
+func TestRunListIsOneSnapshotWhileRetriesLand(t *testing.T) {
+	store, _ := newTestStore(t)
+	const jobs = 8
+	seedRunSnapshot(t, store, "run-retry", runListSnapshot)
+	for i := 0; i < jobs; i++ {
+		seedListJob(t, store, "run-retry", fmt.Sprintf("job-%d", i), protocol.JobFailed, protocol.AttemptFailed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writerDone := make(chan error, 1)
+	go func() {
+		// Retry and fail each job in turn: the job flips failed → queued with
+		// a new queued attempt, then both fail again in one transaction.
+		for round := 0; round < 40 && ctx.Err() == nil; round++ {
+			for i := 0; i < jobs; i++ {
+				jobID := fmt.Sprintf("job-%d", i)
+				if _, err := store.RetryJob(ctx, jobID); err != nil {
+					writerDone <- fmt.Errorf("retry %s: %w", jobID, err)
+					return
+				}
+				tx, err := store.db.BeginTx(ctx, nil)
+				if err != nil {
+					writerDone <- err
+					return
+				}
+				now := store.now().UnixMilli()
+				if _, err := tx.Exec(`UPDATE attempts SET state = 'failed', completed_at = ?
+					WHERE job_id = ? AND state = 'queued'`, now, jobID); err != nil {
+					tx.Rollback()
+					writerDone <- err
+					return
+				}
+				if _, err := tx.Exec(`UPDATE jobs SET state = 'failed' WHERE id = ?`, jobID); err != nil {
+					tx.Rollback()
+					writerDone <- err
+					return
+				}
+				if err := tx.Commit(); err != nil {
+					writerDone <- err
+					return
+				}
+			}
+		}
+		writerDone <- nil
+	}()
+
+	reads := 0
+	for {
+		select {
+		case err := <-writerDone:
+			if err != nil {
+				t.Fatalf("writer: %v", err)
+			}
+			if reads == 0 {
+				t.Fatal("the writer finished before any list read; the test proved nothing")
+			}
+			return
+		default:
+		}
+		items, _, err := store.RunList(ctx, RunListPage{})
+		if err != nil {
+			t.Fatalf("run list: %v", err)
+		}
+		reads++
+		for _, summary := range items[0].JobSummaries {
+			attempt := summary.LatestAttempt
+			if attempt == nil {
+				t.Fatalf("read %d: job %s has no latest attempt", reads, summary.Job.ID)
+			}
+			consistent := (summary.Job.State == protocol.JobFailed && attempt.State == protocol.AttemptFailed) ||
+				(summary.Job.State == protocol.JobQueued && attempt.State == protocol.AttemptQueued)
+			if !consistent || summary.AttemptCount != attempt.AttemptNumber {
+				t.Fatalf("read %d: job %s is %s with latest attempt %d of %d %s; want one snapshot",
+					reads, summary.Job.ID, summary.Job.State, attempt.AttemptNumber, summary.AttemptCount, attempt.State)
+			}
+		}
+	}
+}
+
+// An active attempt has no result, and the stations are definitions only.
+// The summary's phases come from the trace, so a running job shows how far
+// it has got: build passed, test running.
+func TestRunListShowsPhaseProgressOfAnActiveAttemptFromItsTrace(t *testing.T) {
+	store, _ := newTestStore(t)
+	seedRunSnapshot(t, store, "run-live", runListSnapshot)
+	seedListJob(t, store, "run-live", "job-live", protocol.JobActive, "running")
+	if _, err := store.db.Exec(`UPDATE attempts SET result = NULL WHERE id = 'job-live-a1'`); err != nil {
+		t.Fatal(err)
+	}
+
+	read := func() JobSummary {
+		t.Helper()
+		items, _, err := store.RunList(context.Background(), RunListPage{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return items[0].JobSummaries[0]
+	}
+	if got := read(); got.Phases == nil || len(got.Phases) != 0 {
+		t.Fatalf("before any phase: phases %+v, want an empty list", got.Phases)
+	}
+
+	status := func(value string) json.RawMessage { return json.RawMessage(fmt.Sprintf(`{"status":%q}`, value)) }
+	if err := store.AppendEvents(context.Background(), "job-live-a1", []protocol.Event{
+		{Seq: 1, Type: protocol.EventPhaseStart, Phase: "build"},
+		{Seq: 2, Type: protocol.EventToolCall, Phase: "build", Name: "Edit"},
+		{Seq: 3, Type: protocol.EventPhaseEnd, Phase: "build", Payload: status(protocol.EnvelopeSuccess)},
+		{Seq: 4, Type: protocol.EventPhaseStart, Phase: "test"},
+		{Seq: 5, Type: protocol.EventLog, Phase: "test", Name: "agent_text"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	live := read()
+	if live.LatestAttempt == nil || live.LatestAttempt.ResultExcerpt != "" || live.LatestAttempt.ResultTruncated {
+		t.Fatalf("active attempt: %+v, want no result", live.LatestAttempt)
+	}
+	if fmt.Sprint(live.Phases) != "[{build success 1} {test running 1}]" {
+		t.Fatalf("active attempt: phases %+v, want build success then test running", live.Phases)
+	}
+
+	// A repair loop re-enters build; a died phase reads as the lane reads it.
+	if err := store.AppendEvents(context.Background(), "job-live-a1", []protocol.Event{
+		{Seq: 6, Type: protocol.EventPhaseEnd, Phase: "test", Payload: status(protocol.EnvelopeFail)},
+		{Seq: 7, Type: protocol.EventPhaseStart, Phase: "build"},
+		{Seq: 8, Type: protocol.EventPhaseDeath, Phase: "build"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); fmt.Sprint(got.Phases) != "[{build death 2} {test fail 1}]" {
+		t.Fatalf("after repair: phases %+v, want build died in round 2, test failed", got.Phases)
+	}
+}
+
+func TestRunListCutsResultAndErrorToAFirstLineExcerpt(t *testing.T) {
+	store, _ := newTestStore(t)
+	seedRunSnapshot(t, store, "run-big", runListSnapshot)
+	seedListJob(t, store, "run-big", "job-big", protocol.JobAcceptedUnpublished, protocol.AttemptAcceptedUnpublished)
+	envelope := strings.Repeat("x", 64<<10)
+	result := fmt.Sprintf(`{"phases":[{"phase":"build","status":"success","envelope":{"pad":%q}},`+
+		`{"phase":"test","status":"success"}],"publish":{"state":"failed","code":"ci_red","detail":"long"}}`, envelope)
+	errorText := strings.Repeat("é", 400) + "\nsecond line"
+	if _, err := store.db.Exec(`UPDATE attempts SET result = ?, error = ? WHERE id = 'job-big-a1'`, result, errorText); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewHandler(store, "", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest("GET", "http://127.0.0.1:8383/api/runs", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Body.Len() > 16<<10 {
+		t.Fatalf("response is %d bytes; a 64 KiB result must not reach the list", recorder.Body.Len())
+	}
+	if strings.Contains(recorder.Body.String(), `"result":`) || strings.Contains(recorder.Body.String(), `"error":`) {
+		t.Fatalf("response carries a result or error body: %s", recorder.Body.String())
+	}
+	var items []RunListItem
+	if err := json.Unmarshal(recorder.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	attempt := items[0].JobSummaries[0].LatestAttempt
+	if utf8.RuneCountInString(attempt.ResultExcerpt) != ExcerptRunes || !strings.HasPrefix(result, attempt.ResultExcerpt) ||
+		!attempt.ResultTruncated {
+		t.Fatalf("result excerpt %q (truncated %v), want the first %d runes, flagged", attempt.ResultExcerpt,
+			attempt.ResultTruncated, ExcerptRunes)
+	}
+	if attempt.ErrorExcerpt != strings.Repeat("é", ExcerptRunes) || !attempt.ErrorTruncated {
+		t.Fatalf("error excerpt %q (truncated %v), want %d runes of the first line, flagged",
+			attempt.ErrorExcerpt, attempt.ErrorTruncated, ExcerptRunes)
+	}
+	if attempt.PublishState != "failed" || attempt.PublishCode != "ci_red" {
+		t.Fatalf("publish outcome %q/%q, want failed/ci_red from the result", attempt.PublishState, attempt.PublishCode)
+	}
+	if got := items[0].JobSummaries[0].Phases; fmt.Sprint(got) != "[{build success 1} {test success 1}]" {
+		t.Fatalf("phases %+v, want both from the result", got)
+	}
+
+	// A short single-line body is whole, not flagged; a bare-string publish
+	// outcome is its state; a result that is not JSON adds nothing.
+	if _, err := store.db.Exec(`UPDATE attempts SET result = '{"publish":"held"}', error = 'boom' WHERE id = 'job-big-a1'`); err != nil {
+		t.Fatal(err)
+	}
+	brief := runListSummary(t, store).LatestAttempt
+	if brief.ResultExcerpt != `{"publish":"held"}` || brief.ResultTruncated || brief.ErrorExcerpt != "boom" ||
+		brief.ErrorTruncated || brief.PublishState != "held" || brief.PublishCode != "" {
+		t.Fatalf("short bodies: %+v", brief)
+	}
+	if _, err := store.db.Exec(`UPDATE attempts SET result = 'not json' WHERE id = 'job-big-a1'`); err != nil {
+		t.Fatal(err)
+	}
+	if summary := runListSummary(t, store); summary.LatestAttempt.PublishState != "" || len(summary.Phases) != 0 ||
+		summary.LatestAttempt.ResultExcerpt != "not json" {
+		t.Fatalf("unparsable result: %+v", summary)
+	}
+}
+
+func runListSummary(t *testing.T, store *Store) JobSummary {
+	t.Helper()
+	items, _, err := store.RunList(context.Background(), RunListPage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return items[0].JobSummaries[0]
+}
+
+// listPage requests GET /api/runs with query and returns the run IDs and the
+// next-page cursor.
+func listPage(t *testing.T, handler http.Handler, query string) ([]string, string, int) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest("GET", "http://127.0.0.1:8383/api/runs"+query, nil))
+	if recorder.Code != http.StatusOK {
+		return nil, "", recorder.Code
+	}
+	var items []RunListItem
+	if err := json.Unmarshal(recorder.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, len(items))
+	for i, item := range items {
+		ids[i] = item.ID
+	}
+	return ids, recorder.Header().Get("X-Next-Before"), recorder.Code
+}
+
+func TestRunListPagesNewestFirstWithABeforeCursor(t *testing.T) {
+	store, clock := newTestStore(t)
+	// Runs 0-2 share a created_at, so the cursor must break ties by ID.
+	for i := 0; i < 7; i++ {
+		if i >= 3 {
+			clock.Advance(time.Second)
+		}
+		seedRunSnapshot(t, store, fmt.Sprintf("run-%d", i), runListSnapshot)
+		seedListJob(t, store, fmt.Sprintf("run-%d", i), fmt.Sprintf("job-%d", i), protocol.JobFailed, protocol.AttemptFailed)
+	}
+	handler := NewHandler(store, "", nil)
+	want := []string{"run-6", "run-5", "run-4", "run-3", "run-0", "run-1", "run-2"}
+
+	all, next, _ := listPage(t, handler, "")
+	if fmt.Sprint(all) != fmt.Sprint(want) || next != "" {
+		t.Fatalf("default page: %v next %q, want %v and no cursor", all, next, want)
+	}
+	// Exactly the remaining runs: the last page, so no cursor.
+	if ids, next, _ := listPage(t, handler, "?limit=7"); len(ids) != 7 || next != "" {
+		t.Fatalf("limit = count: %v next %q, want every run and no cursor", ids, next)
+	}
+
+	var walked []string
+	cursor := ""
+	for pages := 0; ; pages++ {
+		query := "?limit=2"
+		if cursor != "" {
+			query += "&before=" + cursor
+		}
+		ids, next, code := listPage(t, handler, query)
+		if code != http.StatusOK || len(ids) == 0 || len(ids) > 2 || pages > 4 {
+			t.Fatalf("page %d (%s): status %d ids %v", pages, query, code, ids)
+		}
+		walked = append(walked, ids...)
+		if next == "" {
+			break
+		}
+		if next != ids[len(ids)-1] {
+			t.Fatalf("page %d: cursor %q, want the page's last run %q", pages, next, ids[len(ids)-1])
+		}
+		cursor = next
+	}
+	if fmt.Sprint(walked) != fmt.Sprint(want) {
+		t.Fatalf("paged walk %v, want %v with no run skipped or repeated", walked, want)
+	}
+	// The cursor at a created_at tie continues inside the tie.
+	if ids, _, _ := listPage(t, handler, "?before=run-0"); fmt.Sprint(ids) != "[run-1 run-2]" {
+		t.Fatalf("before run-0: %v, want [run-1 run-2]", ids)
+	}
+	if ids, next, _ := listPage(t, handler, "?before=run-2"); len(ids) != 0 || next != "" {
+		t.Fatalf("before the oldest run: %v next %q, want an empty last page", ids, next)
+	}
+
+	for _, query := range []string{"?limit=0", "?limit=-1", "?limit=ten", "?before=run-missing"} {
+		if _, _, code := listPage(t, handler, query); code != http.StatusBadRequest {
+			t.Fatalf("%s: status %d, want 400", query, code)
+		}
+	}
+}
+
+func TestRunListCapsTheLimitAndScopesEveryQueryToThePage(t *testing.T) {
+	store, clock := newTestStore(t)
+	const total = MaxRunListLimit + 20
+	for i := 0; i < total; i++ {
+		clock.Advance(time.Millisecond)
+		runID := fmt.Sprintf("run-%03d", i)
+		seedRunSnapshot(t, store, runID, runListSnapshot)
+		seedListJob(t, store, runID, fmt.Sprintf("job-%03d", i), protocol.JobFailed, protocol.AttemptFailed)
+	}
+	handler := NewHandler(store, "", nil)
+	ids, next, _ := listPage(t, handler, fmt.Sprintf("?limit=%d", MaxRunListLimit*5))
+	if len(ids) != MaxRunListLimit || next != ids[len(ids)-1] {
+		t.Fatalf("limit above the cap: %d runs next %q, want %d and a cursor", len(ids), next, MaxRunListLimit)
+	}
+	rest, next, _ := listPage(t, handler, "?before="+next)
+	if len(rest) != total-MaxRunListLimit || next != "" || rest[len(rest)-1] != "run-000" {
+		t.Fatalf("second page: %d runs next %q, want the oldest %d", len(rest), next, total-MaxRunListLimit)
+	}
+
+	// A cursor adds one lookup; the summary queries stay fixed.
+	var queries atomic.Int64
+	original := store.db
+	store.db = countingDB(t, store, &queries)
+	defer func() { store.db = original }()
+	items, _, err := store.RunList(context.Background(), RunListPage{Limit: 3, Before: "run-100"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queries.Load() != 7 {
+		t.Fatalf("queries with a cursor: %d, want 7", queries.Load())
+	}
+	if len(items) != 3 || items[0].ID != "run-099" || len(items[2].JobSummaries) != 1 ||
+		items[2].JobSummaries[0].Job.ID != "job-097" || items[2].JobSummaries[0].LatestAttempt == nil {
+		t.Fatalf("cursor page: %+v, want runs 099-097 with their summaries", items)
+	}
+}
+
+// The station list is parsed once per run, not once per poll.
+func TestRunListParsesEachRunSnapshotOnce(t *testing.T) {
+	store, _ := newTestStore(t)
+	seedRunSnapshot(t, store, "run-memo", runListSnapshot)
+	seedListJob(t, store, "run-memo", "job-memo", protocol.JobQueued)
+	first := runListSummary(t, store).Stations
+	second := runListSummary(t, store).Stations
+	if len(first) != 2 || &first[0] != &second[0] {
+		t.Fatalf("stations %p then %p, want the memoized slice", first, second)
+	}
 }

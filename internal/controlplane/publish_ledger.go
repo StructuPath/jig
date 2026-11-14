@@ -346,14 +346,24 @@ func (s *Store) JobPublishRecords(ctx context.Context, jobID string) ([]protocol
 	return s.publishRecords(ctx, `a.job_id = ?`, jobID)
 }
 
-func (s *Store) publishRecords(ctx context.Context, where string, arguments ...any) ([]protocol.PublishRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *Store) publishRecords(ctx context.Context, where string, argument any) ([]protocol.PublishRecord, error) {
+	return queryPublishRecords(ctx, s.db, where, argument)
+}
+
+// queryer is what *sql.DB and *sql.Tx share for reads, so a read helper can
+// run alone or inside the snapshot of a larger read (GET /api/runs).
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func queryPublishRecords(ctx context.Context, q queryer, where string, argument any) ([]protocol.PublishRecord, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT p.attempt_id, a.job_id, a.attempt_number, p.step, p.branch,
 		       p.remote_ref, p.pr_url, p.completed_at
 		FROM publish_records p JOIN attempts a ON a.id = p.attempt_id
 		WHERE `+where+`
 		ORDER BY a.attempt_number, p.completed_at, p.step
-	`, arguments...)
+	`, argument)
 	if err != nil {
 		return nil, unavailable(err)
 	}
