@@ -480,8 +480,7 @@ func (s *Store) RetryPublish(
 			"the attempt left accepted_unpublished during the retry")
 	}
 	result, err = tx.ExecContext(ctx, `
-		UPDATE jobs SET state = 'active', cancellation_requested = 0, updated_at = ?,
-		    publish_requested_at = NULL
+		UPDATE jobs SET state = 'active', cancellation_requested = 0, updated_at = ?
 		WHERE id = ? AND state = 'accepted_unpublished'
 	`, now.UnixMilli(), jobID)
 	if err != nil {
@@ -566,10 +565,12 @@ func (s *Store) RequestPublish(ctx context.Context, jobID string) (protocol.Job,
 	return s.Job(ctx, jobID)
 }
 
-// WithdrawPublishRequest clears a request no worker has taken yet. A request
-// a worker already took is gone from the row — its retry is running or done —
-// so withdrawing then changes nothing, and is not an error: the answer is the
-// job as it is.
+// WithdrawPublishRequest clears a pending request. The grant of the retry
+// leaves the request on the row and only the retry's completion clears it,
+// so a retry the sweeper returns as interrupted is served again (R14);
+// withdrawing while that retry runs keeps it from being served again.
+// Withdrawing with nothing pending is not an error: the answer is the job as
+// it is.
 func (s *Store) WithdrawPublishRequest(ctx context.Context, jobID string) (protocol.Job, error) {
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE jobs SET publish_requested_at = NULL WHERE id = ?`, jobID)
