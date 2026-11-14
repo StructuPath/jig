@@ -1,7 +1,7 @@
 // polling.ts — the UI's two polling primitives. The control plane is a
 // loopback SQLite server: polling is the honest transport, and the cost of a
 // poll is a millisecond of local I/O.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "./api";
 import { isTerminalAttempt } from "./format";
 import type { TraceEvent } from "./types";
@@ -96,6 +96,94 @@ export function usePolled<T>(load: () => Promise<T>, every: number | ((data: T |
   const refresh = useCallback(() => setTick((value) => value + 1), []);
   return { data, error, loading, refresh };
 }
+
+interface SharedPoll {
+  load: () => Promise<unknown>;
+  snapshot: { data: unknown; error: Error | null; loading: boolean };
+  listeners: Set<() => void>;
+  /** Each subscriber's interval; the poll runs at the shortest. */
+  intervals: Map<symbol, number>;
+  timer: ReturnType<typeof setInterval> | null;
+  timerMs: number;
+  inFlight: boolean;
+  onVisibility: () => void;
+}
+
+const sharedPolls = new Map<string, SharedPoll>();
+
+function sharedFetch(poll: SharedPoll): void {
+  if (poll.inFlight) return;
+  poll.inFlight = true;
+  const publish = (next: Partial<SharedPoll["snapshot"]>) => {
+    poll.snapshot = { ...poll.snapshot, ...next, loading: false };
+    poll.listeners.forEach((listener) => listener());
+  };
+  poll.load().then(
+    (data) => publish({ data, error: null }),
+    (failure: unknown) => publish({ error: failure as Error }),
+  ).finally(() => { poll.inFlight = false; });
+}
+
+function sharedSchedule(poll: SharedPoll): void {
+  const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+  const every = Math.min(...poll.intervals.values());
+  const wanted = hidden || !Number.isFinite(every) || every <= 0 ? 0 : every;
+  if (wanted === poll.timerMs && (poll.timer !== null) === (wanted > 0)) return;
+  if (poll.timer) clearInterval(poll.timer);
+  poll.timer = wanted > 0 ? setInterval(() => sharedFetch(poll), wanted) : null;
+  poll.timerMs = wanted;
+}
+
+/**
+ * useSharedPoll is usePolled for a resource several components on one screen
+ * read — the worker fleet in the plant bar and on the Floor, the queue in the
+ * plant bar and on Queue. Every subscriber to a key shares one request and
+ * one timer, at the shortest interval any of them asked for; the poll stops
+ * when the last one unmounts and while the tab is hidden.
+ */
+export function useSharedPoll<T>(key: string, load: () => Promise<T>, intervalMs: number): Polled<T> {
+  const id = useRef(Symbol(key)).current;
+  const pollFor = useCallback(() => {
+    let poll = sharedPolls.get(key);
+    if (!poll) {
+      const created: SharedPoll = {
+        load, snapshot: { data: null, error: null, loading: true }, listeners: new Set(), intervals: new Map(),
+        timer: null, timerMs: 0, inFlight: false,
+        onVisibility: () => {
+          if (typeof document !== "undefined" && document.visibilityState !== "hidden") sharedFetch(created);
+          sharedSchedule(created);
+        },
+      };
+      poll = created;
+      sharedPolls.set(key, poll);
+    }
+    return poll;
+  }, [key, load]);
+  const subscribe = useCallback((listener: () => void) => {
+    const poll = pollFor();
+    const first = poll.listeners.size === 0;
+    poll.listeners.add(listener);
+    poll.intervals.set(id, intervalMs);
+    if (first) {
+      document.addEventListener("visibilitychange", poll.onVisibility);
+      sharedFetch(poll);
+    }
+    sharedSchedule(poll);
+    return () => {
+      poll.listeners.delete(listener);
+      poll.intervals.delete(id);
+      if (poll.listeners.size > 0) { sharedSchedule(poll); return; }
+      if (poll.timer) clearInterval(poll.timer);
+      document.removeEventListener("visibilitychange", poll.onVisibility);
+      sharedPolls.delete(key);
+    };
+  }, [pollFor, id, intervalMs, key]);
+  const snapshot = useSyncExternalStore(subscribe, () => sharedPolls.get(key)?.snapshot ?? EMPTY_POLL);
+  const refresh = useCallback(() => { const poll = sharedPolls.get(key); if (poll) sharedFetch(poll); }, [key]);
+  return { data: snapshot.data as T | null, error: snapshot.error, loading: snapshot.loading, refresh };
+}
+
+const EMPTY_POLL = { data: null, error: null, loading: true };
 
 export interface AttemptTrace {
   events: TraceEvent[];

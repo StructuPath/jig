@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { webcrypto } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -116,10 +116,12 @@ it("starts a job with no worker online and says the job waits", async () => {
   const fetch = mockServer({ online: false });
   render(<Tasks />);
   fireEvent.change(screen.getByLabelText("1. Project"), { target: { value: "/tmp/project" } });
-  expect(await screen.findByText(/No worker is online — the job waits until you run/)).toBeVisible();
+  const note = await screen.findByText(/No worker is online — the job waits until you run/);
+  expect(note).toBeVisible();
   // A starter job runs on Codex; plain `jig worker` runs Claude Code and
-  // would leave it queued.
-  expect(screen.getByText("jig worker --runtime codex", { selector: "code" })).toBeVisible();
+  // would leave it queued. The Floor's worker line names the same command.
+  expect(within(note).getByText("jig worker --runtime codex", { selector: "code" })).toBeVisible();
+  expect(within(screen.getByText(/Jobs wait in the queue until you run/)).getByText("jig worker --runtime codex")).toBeVisible();
   const start = screen.getByRole("button", { name: "Start job" });
   await waitFor(() => expect(start).toBeEnabled());
   fireEvent.click(start);

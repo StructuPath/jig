@@ -249,3 +249,50 @@ export interface AttemptSummary {
   };
   publish_hold?: string;
 }
+
+// RunListItem is one row of GET /api/runs: the run with a summary of each of
+// its jobs (internal/controlplane/runs_list.go). The summaries are what list
+// rows, Floor rows and board cards are built from, so a list of 40 jobs is
+// one request rather than one or two per row.
+export interface RunListItem extends Run {
+  job_summaries?: JobSummary[] | null;
+}
+
+// RunListPage is one page of GET /api/runs. `next` is the run ID to pass as
+// `before` for the next page (the X-Next-Before header); null on the last.
+export interface RunListPage {
+  runs: RunListItem[];
+  next: string | null;
+}
+
+// JobSummary is the slice of JobDetail a list row needs: the job, the frozen
+// chain and policy, the latest attempt without its result and error bodies,
+// where each of that attempt's phases stands, and its publish records.
+export interface JobSummary {
+  job: Job;
+  stations?: Station[];
+  delivery?: Delivery;
+  attempt_count: number;
+  latest_attempt?: AttemptBrief;
+  phases: PhaseProgress[] | null;
+  publish: PublishRecord[] | null;
+}
+
+// AttemptBrief is an attempt with first-line excerpts in place of its result
+// and error, and the result's publish outcome read out server-side.
+export interface AttemptBrief extends Omit<Attempt, "result" | "error"> {
+  result_excerpt?: string;
+  result_truncated?: boolean;
+  error_excerpt?: string;
+  error_truncated?: boolean;
+  publish_state?: string;
+  publish_code?: string;
+}
+
+// PhaseProgress is one phase of an attempt in the trace's vocabulary:
+// running, death, or phase_end's status (success, fail, skipped).
+export interface PhaseProgress {
+  phase: string;
+  status: string;
+  rounds: number;
+}

@@ -80,16 +80,18 @@ it("reports the server's liveness verdict and the runtime each worker owns", asy
   render(<Fleet />);
 
   const local = await waitFor(() => screen.getByText("local").closest("tr")!);
+  const spare = () => screen.getByText("spare").closest("tr")!;
   expect(within(local).getByText("Online")).toBeInTheDocument();
   expect(within(local).getByText("claude-code 2.1.4")).toBeInTheDocument();
   expect(within(local).getByText("1 / 2")).toBeInTheDocument();
-  expect(within(local).getByText("2.0s ago")).toBeInTheDocument();
+  // Ages read as they do everywhere else (formatAge), the exact time in the title.
+  expect(within(local).getByText("just now")).toBeInTheDocument();
+  expect(within(spare()).getByText("1 min ago")).toHaveAttribute("title", expect.stringMatching(/2026/));
 
   // Stale is the server's word, not an inference: worker-b's four idle slots
   // must not be counted as capacity anywhere in the view.
-  const spare = screen.getByText("spare").closest("tr")!;
-  expect(within(spare).getByText("Offline")).toBeInTheDocument();
-  expect(within(spare).getByText("codex 0.9.1")).toBeInTheDocument();
+  expect(within(spare()).getByText("Offline")).toBeInTheDocument();
+  expect(within(spare()).getByText("codex 0.9.1")).toBeInTheDocument();
   expect(screen.getByText("free slots").previousSibling).toHaveTextContent("1");
 
   // A real worker advertises dozens of env names, so the cell counts them
@@ -115,11 +117,24 @@ it("sends the operator to the worker they have not started", async () => {
   render(<Fleet />);
 
   expect(await screen.findByText("No workers registered")).toBeInTheDocument();
+  // The exact commands, as code — not a sentence with literal backticks.
+  expect(screen.getByText(/jig worker --runtime codex/, { selector: "pre" })).toBeInTheDocument();
+  expect(screen.getByText("jig start", { selector: "code" })).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain("`");
+  expect(document.title).toBe("Workers · jig");
+});
+
+it("gives the start command when every registered worker is offline", async () => {
+  mockFleet({ workers: [member({ live: false })], live_count: 0, stale_count: 1 });
+  render(<Fleet />);
+  expect(await screen.findByText("No worker is online")).toBeInTheDocument();
+  expect(screen.getByText(/jig worker --runtime codex/, { selector: "pre" })).toBeInTheDocument();
 });
 
 it("measures heartbeat age against the server's observation, never the browser clock", () => {
-  expect(heartbeatAge(member({ last_heartbeat: at(-45_000) }), OBSERVED)).toBe("45s ago");
+  expect(heartbeatAge(member({ last_heartbeat: at(-45_000) }), OBSERVED)).toBe("just now");
+  expect(heartbeatAge(member({ last_heartbeat: at(-5 * 3_600_000) }), OBSERVED)).toBe("5 h ago");
   // A heartbeat stamped a shade ahead of the observation is clock jitter
   // inside one process, not a negative age.
-  expect(heartbeatAge(member({ last_heartbeat: at(500) }), OBSERVED)).toBe("0ms ago");
+  expect(heartbeatAge(member({ last_heartbeat: at(500) }), OBSERVED)).toBe("just now");
 });

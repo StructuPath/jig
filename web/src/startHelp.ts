@@ -59,3 +59,12 @@ export function startHelp(error: Error | null, repository: string): StartHelp | 
     commands: [`cd ${shellQuote(project)}`, 'echo "# New project" > README.md', 'git add -A && git commit -m "Initial commit"'],
   };
 }
+
+/**
+ * workerCommand is the command that starts a worker for a runtime. `jig
+ * worker` runs Claude Code unless told otherwise, so a job that needs another
+ * runtime — Codex for the task form's own jobs — names it, or it stays queued.
+ */
+export function workerCommand(runtime?: string): string {
+  return runtime ? `jig worker --runtime ${runtime}` : "jig worker";
+}

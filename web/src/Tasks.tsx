@@ -2,17 +2,22 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { api, ensureDefinition } from "./api";
 import { Floor } from "./Floor";
-import { formatDateTime, projectName, taskHeading, taskState } from "./format";
-import { useNow, usePolled } from "./polling";
+import { formatAge, formatDateTime, projectName, taskHeading, taskState } from "./format";
+import { useNow, usePolled, useSharedPoll } from "./polling";
+import { useDocumentTitle } from "./keyboard";
 import { navigate } from "./router";
 import { loadContinuation } from "./continuation";
 import type { Continuation } from "./continuation";
-import { startHelp } from "./startHelp";
+import { startHelp, workerCommand } from "./startHelp";
 import { automaticGoal, canPublish, defaultModel, starterSource } from "./starters";
 import type { Delivery, TaskMode } from "./starters";
 import type { JobStatus } from "./status";
 import type { Run } from "./types";
 import { ErrorBanner, JobBadge, Link, StatusBadge } from "./ui";
+
+// The Floor is the newest work on the line, newest first; the Jobs list holds
+// the rest. 30 one-line rows fill a 1080p screen beside the start form.
+const FLOOR_ROWS = 30;
 
 function storedProject(): string | null {
   try { return localStorage.getItem("jig-project"); } catch { return null; /* Browser storage can be disabled. */ }
@@ -40,8 +45,7 @@ function readDraft(): Draft {
 export function Tasks() {
   const loadRuns = useCallback(() => api.runs(), []);
   const runs = usePolled(loadRuns, 3000, "tasks");
-  const loadFleet = useCallback(() => api.fleet(), []);
-  const fleet = usePolled(loadFleet, 3000, "task-workers");
+  const fleet = useSharedPoll("workers", api.fleet, 3000);
   const [draft] = useState(readDraft);
   const [repository, setRepository] = useState(() => new URLSearchParams(window.location.search).get("project") ?? (typeof draft.repository === "string" ? draft.repository : null) ?? storedProject() ?? "");
   const [task, setTask] = useState(() => typeof draft.task === "string" ? draft.task : "");
@@ -86,16 +90,15 @@ export function Tasks() {
   // waits. Only a saved-workflow choice with no workflow cannot start.
   const ready = saved ? Boolean(workflow) : true;
   const runnable = saved ? (pinned ? liveRuntimes.includes(pinned) : liveRuntimes.length > 0) : codexReady;
-  // `jig worker` runs Claude Code unless told otherwise, so the command names
-  // the runtime the job needs: Codex for the task form's own jobs, and the
-  // pinned runtime for a saved workflow that pins one.
+  // The command names the runtime the job needs: Codex for the task form's
+  // own jobs, and the pinned runtime for a saved workflow that pins one.
   const needed = saved ? pinned : "codex";
-  const workerCommand = needed ? `jig worker --runtime ${needed}` : "jig worker";
   const waitNote = liveRuntimes.length === 0
-    ? <>No worker is online — the job waits until you run <code>{workerCommand}</code>.</>
+    ? <>No worker is online — the job waits until you run <code>{workerCommand(needed)}</code>.</>
     : `No online worker runs ${saved ? pinned ?? "any runtime" : "Codex"} — the job waits in the queue until one does.`;
   const taskNeeded = saved || mode !== "auto";
   const nowMs = useNow(1000);
+  useDocumentTitle("Floor");
 
   const start = async (event: FormEvent) => {
     event.preventDefault();
@@ -127,10 +130,13 @@ export function Tasks() {
     <section className="floor-main" aria-label="On the line">
       <header className="floor-head"><h1>On the line</h1><Link href="/runs">All jobs →</Link></header>
       <ErrorBanner error={runs.error} />
-      {(runs.data ?? []).length > 0 && <Floor runs={(runs.data ?? []).slice(0, 12)} nowMs={nowMs} />}
-      {!runs.loading && (runs.data ?? []).length === 0 && <p className="subtle">The line is empty. Your first job appears here when you press Start.</p>}
+      {(runs.data ?? []).length > 0 && <Floor runs={(runs.data ?? []).slice(0, FLOOR_ROWS)} nowMs={nowMs} />}
+      {!runs.loading && (runs.data ?? []).length === 0 && <div className="floor-empty">
+        <p>The line is empty. Fill in <strong>Start a job</strong> and press Start job, or admit a run of a saved workflow from a terminal:</p>
+        <pre>jig def invoke &lt;workflow&gt; --repo &lt;path&gt; --instructions "&lt;what to do&gt;"</pre>
+      </div>}
       <p className="floor-workers">
-        {fleet.data ? (fleet.data.workers ?? []).filter((worker) => worker.live).length === 0 ? "No worker is online. Jobs wait in the queue until one starts." :
+        {fleet.data ? (fleet.data.workers ?? []).filter((worker) => worker.live).length === 0 ? <>No worker is online. Jobs wait in the queue until you run <code>{workerCommand("codex")}</code>.</> :
           (fleet.data.workers ?? []).filter((worker) => worker.live).map((worker) => `${worker.name} · ${(worker.runtimes ?? []).map((runtime) => runtime.name).join(", ")} · ${worker.active_count}/${worker.capacity} busy`).join("   ") : "Checking workers…"}
       </p>
     </section>
@@ -191,12 +197,12 @@ export function Tasks() {
   </div>;
 }
 
-export function TaskCard({ run, status }: { run: Run; status?: JobStatus }) {
+export function TaskCard({ run, status, nowMs }: { run: Run; status?: JobStatus; nowMs: number }) {
   const title = taskHeading(run);
   return <article className={`panel task-card task-card-${status ? `tone-${status.tone}` : taskState(run)}`}>
       <div className="task-card-meta"><span className="task-project">{run.targets.map((target) => projectName(target.repository)).join(", ")}</span>{status ? <JobBadge status={status} /> : <StatusBadge state={taskState(run)} />}</div>
       <h3><Link href={`/runs/${run.id}`}>{title}</Link></h3>
-      <p className="subtle">{formatDateTime(run.created_at)}</p>
+      <p className="subtle" title={formatDateTime(run.created_at)}>{formatAge(run.created_at, nowMs)}</p>
       <Link href={`/runs/${run.id}`}>Open job →</Link>
     </article>;
 }
