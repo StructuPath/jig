@@ -109,6 +109,33 @@ func TestServeAnswersTheAPIAndTheEmbeddedUIOnOneLoopbackOrigin(t *testing.T) {
 	}
 }
 
+// One data directory is one control plane: a second `jig serve` over it
+// would run a second sweeper and admission loop and fire every schedule
+// twice, so it is refused while the first holds serve.lock, and the data
+// directory is usable again once the first stops.
+func TestASecondServeOverTheSameDataDirectoryIsRefused(t *testing.T) {
+	dataDir := t.TempDir()
+	_, stop := startServe(t, dataDir, "--no-github-poll")
+
+	var stdout, stderr syncBuffer
+	code := serveCommand(context.Background(),
+		[]string{"--data", dataDir, "--addr", "127.0.0.1:0", "--no-github-poll"}, &stdout, &stderr)
+	if code != exitInfraFailed {
+		t.Fatalf("second serve exit = %d, want %d\nstderr: %s", code, exitInfraFailed, stderr.String())
+	}
+	want := fmt.Sprintf("jig serve: %s is in use by another jig serve (pid %d)", dataDir, os.Getpid())
+	if !strings.Contains(stderr.String(), want) {
+		t.Fatalf("stderr = %q, want it to contain %q", stderr.String(), want)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("a refused serve still announced a listener:\n%s", stdout.String())
+	}
+
+	stop()
+	_, stopAgain := startServe(t, dataDir, "--no-github-poll")
+	stopAgain()
+}
+
 // Covers R20: the refusal happens before any socket exists, so the address is
 // still free afterwards.
 func TestServeRefusesANonLoopbackBindWithoutTheExplicitOptIn(t *testing.T) {
