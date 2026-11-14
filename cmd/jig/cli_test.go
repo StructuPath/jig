@@ -9,6 +9,7 @@ import (
 	"flag"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -65,13 +66,14 @@ func TestHelpExitsZeroOnEveryCommand(t *testing.T) {
 	commands := map[string]func(context.Context, []string, io.Writer, io.Writer) int{
 		"start": startCommand, "serve": serveCommand, "worker": workerCommand,
 		"run": runCommand, "report": reportCommand, "job": jobCommand,
-		"def": defCommand, "trigger": triggerCommand,
+		"def": defCommand, "trigger": triggerCommand, "runs": runsCommand,
+		"completion": completionCommand,
 	}
 	for name, command := range commands {
 		for _, args := range [][]string{{"--help"}, {"-h"}} {
-			if name == "job" || name == "def" || name == "trigger" {
+			if name == "job" || name == "def" || name == "trigger" || name == "runs" {
 				// The family's own help, and one subcommand's.
-				sub := map[string]string{"job": "release", "def": "invoke", "trigger": "create"}[name]
+				sub := map[string]string{"job": "release", "def": "invoke", "trigger": "create", "runs": "list"}[name]
 				for _, full := range [][]string{args, append([]string{sub}, args...)} {
 					var stdout, stderr strings.Builder
 					if code := command(context.Background(), full, &stdout, &stderr); code != exitAccepted {
@@ -142,13 +144,21 @@ func TestAnInvalidRequestRejectionExitsTwo(t *testing.T) {
 }
 
 func TestARelativeRepositoryIsResolvedBeforeItIsSent(t *testing.T) {
-	directory := t.TempDir()
+	root := t.TempDir()
+	directory := filepath.Join(root, "work")
+	if err := os.MkdirAll(filepath.Join(root, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(directory)
 	working, _ := filepath.Abs(".")
 	for value, want := range map[string]string{
 		".":                         working,
 		"./repo":                    filepath.Join(working, "repo"),
 		"../repo":                   filepath.Join(filepath.Dir(working), "repo"),
+		"../missing":                working + string(filepath.Separator) + "../missing",
 		"repo":                      filepath.Join(working, "repo"),
 		"/abs/repo":                 "/abs/repo",
 		"file:///abs/repo":          "file:///abs/repo",
@@ -158,6 +168,59 @@ func TestARelativeRepositoryIsResolvedBeforeItIsSent(t *testing.T) {
 		if got := cliRepository(value); got != want {
 			t.Errorf("cliRepository(%q) = %q, want %q", value, got, want)
 		}
+	}
+}
+
+// A ".." after a symlink steps out of the symlink's target, as the OS
+// resolves it: with link -> target/child, link/../repo is target/repo, not
+// the ./repo lexical cleaning would pick.
+func TestARelativeRepositoryThroughASymlinkResolvesLikeTheOS(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"work/repo", "target/child", "target/repo"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(root, "target", "child"), filepath.Join(root, "work", "link")); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(filepath.Join(root, "work"))
+	want, err := filepath.EvalSymlinks(filepath.Join(root, "target", "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cliRepository("link/../repo"); got != want {
+		t.Fatalf("cliRepository(link/../repo) = %q, want %q", got, want)
+	}
+}
+
+// A name is free-form, so a definition named like a UUID is reached by that
+// name: an id-shaped reference is an id first and a name when no id matches.
+func TestADefinitionNamedLikeAUUIDIsResolvedByName(t *testing.T) {
+	base, stop := startServe(t, t.TempDir(), "--no-github-poll")
+	defer stop()
+	const name = "11111111-2222-4333-8444-555555555555"
+	source, err := os.ReadFile(stockDefinition("scout.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed := strings.Replace(string(source), "\nname: scout\n", "\nname: "+name+"\n", 1)
+	if renamed == string(source) {
+		t.Fatal("scout.yaml no longer carries `name: scout` on its own line")
+	}
+	path := filepath.Join(t.TempDir(), "uuid-named.yaml")
+	if err := os.WriteFile(path, []byte(renamed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	created := runDef(t, exitAccepted, "create", path, "--server", base)
+	definitionID, _, _ := strings.Cut(created, "  ")
+
+	shown := runDef(t, exitAccepted, "show", name, "--json", "--server", base)
+	if !strings.Contains(shown, `"id": "`+definitionID+`"`) {
+		t.Fatalf("show by a UUID-shaped name did not find the definition %s:\n%s", definitionID, shown)
+	}
+	if byID := runDef(t, exitAccepted, "show", definitionID, "--json", "--server", base); !strings.Contains(byID, `"name": "`+name+`"`) {
+		t.Fatalf("show by id no longer works:\n%s", byID)
 	}
 }
 

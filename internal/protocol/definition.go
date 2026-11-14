@@ -289,9 +289,10 @@ type RoleSpec struct {
 // role's environment). If guards the phase (KTD2): a bare field name runs
 // the phase only when a previous envelope set that field truthy; a
 // `<field> == <literal>` predicate runs it only when the comparison holds.
-// ReportsFields, on a code phase, makes the command's last stdout line a
-// JSON object of envelope fields — the way a deterministic script (a risk
-// classifier, say) speaks to `if:` guards and the publish hold.
+// ReportsFields, on a code phase, makes the last non-empty line of the
+// command's combined stdout and stderr a JSON object of envelope fields —
+// the way a deterministic script (a risk classifier, say) speaks to `if:`
+// guards and the publish hold.
 type PhaseSpec struct {
 	Name          string      `yaml:"name"`
 	Kind          string      `yaml:"kind"`

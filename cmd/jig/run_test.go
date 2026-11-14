@@ -295,6 +295,74 @@ func TestDirectRunRecordsTheSameEventStreamShapeAsAServerPathRun(t *testing.T) {
 	}
 }
 
+// ---- scenario: a declared secret never reaches the direct run's trace -----
+
+// docs/definition-reference.md promises sensitive_env values are redacted
+// from every persisted trace (R15); `jig run` persists through the same
+// worker trace stream, so neither the JSONL nor the events table keeps one.
+func TestDirectRunRedactsADeclaredSecretFromTheStoredTrace(t *testing.T) {
+	const secretValue = "s3cr3t-direct-run-value"
+	t.Setenv("JIG_TEST_DIRECT_SECRET", secretValue)
+	repo := initRepo(t)
+	data := t.TempDir()
+	scriptRuntime(t, map[string]any{
+		"text": envelopeJSON(t, map[string]any{
+			"status": "success", "summary": "the token is " + secretValue,
+			"approved": true, "blocking": []any{},
+		}),
+	})
+	defPath := filepath.Join(t.TempDir(), "secret.yaml")
+	source := `
+name: secret
+roster:
+  scout:
+    model: haiku
+    system_prompt: s
+    user_prompt: "{{prompt}}"
+    env: [PATH, JIG_TEST_DIRECT_SECRET]
+    sensitive_env: [JIG_TEST_DIRECT_SECRET]
+    writes: []
+phases:
+  - name: scout
+    kind: agent
+    owner: scout
+acceptance: [all_phases_passed]
+`
+	if err := os.WriteFile(defPath, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, report, stderr := runJigJSON(t, "--def", defPath, "--data", data, repo, "look")
+	if code != exitAccepted {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitAccepted, stderr)
+	}
+	traceBody, err := os.ReadFile(report.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(traceBody), secretValue) {
+		t.Fatalf("the JSONL trace keeps the declared secret:\n%s", traceBody)
+	}
+	if !strings.Contains(string(traceBody), "[redacted:JIG_TEST_DIRECT_SECRET]") {
+		t.Fatalf("the JSONL trace shows no redaction — the probe never reached it:\n%s", traceBody)
+	}
+	store, err := controlplane.Open(context.Background(), filepath.Join(data, "jig.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events, err := store.AttemptEvents(context.Background(), report.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(stored), secretValue) {
+		t.Fatalf("the events table keeps the declared secret")
+	}
+}
+
 // ---- machine-readable output and exit codes --------------------------------
 
 func TestJSONOutputCarriesTheDocumentedFieldsAndRejectionExitsDistinctlyFromInfraFailure(t *testing.T) {
