@@ -1,14 +1,15 @@
 // consistency.test.tsx — one job, one status word, in every view that shows
-// it: the job list row, the board card, and the run header. A running job's
+// it: the job list row and the board card (built from the run list's job
+// summary) and the run header (built from the job detail). A running job's
 // current station is a separate label on the row, never the status word.
-// A run that stays `mixed` while its job moves on (a publish retry) keeps
-// every view polling until the job can no longer change.
+// A run that stays `mixed` while its job moves on (a publish retry) moves
+// every view with it.
 import { act, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Floor } from "./Floor";
 import { RunDetail } from "./RunDetail";
 import { TaskBoard } from "./TaskBoard";
-import type { Attempt, JobDetail, Run, TraceEvent } from "./types";
+import type { Attempt, AttemptSummary, JobDetail, JobSummary, Run, RunListItem, TraceEvent } from "./types";
 
 const BASE = Date.parse("2026-11-14T10:00:00.000Z");
 const at = (offsetMs: number) => new Date(BASE + offsetMs).toISOString();
@@ -78,12 +79,47 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function views() {
-  return render(<>
-    <Floor runs={[current.run]} nowMs={BASE + 60_000} />
-    <TaskBoard runs={[current.run]} />
+/**
+ * listed is the run as GET /api/runs lists it: the job summary the server
+ * folds from the same ledger the job detail reads — the latest attempt with
+ * its publish outcome, and each phase's status from the trace, then the
+ * result.
+ */
+function listed(): RunListItem {
+  const attempt = current.job.attempts?.at(-1);
+  const parsed = attempt?.result ? JSON.parse(attempt.result) as AttemptSummary : null;
+  const publish = parsed?.publish;
+  const phases = new Map<string, string>();
+  for (const event of current.events) {
+    if (event.type === "phase_start" && event.phase) phases.set(event.phase, "running");
+    if (event.type === "phase_end" && event.phase) phases.set(event.phase, String((event.payload as { status?: string })?.status ?? "unknown"));
+  }
+  for (const phase of parsed?.phases ?? []) phases.set(phase.phase, phase.status);
+  const summary: JobSummary = {
+    job: current.job.job, stations: current.job.stations, delivery: current.job.delivery,
+    attempt_count: current.job.attempts?.length ?? 0,
+    latest_attempt: attempt ? (({ result: _result, error: _error, ...rest }) => ({
+      ...rest,
+      publish_state: typeof publish === "string" ? publish : publish?.state,
+      publish_code: typeof publish === "string" ? undefined : publish?.code,
+    }))(attempt) : undefined,
+    phases: [...phases].map(([phase, status]) => ({ phase, status, rounds: 1 })),
+    publish: current.job.publish ?? [],
+  };
+  return { ...current.run, job_summaries: [summary] };
+}
+
+function Views() {
+  const item = listed();
+  return <>
+    <Floor runs={[item]} nowMs={BASE + 60_000} />
+    <TaskBoard runs={[item]} />
     <RunDetail runID="run-1" />
-  </>);
+  </>;
+}
+
+function views() {
+  return render(<Views />);
 }
 
 /** words reads the status word each view shows for the one job. */
@@ -117,26 +153,26 @@ describe("a run that stays mixed while its job moves on", () => {
   it("follows a held job to not published, then stops polling once nothing can change", async () => {
     const result = (publish: object) => ({ phases: [], publish });
     current = { run: run("mixed"), job: detail("accepted_unpublished", [attempt("accepted_unpublished", result({ state: "held", code: "publish_held" }))]), events: [] };
-    const { container } = views();
+    const view = views();
+    const { container } = view;
     await waitFor(() => expect(words(container)).toEqual({ row: "Held", card: "Held", header: "Held" }));
 
     // The release ran and its publish failed: the job is unpublished for a new
-    // reason, and the run is still `mixed`.
+    // reason, and the run is still `mixed`. The row and card move with the
+    // run list's next poll; the header with its own.
     current.job = detail("accepted_unpublished", [attempt("accepted_unpublished", result({ state: "failed", code: "push_failed" }))]);
+    view.rerender(<Views />);
     await act(() => vi.advanceTimersByTimeAsync(4500));
     await waitFor(() => expect(words(container)).toEqual({ row: "Not published", card: "Not published", header: "Not published" }));
 
     // A retry that finds nothing to publish leaves no action open; every view
-    // settles on Done and the job is no longer read.
+    // settles on Done.
     current.job = detail("accepted_unpublished", [attempt("accepted_unpublished", result({ state: "failed", code: "publish_empty_changeset" }))]);
+    view.rerender(<Views />);
     await act(() => vi.advanceTimersByTimeAsync(4500));
     await waitFor(() => expect(words(container)).toEqual({ row: "Done", card: "Done", header: "Done" }));
-    await act(() => vi.advanceTimersByTimeAsync(4500));
-    const jobReads = () => requests.filter((url) => url === "/api/jobs/job-1").length;
-    const settled = jobReads();
-    await act(() => vi.advanceTimersByTimeAsync(10_000));
-    // The job panel polls on its own interval regardless; the row, the card
-    // and the header have stopped, so only its reads remain.
-    expect(jobReads() - settled).toBeLessThanOrEqual(4);
+    // The row and the card read nothing of their own: every request is the
+    // run header's or its job panel's.
+    expect(requests.filter((url) => url.startsWith("/api/runs") && url !== "/api/runs/run-1")).toEqual([]);
   });
 });

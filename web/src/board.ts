@@ -33,10 +33,10 @@ export const columns: ReadonlyArray<{ id: ColumnID; label: string }> = [
   { id: "stopped", label: "Stopped" },
 ];
 
-export interface Column {
+export interface Column<T extends Run = Run> {
   id: ColumnID;
   label: string;
-  runs: Run[];
+  runs: T[];
 }
 
 /**
@@ -65,17 +65,18 @@ export function runColumn(run: Run, jobStates: string[] | undefined, status?: Jo
 
 /**
  * buildBoard folds runs into the five columns, preserving the incoming run
- * order (the API lists newest first) within each column. A null queue means
- * the queue poll failed; active runs then fall to Running (KTD6).
+ * order (the API lists newest first) within each column. The job states may
+ * come from the queue or from the run list's job summaries; null means none
+ * are known, and active runs then fall to Running (KTD6).
  */
-export function buildBoard(runs: Run[], queue: QueueEntry[] | null, statuses?: ReadonlyMap<string, JobStatus>): Column[] {
+export function buildBoard<T extends Run>(runs: T[], queue: Pick<QueueEntry, "run_id" | "state">[] | null, statuses?: ReadonlyMap<string, JobStatus>): Column<T>[] {
   const jobStates = new Map<string, string[]>();
   for (const entry of queue ?? []) {
     const states = jobStates.get(entry.run_id);
     if (states) states.push(entry.state);
     else jobStates.set(entry.run_id, [entry.state]);
   }
-  const board = columns.map((column) => ({ ...column, runs: [] as Run[] }));
+  const board = columns.map((column) => ({ ...column, runs: [] as T[] }));
   const byID = new Map(board.map((column) => [column.id, column]));
   for (const run of runs) byID.get(runColumn(run, jobStates.get(run.id), statuses?.get(run.id)))!.runs.push(run);
   return board;

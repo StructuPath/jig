@@ -12,19 +12,22 @@
 // The count is what an operator reads — a worker started from a stripped
 // shell shows a suspiciously small one — and the full list is the cell's
 // title for when the answer is "which one is missing".
-import { useCallback } from "react";
 import { api } from "./api";
-import { formatClock, formatDuration, parseTime } from "./format";
-import { usePolled } from "./polling";
+import { formatAge, formatClock, formatDateTime, parseTime } from "./format";
+import { useDocumentTitle } from "./keyboard";
+import { useSharedPoll } from "./polling";
+import { workerCommand } from "./startHelp";
 import type { FleetMember } from "./types";
-import { Empty, ErrorBanner, Loading, StatusBadge } from "./ui";
+import { ErrorBanner, Loading, StatusBadge } from "./ui";
 
-/** heartbeatAge renders the gap between a worker's last beat and the server's own clock. */
+/**
+ * heartbeatAge renders the gap between a worker's last beat and the server's
+ * own clock, in the words every other age in the UI uses (formatAge).
+ */
 export function heartbeatAge(member: FleetMember, observedAt: string): string {
   const observed = parseTime(observedAt);
-  const beat = parseTime(member.last_heartbeat);
-  if (observed === null || beat === null) return "—";
-  return `${formatDuration(Math.max(observed - beat, 0))} ago`;
+  if (observed === null || parseTime(member.last_heartbeat) === null) return "—";
+  return formatAge(member.last_heartbeat, observed);
 }
 
 function runtimeLabel(member: FleetMember): string {
@@ -34,8 +37,8 @@ function runtimeLabel(member: FleetMember): string {
 }
 
 export function Fleet() {
-  const load = useCallback(() => api.fleet(), []);
-  const { data, error, loading } = usePolled(load, 3000, "fleet");
+  const { data, error, loading } = useSharedPoll("workers", api.fleet, 3000);
+  useDocumentTitle("Workers");
 
   if (loading && !data) return <Loading label="Loading fleet…" />;
   if (!data) return <ErrorBanner error={error} />;
@@ -72,12 +75,16 @@ export function Fleet() {
       <ErrorBanner error={error} />
 
       {workers.length === 0 ? (
-        <Empty
-          title="No workers registered"
-          detail="Nothing can claim queued work until a worker registers. Start one with `jig worker`."
-        />
+        <section className="empty">
+          <h2>No workers registered</h2>
+          <StartWorker />
+        </section>
       ) : (
         <>
+          {data.live_count === 0 && <section className="panel">
+            <h2>No worker is online</h2>
+            <StartWorker />
+          </section>}
           <table className="table">
             <thead>
               <tr>
@@ -108,7 +115,7 @@ export function Fleet() {
                   <td title={(member.env_names ?? []).join(" ")}>
                     {(member.env_names ?? []).length} names
                   </td>
-                  <td>{heartbeatAge(member, data.observed_at)}</td>
+                  <td title={formatDateTime(member.last_heartbeat)}>{heartbeatAge(member, data.observed_at)}</td>
                 </tr>
               ))}
             </tbody>
@@ -124,4 +131,13 @@ export function Fleet() {
       )}
     </div>
   );
+}
+
+/** StartWorker is the exact command that brings a worker online, per runtime. */
+function StartWorker() {
+  return <>
+    <p>Nothing can claim queued work until a worker is online. Start one in a terminal:</p>
+    <pre>{`${workerCommand("codex")}   # runs the Floor's Codex jobs\n${workerCommand()}                   # runs Claude Code workflows`}</pre>
+    <p className="subtle">Or run <code>jig start</code>, which starts the UI and a Codex worker together.</p>
+  </>;
 }

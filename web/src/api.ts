@@ -12,7 +12,8 @@ import type {
   JobDetail,
   QueueView,
   Report,
-  Run,
+  RunListItem,
+  RunListPage,
   RunView,
   WorktreeLedgerEntry,
   APIErrorBody,
@@ -31,6 +32,10 @@ export class APIError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await requestWithResponse<T>(path, init)).body;
+}
+
+async function requestWithResponse<T>(path: string, init?: RequestInit): Promise<{ body: T; response: Response }> {
   const response = await fetch(path, {
     ...init,
     headers: init?.body ? { "Content-Type": "application/json", ...init.headers } : init?.headers,
@@ -48,8 +53,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       response.status,
     );
   }
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  if (response.status === 204) return { body: undefined as T, response };
+  return { body: (await response.json()) as T, response };
 }
 
 export interface TaskOptions {
@@ -86,7 +91,14 @@ export const api = {
       targets: [{ repository, ...(ref ? { ref } : {}) }] }),
   }),
   queue: () => request<QueueView>("/api/queue"),
-  runs: () => request<Run[] | null>("/api/runs").then((runs) => runs ?? []),
+  runs: () => api.runsPage().then((page) => page.runs),
+  // One page of runs, newest first, each with its job summaries. `before` is
+  // the last run ID held; the next page's cursor is the X-Next-Before header.
+  runsPage: async (before?: string): Promise<RunListPage> => {
+    const { body, response } = await requestWithResponse<RunListItem[] | null>(
+      before ? `/api/runs?before=${encodeURIComponent(before)}` : "/api/runs");
+    return { runs: body ?? [], next: response.headers?.get("X-Next-Before") || null };
+  },
   run: (id: string) => request<RunView>(`/api/runs/${encodeURIComponent(id)}`),
   job: (id: string) => request<JobDetail>(`/api/jobs/${encodeURIComponent(id)}`),
   attempt: (id: string) => request<Attempt>(`/api/attempts/${encodeURIComponent(id)}`),

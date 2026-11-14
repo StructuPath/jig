@@ -1,6 +1,6 @@
-import { act, renderHook } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
-import { usePolled } from "./polling";
+import { act, render, renderHook } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { usePolled, useSharedPoll } from "./polling";
 
 afterEach(() => vi.useRealTimers());
 
@@ -42,4 +42,27 @@ it("ignores a pending response after changing the resource", async () => {
   await act(async () => {});
   await act(async () => { finishOld("old resource"); });
   expect(result.current.data).toBe("current resource");
+});
+
+describe("useSharedPoll", () => {
+  it("serves every reader of a key from one request and one timer", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let calls = 0;
+    const load = async () => ++calls;
+    function Reader({ every }: { every: number }) {
+      const { data } = useSharedPoll("shared-test", load, every);
+      return <span>{data ?? "…"}</span>;
+    }
+    const view = render(<><Reader every={5000} /><Reader every={3000} /></>);
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    expect(calls).toBe(1);
+    expect(view.container.textContent).toBe("11");
+    // The poll runs at the shortest interval any reader asked for.
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    expect(calls).toBe(2);
+    view.unmount();
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(calls).toBe(2);
+    vi.useRealTimers();
+  });
 });

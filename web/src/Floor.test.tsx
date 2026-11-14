@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { Floor } from "./Floor";
+import { Floor, lampsLabel } from "./Floor";
 import { Tasks } from "./Tasks";
-import type { Run } from "./types";
+import type { AttemptBrief, AttemptSummary, JobDetail, JobSummary, Run, RunListItem } from "./types";
 
 const NOW = Date.parse("2026-11-10T09:00:00Z");
 
@@ -99,53 +99,105 @@ beforeEach(() => {
 
 afterEach(() => vi.unstubAllGlobals());
 
-it("lights a finished job's row from its result, without reading its trace", async () => {
-  render(<Floor runs={[run("run-done", "accepted", "Hint when no control plane answers")]} nowMs={NOW} />);
-  // The row's cells are replaced as its job detail arrives, and the run
-  // state already reads "Accepted" before then, so the row is found through
-  // the lamps that only the finished detail produces.
-  const row = within((await screen.findByRole("img", { name: "5 of 5 stations passed" })).closest("tr") as HTMLElement);
+/**
+ * summarize is the server's job summary of a fixture's job detail: the
+ * latest attempt without its result and error bodies, the phase statuses
+ * and publish outcome read out of the result, and that attempt's records.
+ */
+function summarize(detail: JobDetail): JobSummary {
+  const attempt = detail.attempts?.at(-1);
+  const parsed = attempt?.result ? JSON.parse(attempt.result) as AttemptSummary : null;
+  const publish = parsed?.publish;
+  const latest: AttemptBrief | undefined = attempt ? (({ result: _result, error: _error, ...rest }) => ({
+    ...rest,
+    publish_hold: parsed?.publish_hold ?? attempt.publish_hold,
+    publish_state: typeof publish === "string" ? publish : publish?.state,
+    publish_code: typeof publish === "string" ? undefined : publish?.code,
+  }))(attempt) : undefined;
+  return {
+    job: { ...detail.job, run_id: detail.run_id, state: detail.job.state ?? attempt?.state ?? "queued" },
+    stations: detail.stations, delivery: detail.delivery, attempt_count: detail.attempts?.length ?? 0,
+    latest_attempt: latest,
+    phases: (parsed?.phases ?? []).map((phase) => ({ phase: phase.phase, status: phase.status, rounds: 1 })),
+    publish: (detail.publish ?? []).filter((record) => record.attempt_id === attempt?.id),
+  };
+}
+
+function listed(id: string, state: string, title: string, job?: string): RunListItem {
+  return { ...run(id, state, title), job_summaries: job ? [summarize(jobs[job] as JobDetail)] : [] };
+}
+
+it("lights a finished job's row from its summary, with no request of its own", async () => {
+  render(<Floor runs={[listed("run-done", "accepted", "Hint when no control plane answers", "job-done")]} nowMs={NOW} />);
+  const row = within(screen.getByRole("img", { name: "5 of 5 stations passed" }).closest("tr") as HTMLElement);
   expect(row.getByText("Accepted")).toBeVisible();
   expect(row.getByText("Hint when no control plane answers")).toBeVisible();
-  // Three phases plus publish and CI, all proven.
-  expect(row.getByRole("img", { name: "5 of 5 stations passed" })).toBeVisible();
+  // The project sits on the title's line, not under it.
+  expect(row.getByText("repo")).toBeVisible();
   expect(row.getByText("9m 2s")).toBeVisible();
+  expect(row.getByText("1 h ago")).toHaveAttribute("title", expect.stringMatching(/2026/));
   expect(row.getByRole("link", { name: "PR #46" })).toHaveAttribute("href", "https://github.com/owner/repo/pull/46");
-  expect(requests.some((url) => url.includes("/events"))).toBe(false);
+  expect(requests).toEqual([]);
 });
 
-it("shows a held job as held on its row", async () => {
-  render(<Floor runs={[run("run-held", "mixed", "CI concurrency group")]} nowMs={NOW} />);
-  const row = within((await screen.findByText("Held")).closest("tr") as HTMLElement);
+it("shows a held job as held on its row", () => {
+  render(<Floor runs={[listed("run-held", "mixed", "CI concurrency group", "job-held")]} nowMs={NOW} />);
+  const row = within(screen.getByText("Held").closest("tr") as HTMLElement);
   expect(row.getByText("CI concurrency group")).toBeVisible();
-  expect(row.getByRole("img", { name: "2 of 5 stations passed" })).toBeVisible();
+  // The summary carries no phase envelopes, so the row cannot tell which
+  // station's field tripped the hold; the publish lamp and the word say
+  // Held, and the job page names the station.
+  expect(row.getByRole("img", { name: "3 of 5 stations passed" })).toBeVisible();
   expect(row.getByText("held")).toBeVisible();
 });
 
-it("keeps a row lit while its run changes state", async () => {
-  const view = render(<Floor runs={[run("run-done", "active", "Hint when no control plane answers")]} nowMs={NOW} />);
-  expect(await screen.findByText("Accepted")).toBeVisible();
-  // The run list's next poll moves the run on; the row must not drop to
-  // unlit while it reads the job again.
-  view.rerender(<Floor runs={[run("run-done", "accepted", "Hint when no control plane answers")]} nowMs={NOW} />);
+it("moves a row on with the run list's next poll", () => {
+  const queued: RunListItem = { ...run("run-done", "active", "Hint when no control plane answers"),
+    job_summaries: [{ ...summarize(jobs["job-done"] as JobDetail), latest_attempt: undefined, phases: [], publish: [], job: { ...(jobs["job-done"] as JobDetail).job, state: "queued" } }] };
+  const view = render(<Floor runs={[queued]} nowMs={NOW} />);
+  expect(screen.getByText("Queued")).toBeVisible();
+  view.rerender(<Floor runs={[listed("run-done", "accepted", "Hint when no control plane answers", "job-done")]} nowMs={NOW} />);
   expect(screen.getByText("Accepted")).toBeVisible();
   expect(screen.getByRole("img", { name: "5 of 5 stations passed" })).toBeVisible();
 });
 
-it("labels a job the form kept local as kept local, not held", async () => {
-  render(<Floor runs={[run("run-local", "accepted", "Local change")]} nowMs={NOW} />);
-  const row = within((await screen.findByText("Ready to review")).closest("tr") as HTMLElement);
+it("labels a job the form kept local as kept local, not held", () => {
+  render(<Floor runs={[listed("run-local", "mixed", "Local change", "job-local")]} nowMs={NOW} />);
+  const row = within(screen.getByText("Ready to review").closest("tr") as HTMLElement);
   expect(row.getByText("kept local")).toBeVisible();
   expect(row.queryByText("held")).toBeNull();
 });
 
-it("keeps a row readable when the run has no job yet", async () => {
-  render(<Floor runs={[run("run-empty", "active", "Queued work")]} nowMs={NOW} />);
-  const row = within((await screen.findByText("Queued work")).closest("tr") as HTMLElement);
-  await waitFor(() => expect(requests).toContain("/api/runs/run-empty"));
+it("keeps a row readable when the run has no job yet", () => {
+  render(<Floor runs={[listed("run-empty", "active", "Queued work")]} nowMs={NOW} />);
+  const row = within(screen.getByText("Queued work").closest("tr") as HTMLElement);
   // Before any job exists the row reads the run state as its board card and
   // run header do.
   expect(row.getByText("In progress")).toBeVisible();
+  expect(requests).toEqual([]);
+});
+
+it("lights a running job's live station from the summary's phase progress", () => {
+  const summary: JobSummary = {
+    job: { id: "job-live", run_id: "run-live", repository: "github.com/owner/repo", base_sha: "abc", state: "active", cancellation_requested: false, created_at: "2026-11-10T08:50:00Z", updated_at: "2026-11-10T08:50:00Z" },
+    stations, delivery, attempt_count: 2,
+    latest_attempt: { id: "a-live", job_id: "job-live", attempt_number: 2, state: "running", created_at: "2026-11-10T08:50:00Z", started_at: "2026-11-10T08:50:00Z" },
+    phases: [{ phase: "plan", status: "success", rounds: 1 }, { phase: "build", status: "running", rounds: 2 }],
+    publish: [],
+  };
+  render(<Floor runs={[{ ...run("run-live", "active", "Live work"), job_summaries: [summary] }]} nowMs={NOW} />);
+  const row = within(screen.getByText("Live work").closest("tr") as HTMLElement);
+  expect(row.getByText("Running")).toBeVisible();
+  expect(row.getByText("build")).toBeVisible();
+  expect(row.getByRole("img", { name: "1 of 5 stations passed" })).toBeVisible();
+  expect(row.getByText("10m 0s")).toBeVisible();
+});
+
+it("counts a skipped station apart from the passed ones", () => {
+  expect(lampsLabel([{ state: "pass", label: "plan" }, { state: "skip", label: "review" }])).toBe("1 of 1 run stations passed, 1 skipped");
+  expect(lampsLabel([{ state: "pass", label: "plan" }, { state: "pass", label: "build" }])).toBe("2 of 2 stations passed");
+  expect(lampsLabel([{ state: "pass", label: "plan" }, { state: "bad", label: "test" }, { state: "skip", label: "publish" }]))
+    .toBe("1 of 2 run stations passed, 1 skipped; failed: test");
 });
 
 it("starts a saved workflow as itself, on the runtime it pins", async () => {
