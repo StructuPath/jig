@@ -22,7 +22,9 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -49,8 +51,11 @@ type InvocationTarget struct {
 // Instructions and Context are the two halves of the prompt: Instructions is
 // operator-authored and trusted, Context is repository/issue text and is
 // not — they are joined only by protocol.ComposeInvocationPrompt, whose
-// result is frozen as the {{prompt}} parameter.
+// result is frozen as the {{prompt}} parameter. RequestID, when set, makes
+// the invocation repeatable: a second invocation with the same key answers
+// with the run the first admitted instead of admitting another.
 type RunInvocation struct {
+	RequestID    string                      `json:"request_id,omitempty"`
 	DefinitionID string                      `json:"definition_id"`
 	Parameters   map[string]string           `json:"parameters,omitempty"`
 	Instructions string                      `json:"instructions,omitempty"`
@@ -78,16 +83,100 @@ type preparedInvocation struct {
 	snapshot     string
 	parameters   map[string]string
 	targets      []protocol.RunTarget
+	// requestID and requestDigest are the client's idempotency key and the
+	// fingerprint of the request it names; both empty when there is no key.
+	requestID     string
+	requestDigest string
+}
+
+// maxRequestIDBytes bounds a client idempotency key; a UUID is 36.
+const maxRequestIDBytes = 128
+
+// normalizeRequestID validates an optional client idempotency key. The key
+// is stored and compared verbatim, so it is restricted to a plain token
+// alphabet that no client could send two spellings of.
+func normalizeRequestID(requestID string) (string, error) {
+	if requestID == "" {
+		return "", nil
+	}
+	if len(requestID) > maxRequestIDBytes {
+		return "", invalid("invalid_request_id", "request_id is longer than 128 bytes")
+	}
+	for _, character := range requestID {
+		switch {
+		case character >= 'a' && character <= 'z', character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9', strings.ContainsRune("-_.:", character):
+		default:
+			return "", invalid("invalid_request_id",
+				"request_id may contain only letters, digits, and - _ . :")
+		}
+	}
+	return requestID, nil
+}
+
+// requestDigest fingerprints what an idempotency key was used for.
+func requestDigest(parts ...string) string {
+	hash := sha256.New()
+	for _, part := range parts {
+		hash.Write([]byte(part))
+		hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// replayRun answers a keyed admission whose key already admitted a run: the
+// same request gets that run back, a different request under the key is
+// refused. found is false when the key is unused (or there is no key).
+func (s *Store) replayRun(ctx context.Context, requestID, digest string) (RunView, bool, error) {
+	if requestID == "" {
+		return RunView{}, false, nil
+	}
+	var runID, storedDigest string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, COALESCE(request_digest, '') FROM runs WHERE request_id = ?
+	`, requestID).Scan(&runID, &storedDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunView{}, false, nil
+	}
+	if err != nil {
+		return RunView{}, false, unavailable(err)
+	}
+	if storedDigest != digest {
+		return RunView{}, true, conflict("request_id_conflict",
+			"request_id "+quote(requestID)+" already admitted run "+quote(runID)+
+				" for a different request")
+	}
+	view, err := s.RunDetail(ctx, runID)
+	return view, true, err
 }
 
 // InvokeDefinition admits one run: it freezes the definition's current
 // source, composes and freezes the prompt, pins a base SHA per target, and
 // fans out one job per target (R2, R3, KTD9).
+//
+// A keyed invocation is checked before anything slow runs: a client that
+// lost the answer to an admitted run and sends it again gets that run back,
+// not a second one, and does not wait on ref resolution twice.
 func (s *Store) InvokeDefinition(ctx context.Context, input RunInvocation) (RunView, error) {
+	requestID, err := normalizeRequestID(input.RequestID)
+	if err != nil {
+		return RunView{}, err
+	}
+	unkeyed := input
+	unkeyed.RequestID = ""
+	request, err := json.Marshal(unkeyed)
+	if err != nil {
+		return RunView{}, unavailable(err)
+	}
+	digest := requestDigest("invoke", string(request))
+	if view, found, err := s.replayRun(ctx, requestID, digest); found || err != nil {
+		return view, err
+	}
 	prepared, err := s.prepareInvocation(ctx, input)
 	if err != nil {
 		return RunView{}, err
 	}
+	prepared.requestID, prepared.requestDigest = requestID, digest
 	return s.admitRun(ctx, prepared)
 }
 
@@ -125,8 +214,17 @@ func (s *Store) prepareInvocation(ctx context.Context, input RunInvocation) (pre
 // target's head. It is the answer to "the pinned commit is no longer
 // fetchable" and to "rerun this against today's tree", and it is deliberately
 // a separate action: no retry, and no invocation, ever re-resolves a pin.
-func (s *Store) ReadmitRunAtHead(ctx context.Context, runID string) (RunView, error) {
+// requestID is the same optional idempotency key InvokeDefinition takes.
+func (s *Store) ReadmitRunAtHead(ctx context.Context, runID, requestID string) (RunView, error) {
 	var zero RunView
+	requestID, err := normalizeRequestID(requestID)
+	if err != nil {
+		return zero, err
+	}
+	digest := requestDigest("readmit", runID)
+	if view, found, err := s.replayRun(ctx, requestID, digest); found || err != nil {
+		return view, err
+	}
 	previous, err := s.Run(ctx, runID)
 	if err != nil {
 		return zero, err
@@ -143,11 +241,13 @@ func (s *Store) ReadmitRunAtHead(ctx context.Context, runID string) (RunView, er
 		return zero, err
 	}
 	return s.admitRun(ctx, preparedInvocation{
-		definitionID: previous.DefinitionID,
-		generation:   previous.DefinitionGeneration,
-		snapshot:     previous.Snapshot,
-		parameters:   previous.Parameters,
-		targets:      resolved,
+		definitionID:  previous.DefinitionID,
+		generation:    previous.DefinitionGeneration,
+		snapshot:      previous.Snapshot,
+		parameters:    previous.Parameters,
+		targets:       resolved,
+		requestID:     requestID,
+		requestDigest: digest,
 	})
 }
 
@@ -224,6 +324,22 @@ func (s *Store) resolveRefFor(ctx context.Context, identity, ref string) (string
 	return s.resolveBaseSHA(ctx, identity, ref)
 }
 
+// refResolveWaitDelay bounds how long one ref resolution waits for git's
+// helpers after git itself exits; AdmissionWriteBudget counts it.
+const refResolveWaitDelay = 5 * time.Second
+
+// AdmissionWriteBudget is how long an admitting request may take to answer:
+// every target may resolve its ref for the full GitCommandTimeout, one after
+// another, plus a margin for the transaction. The listener's 15-second
+// write timeout is far shorter, and a request that outlives it commits a
+// run whose answer the client never receives.
+func AdmissionWriteBudget(targets int) time.Duration {
+	if targets < 1 {
+		targets = 1
+	}
+	return time.Duration(targets)*(protocol.GitCommandTimeout+refResolveWaitDelay) + 30*time.Second
+}
+
 // resolveBaseSHA asks the repository itself what the ref points at right
 // now, through the only source derivable from the identity (R17: never a URL
 // from a ticket). This is the single moment a run touches a live ref.
@@ -248,7 +364,7 @@ func (s *Store) resolveBaseSHA(ctx context.Context, identity, ref string) (strin
 	// A helper git spawned (an ssh ControlMaster) can outlive git and hold
 	// the output pipe, and killing git on timeout does not reach it: bound
 	// Wait so an admission cannot hang, and keep a clean exit's output.
-	command.WaitDelay = 5 * time.Second
+	command.WaitDelay = refResolveWaitDelay
 	output, err := command.Output()
 	if errors.Is(err, exec.ErrWaitDelay) {
 		err = nil
@@ -282,6 +398,15 @@ func (s *Store) admitRun(ctx context.Context, prepared preparedInvocation) (RunV
 	}
 	defer tx.Rollback()
 	runID, jobIDs, err := admitRunTx(ctx, tx, prepared, s.now().UnixMilli())
+	var serviceError *ServiceError
+	if errors.As(err, &serviceError) && serviceError.Code == "run_request_exists" {
+		// A concurrent request with the same key committed first, while this
+		// one was resolving refs: answer with that run, exactly as a later
+		// repeat would.
+		_ = tx.Rollback()
+		view, _, replayErr := s.replayRun(ctx, prepared.requestID, prepared.requestDigest)
+		return view, replayErr
+	}
 	if err != nil {
 		return zero, err
 	}
@@ -317,10 +442,14 @@ func admitRunTx(
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO runs(id, definition_id, definition_generation, snapshot, parameters, targets,
-			state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+			state, created_at, updated_at, request_id, request_digest)
+		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
 	`, runID, prepared.definitionID, prepared.generation, prepared.snapshot,
-		string(parametersJSON), string(targetsJSON), nowMillis, nowMillis); err != nil {
+		string(parametersJSON), string(targetsJSON), nowMillis, nowMillis,
+		nullString(prepared.requestID), nullString(prepared.requestDigest)); err != nil {
+		if prepared.requestID != "" && isConstraintViolation(err) {
+			return "", nil, conflict("run_request_exists", "request_id already admitted a run")
+		}
 		return "", nil, unavailable(err)
 	}
 	jobIDs := make([]string, 0, len(prepared.targets))

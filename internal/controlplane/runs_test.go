@@ -378,7 +378,7 @@ func TestReadmittingARunAtHeadPinsANewerCommitThanTheOriginalRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	readmitted, err := store.ReadmitRunAtHead(ctx, original.Run.ID)
+	readmitted, err := store.ReadmitRunAtHead(ctx, original.Run.ID, "")
 	if err != nil {
 		t.Fatalf("re-admit at head: %v", err)
 	}
