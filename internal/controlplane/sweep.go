@@ -13,6 +13,7 @@ package controlplane
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -202,6 +203,10 @@ func (s *Store) sweepAttempt(ctx context.Context, attemptID string, nowMillis in
 	return value, true, nil
 }
 
+// maxPublishRequestInterruptions is how many interrupted retries one
+// operator publish request survives before the sweeper clears it.
+const maxPublishRequestInterruptions = 3
+
 // returnInterruptedPublishRetry is sweepAttempt's publish-retry half, inside
 // the same transaction and under the same guard: a renewal or completion
 // that landed first wins and the sweep is a no-op.
@@ -225,9 +230,31 @@ func (s *Store) returnInterruptedPublishRetry(
 		return value, false, nil
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET state = 'accepted_unpublished', updated_at = ? WHERE id = ? AND state = 'active'
+		UPDATE jobs SET state = 'accepted_unpublished', updated_at = ?,
+		    publish_request_interruptions = publish_request_interruptions +
+		        (CASE WHEN publish_requested_at IS NULL THEN 0 ELSE 1 END)
+		WHERE id = ? AND state = 'active'
 	`, nowMillis, value.JobID); err != nil {
 		return value, false, unavailable(err)
+	}
+	// The pending request is re-served after an interruption, but not
+	// forever: a retry that crashes its worker would otherwise loop. At the
+	// limit the request is cleared and the attempt says why; the job stays
+	// accepted_unpublished and a new request starts a new count (R14).
+	result, err = tx.ExecContext(ctx, `
+		UPDATE jobs SET publish_requested_at = NULL, publish_request_interruptions = 0
+		WHERE id = ? AND publish_requested_at IS NOT NULL AND publish_request_interruptions >= ?
+	`, value.JobID, maxPublishRequestInterruptions)
+	if err != nil {
+		return value, false, unavailable(err)
+	}
+	if cleared, _ := result.RowsAffected(); cleared == 1 {
+		if _, err := tx.ExecContext(ctx, `UPDATE attempts SET error = ? WHERE id = ?`,
+			fmt.Sprintf("publish retry interrupted %d times while serving one publish request; "+
+				"the request was cleared — check the worker that ran this attempt, then request the publish again",
+				maxPublishRequestInterruptions), value.AttemptID); err != nil {
+			return value, false, unavailable(err)
+		}
 	}
 	if err := applyRunAggregationForJob(ctx, tx, value.JobID, nowMillis); err != nil {
 		return value, false, err
