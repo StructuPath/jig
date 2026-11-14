@@ -65,13 +65,14 @@ func TestHelpExitsZeroOnEveryCommand(t *testing.T) {
 	commands := map[string]func(context.Context, []string, io.Writer, io.Writer) int{
 		"start": startCommand, "serve": serveCommand, "worker": workerCommand,
 		"run": runCommand, "report": reportCommand, "job": jobCommand,
-		"def": defCommand, "trigger": triggerCommand,
+		"def": defCommand, "trigger": triggerCommand, "runs": runsCommand,
+		"completion": completionCommand,
 	}
 	for name, command := range commands {
 		for _, args := range [][]string{{"--help"}, {"-h"}} {
-			if name == "job" || name == "def" || name == "trigger" {
+			if name == "job" || name == "def" || name == "trigger" || name == "runs" {
 				// The family's own help, and one subcommand's.
-				sub := map[string]string{"job": "release", "def": "invoke", "trigger": "create"}[name]
+				sub := map[string]string{"job": "release", "def": "invoke", "trigger": "create", "runs": "list"}[name]
 				for _, full := range [][]string{args, append([]string{sub}, args...)} {
 					var stdout, stderr strings.Builder
 					if code := command(context.Background(), full, &stdout, &stderr); code != exitAccepted {

@@ -8,21 +8,28 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
 )
 
-const startUsage = `Usage: jig start [--no-open] [--allow-merge]
+const startUsage = `Usage: jig start [--addr <host:port>] [--data <dir>] [--runtime <name>]
+                 [--no-open] [--allow-merge]
 
-Start Jig for one person on this machine: the control plane on
-http://127.0.0.1:8383 (unless one already answers there, with GitHub polling
-off) and a worker on your signed-in Codex, then open the UI in your browser.
-Leave it running; Ctrl+C stops the worker and any server it started.
+Start Jig for one person on this machine: the control plane on --addr
+(unless one already answers there, with GitHub polling off) and a worker on
+your signed-in agent CLI, then open the UI in your browser. Leave it
+running; Ctrl+C stops the worker and any server it started.
 
 Flags:
-  --no-open       do not open the browser; print the address instead
-  --allow-merge   allow never-held jobs to merge when their definition
-                  opts in
+  --addr <host:port>  control plane listen address (default 127.0.0.1:8383)
+  --data <dir>        data directory: the control plane uses it, and the
+                      worker uses <dir>/worker (default ~/.jig)
+  --runtime <name>    agent CLI the worker runs: codex (default) or
+                      claude-code
+  --no-open           do not open the browser; print the address instead
+  --allow-merge       allow never-held jobs to merge when their definition
+                      opts in
 
 Exit codes:
   0  stopped cleanly on Ctrl+C, or Jig was already running and ready
@@ -36,18 +43,26 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	flags := flag.NewFlagSet("jig start", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, startUsage) }
+	address := flags.String("addr", defaultServerAuthority, "control plane listen address")
+	dataDir := flags.String("data", defaultDataDir(), "data directory")
+	runtimeName := flags.String("runtime", runtimeCodex, "agent CLI runtime")
 	noOpen := flags.Bool("no-open", false, "do not open the browser")
 	allowMerge := flags.Bool("allow-merge", false, "allow exact-head merge for opted-in definitions")
 	if err := parseFlags(flags, args); err != nil {
 		return flagExit(err)
 	}
-	if flags.NArg() != 0 {
+	switch {
+	case flags.NArg() != 0:
 		return usageError(stderr, "jig start", fmt.Sprintf("unexpected argument %q", flags.Arg(0)), startUsage)
+	case *dataDir == "":
+		return usageError(stderr, "jig start", "--data is required", startUsage)
+	case unknownRuntime(*runtimeName) != "":
+		return usageError(stderr, "jig start", unknownRuntime(*runtimeName), startUsage)
 	}
-	url := "http://" + defaultServerAuthority
+	url := "http://" + *address
 	client := &http.Client{Timeout: time.Second}
 	var heartbeatAfter time.Time
-	running, ready, err := localCodexReady(ctx, client, url, heartbeatAfter, *allowMerge)
+	running, ready, err := localWorkerReady(ctx, client, url, *runtimeName, heartbeatAfter, *allowMerge)
 	if err != nil {
 		fmt.Fprintln(stderr, "jig start:", err)
 		return exitInfraFailed
@@ -60,7 +75,8 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		heartbeatAfter = time.Now()
 		fmt.Fprintln(stdout, "Starting Jig…")
 		serverDone = make(chan int, 1)
-		go func() { serverDone <- serveCommand(serverCtx, []string{"--no-github-poll"}, stdout, stderr) }()
+		serveArgs := []string{"--no-github-poll", "--addr", *address, "--data", *dataDir}
+		go func() { serverDone <- serveCommand(serverCtx, serveArgs, stdout, stderr) }()
 		defer func() { stopServer(); <-serverDone }()
 	}
 	workerCtx, stopWorker := context.WithCancel(context.WithoutCancel(ctx))
@@ -78,9 +94,10 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	defer deadline.Stop()
 	for !ready {
 		if running && workerDone == nil {
-			fmt.Fprintln(stdout, "Starting your signed-in Codex worker…")
+			fmt.Fprintf(stdout, "Starting your signed-in %s worker…\n", *runtimeName)
 			workerDone = make(chan int, 1)
-			workerArgs := []string{"--runtime", "codex"}
+			workerArgs := []string{"--runtime", *runtimeName, "--server", url,
+				"--data", filepath.Join(*dataDir, "worker")}
 			if *allowMerge {
 				workerArgs = append(workerArgs, "--allow-merge")
 			}
@@ -99,7 +116,7 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			fmt.Fprintln(stderr, "Jig could not become ready in 30 seconds. Check the startup messages above.")
 			return exitInfraFailed
 		case <-ticker.C:
-			running, ready, err = localCodexReady(ctx, client, url, heartbeatAfter, *allowMerge)
+			running, ready, err = localWorkerReady(ctx, client, url, *runtimeName, heartbeatAfter, *allowMerge)
 			if err != nil {
 				fmt.Fprintln(stderr, "jig start:", err)
 				return exitInfraFailed
@@ -140,7 +157,9 @@ func startCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 }
 
-func localCodexReady(ctx context.Context, client *http.Client, url string, heartbeatAfter time.Time, requireMerge bool) (running, ready bool, err error) {
+func localWorkerReady(
+	ctx context.Context, client *http.Client, url, runtimeName string, heartbeatAfter time.Time, requireMerge bool,
+) (running, ready bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/api/workers", nil)
 	if err != nil {
 		return false, false, err
@@ -161,14 +180,14 @@ func localCodexReady(ctx context.Context, client *http.Client, url string, heart
 		} `json:"workers"`
 	}
 	if response.StatusCode != http.StatusOK {
-		return true, false, fmt.Errorf("port 8383 did not return Jig's worker status (%s)", response.Status)
+		return true, false, fmt.Errorf("%s did not return Jig's worker status (%s)", url, response.Status)
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&fleet); err != nil {
 		return true, false, fmt.Errorf("cannot read Jig worker status: %w", err)
 	}
 	for _, worker := range fleet.Workers {
 		for _, capability := range worker.Runtimes {
-			if worker.Live && capability.Name == "codex" && (heartbeatAfter.IsZero() || !worker.Heartbeat.Before(heartbeatAfter)) {
+			if worker.Live && capability.Name == runtimeName && (heartbeatAfter.IsZero() || !worker.Heartbeat.Before(heartbeatAfter)) {
 				if requireMerge && !worker.AllowMerge {
 					continue
 				}

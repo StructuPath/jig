@@ -408,3 +408,37 @@ func assertRepositoryClean(t *testing.T, repo string) {
 		t.Fatalf("a read-only definition dirtied the repository: %q", status)
 	}
 }
+
+// ---- every full definition in the docs validates ----------------------------
+
+// A sample an operator copies out of the README and finds rejected is a doc
+// bug that reads as a product bug. Every ```yaml block in the operator docs
+// that declares both a name and phases is a whole definition, and must pass
+// the same save-time validation as the stock library.
+func TestEveryDefinitionInTheDocsValidates(t *testing.T) {
+	documents := []string{
+		filepath.Join("..", "..", "README.md"),
+		filepath.Join("..", "..", "docs", "quickstart.md"),
+		filepath.Join("..", "..", "docs", "definition-reference.md"),
+	}
+	checked := 0
+	for _, path := range documents {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for index, block := range strings.Split(string(body), "```yaml\n")[1:] {
+			source, _, _ := strings.Cut(block, "```")
+			if !strings.Contains(source, "\nphases:") || !strings.HasPrefix(source, "name:") {
+				continue
+			}
+			checked++
+			if _, err := protocol.ParseDefinition([]byte(source)); err != nil {
+				t.Errorf("%s yaml block %d does not validate: %v", path, index+1, err)
+			}
+		}
+	}
+	if checked < 3 {
+		t.Fatalf("found %d whole definitions in the docs; the README shape and the reference's two examples are expected", checked)
+	}
+}

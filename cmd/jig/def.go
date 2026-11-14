@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -53,7 +54,9 @@ Flags:
   --repo <r>       (invoke) a target repository, repeatable: a local path
                    (relative paths resolve here), file:///path, or
                    github.com/owner/repo
-  --param k=v      (invoke) an extra frozen run parameter; repeatable
+  --param k=v      (invoke) a frozen run parameter; repeatable. Every
+                   {{name}} a role's user_prompt references must be passed
+                   (validate lists them as "params:")
 
 Exit codes:
   0  success
@@ -66,11 +69,12 @@ const triggerUsage = `Usage: jig trigger <command> [flags]
 Manage standing admission triggers: cron schedules and GitHub polls.
 
 Commands:
-  create        save a trigger
+  create        save a trigger (saved disabled unless --enable)
   list          list triggers with their counters and diagnostics
   show <id>     print one trigger
-  enable <id>
-  disable <id>
+  enable <id>   start admitting runs
+  disable <id>  stop admitting runs (the stop button)
+  delete <id>   remove a disabled trigger; the runs it admitted are kept
 
 Flags may come before or after the positional arguments.
 
@@ -79,8 +83,10 @@ Create flags:
   --name <name>         human name (required)
   --kind <kind>         schedule | github_issue | github_pull_request
   --instructions <text> trusted prompt half, frozen at save (required)
-  --cron "<expr>"       (schedule) five-field expression
-  --timezone <IANA>     (schedule) e.g. America/Denver
+  --enable              start the trigger as soon as it is saved
+  --param k=v           a frozen run parameter for every run; repeatable
+  --cron "<expr>"       (schedule) five-field expression (required)
+  --timezone <IANA>     (schedule) e.g. America/Denver (required)
   --repo <r>            (schedule) target repository, repeatable;
                         (github) the single repository watched and run against
   --state <state>       (github) open | closed | all | merged
@@ -113,7 +119,7 @@ const (
 <def> is the definition's id or name. Run jig def --help for every flag.
 `
 	triggerCreateUsage = `Usage: jig trigger create --def <def> --name <name> --instructions <text> --repo <r>
-                       [--kind <kind>] [--cron <expr>] [--timezone <IANA>] [...]
+                       [--kind <kind>] [--cron <expr> --timezone <IANA>] [--enable] [...]
 
 Run jig trigger --help for every flag.
 `
@@ -130,31 +136,20 @@ const apiTimeout = 60 * time.Second
 
 // ---- jig def ---------------------------------------------------------------
 
+// defVerbs is the `jig def` vocabulary (see dispatchSubcommand).
+var defVerbs = []subcommand{
+	{name: "validate", run: func(_ context.Context, args []string, stdout, stderr io.Writer) int {
+		return defValidate(args, stdout, stderr)
+	}},
+	{name: "create", run: defCreate},
+	{name: "update", run: defUpdate},
+	{name: "list", run: defList},
+	{name: "show", run: defShow},
+	{name: "invoke", run: defInvoke},
+}
+
 func defCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprint(stderr, defUsage)
-		return exitUsage
-	}
-	switch args[0] {
-	case "validate":
-		return defValidate(args[1:], stdout, stderr)
-	case "create":
-		return defCreate(ctx, args[1:], stdout, stderr)
-	case "update":
-		return defUpdate(ctx, args[1:], stdout, stderr)
-	case "list":
-		return defList(ctx, args[1:], stdout, stderr)
-	case "show":
-		return defShow(ctx, args[1:], stdout, stderr)
-	case "invoke":
-		return defInvoke(ctx, args[1:], stdout, stderr)
-	case "help", "-h", "--help":
-		fmt.Fprint(stdout, defUsage)
-		return exitAccepted
-	default:
-		fmt.Fprintf(stderr, "jig def: unknown command %q\n\n%s", args[0], defUsage)
-		return exitUsage
-	}
+	return dispatchSubcommand(ctx, "jig def", defUsage, defVerbs, args, stdout, stderr)
 }
 
 // validationReport is the --json shape of one validated file: an agent
@@ -165,7 +160,10 @@ type validationReport struct {
 	Name   string `json:"name,omitempty"`
 	Phases int    `json:"phases,omitempty"`
 	Roles  int    `json:"roles,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Params are the run parameters the definition's prompts reference,
+	// which every invocation must pass with --param.
+	Params []string `json:"params,omitempty"`
+	Error  string   `json:"error,omitempty"`
 }
 
 // defValidate is the offline door: the same ParseDefinition the store calls
@@ -195,6 +193,7 @@ func defValidate(args []string, stdout, stderr io.Writer) int {
 				report.Name = spec.Name
 				report.Phases = len(spec.Phases)
 				report.Roles = len(spec.Roster)
+				report.Params = spec.ExpectedParameters()
 			}
 		}
 		if err != nil {
@@ -206,6 +205,9 @@ func defValidate(args []string, stdout, stderr io.Writer) int {
 		} else if !*asJSON {
 			fmt.Fprintf(stdout, "ok %s — definition %q, %d phase(s), %d role(s)\n",
 				path, report.Name, report.Phases, report.Roles)
+			if len(report.Params) > 0 {
+				fmt.Fprintf(stdout, "  params: %s\n", strings.Join(report.Params, ", "))
+			}
 		}
 		reports = append(reports, report)
 	}
@@ -353,14 +355,9 @@ func defInvoke(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	case len(repositories) == 0:
 		return usageError(stderr, "jig def invoke", "at least one --repo is required", defInvokeUsage)
 	}
-	frozen := make(map[string]string, len(parameters))
-	for _, entry := range parameters {
-		name, value, found := strings.Cut(entry, "=")
-		if !found || strings.TrimSpace(name) == "" {
-			fmt.Fprintf(stderr, "jig def invoke: --param %q is not name=value\n", entry)
-			return exitUsage
-		}
-		frozen[name] = value
+	frozen, problem := parseParameters(parameters)
+	if problem != "" {
+		return usageError(stderr, "jig def invoke", problem, defInvokeUsage)
 	}
 	targets := make([]controlplane.InvocationTarget, 0, len(repositories))
 	for _, repository := range repositories {
@@ -370,6 +367,10 @@ func defInvoke(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if err != nil {
 		fmt.Fprintf(stderr, "jig def invoke: %v\n", err)
 		return apiExit(err)
+	}
+	if code := checkParameters(ctx, *server, definitionID, flags.Arg(0), frozen,
+		"jig def invoke", defInvokeUsage, stderr); code != exitAccepted {
+		return code
 	}
 	var view controlplane.RunView
 	if err := apiCall(ctx, *server, http.MethodPost, "/api/runs", controlplane.RunInvocation{
@@ -401,6 +402,57 @@ func defInvoke(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	return exitAccepted
 }
 
+// parseParameters turns repeated --param name=value flags into the frozen
+// parameter map, or names the first malformed entry.
+func parseParameters(entries []string) (map[string]string, string) {
+	frozen := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		name, value, found := strings.Cut(entry, "=")
+		if !found || strings.TrimSpace(name) == "" {
+			return nil, fmt.Sprintf("--param %q is not name=value", entry)
+		}
+		frozen[name] = value
+	}
+	return frozen, ""
+}
+
+// checkParameters refuses an admission that would hand an agent a literal
+// {{name}}: the engine leaves an unset placeholder as it is, so the place to
+// catch a forgotten --param is here, before a run is frozen with it. The
+// definition is read from the control plane — what admission will freeze —
+// and a source this binary cannot parse is left to the server to judge.
+func checkParameters(
+	ctx context.Context, server, definitionID, reference string, frozen map[string]string,
+	command, usage string, stderr io.Writer,
+) int {
+	var definition protocol.Definition
+	if err := apiCall(ctx, server, http.MethodGet,
+		"/api/definitions/"+url.PathEscape(definitionID), nil, &definition); err != nil {
+		if isNotFound(err) {
+			err = definitionNotFound(reference)
+		}
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
+		return apiExit(err)
+	}
+	spec, err := protocol.ParseDefinition([]byte(definition.Source))
+	if err != nil {
+		return exitAccepted
+	}
+	var problems []string
+	for _, missing := range spec.ReferencedParameters() {
+		if _, set := frozen[missing.Name]; set {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf(
+			"missing_param: role %q user_prompt references {{%s}}; pass --param %s=<value>",
+			missing.Role, missing.Name, missing.Name))
+	}
+	if len(problems) == 0 {
+		return exitAccepted
+	}
+	return usageError(stderr, command, strings.Join(problems, "\n"+command+": "), usage)
+}
+
 func reportDefinition(stdout, stderr io.Writer, definition protocol.Definition, asJSON bool) int {
 	if asJSON {
 		return emitJSON(stdout, stderr, definition)
@@ -428,29 +480,22 @@ func readDefinitionSource(path string, stderr io.Writer) (string, int) {
 
 // ---- jig trigger -----------------------------------------------------------
 
+// triggerVerbs is the `jig trigger` vocabulary (see dispatchSubcommand).
+var triggerVerbs = []subcommand{
+	{name: "create", run: triggerCreate},
+	{name: "list", run: triggerList},
+	{name: "show", run: triggerShow},
+	{name: "enable", run: func(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+		return triggerSetEnabled(ctx, args, stdout, stderr, true)
+	}},
+	{name: "disable", run: func(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+		return triggerSetEnabled(ctx, args, stdout, stderr, false)
+	}},
+	{name: "delete", run: triggerDelete},
+}
+
 func triggerCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprint(stderr, triggerUsage)
-		return exitUsage
-	}
-	switch args[0] {
-	case "create":
-		return triggerCreate(ctx, args[1:], stdout, stderr)
-	case "list":
-		return triggerList(ctx, args[1:], stdout, stderr)
-	case "show":
-		return triggerShow(ctx, args[1:], stdout, stderr)
-	case "enable":
-		return triggerSetEnabled(ctx, args[1:], stdout, stderr, true)
-	case "disable":
-		return triggerSetEnabled(ctx, args[1:], stdout, stderr, false)
-	case "help", "-h", "--help":
-		fmt.Fprint(stdout, triggerUsage)
-		return exitAccepted
-	default:
-		fmt.Fprintf(stderr, "jig trigger: unknown command %q\n\n%s", args[0], triggerUsage)
-		return exitUsage
-	}
+	return dispatchSubcommand(ctx, "jig trigger", triggerUsage, triggerVerbs, args, stdout, stderr)
 }
 
 func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -464,7 +509,9 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 	state := flags.String("state", "", "github issue/pull-request state")
 	includeDrafts := flags.Bool("include-drafts", false, "include draft pull requests")
 	pollSeconds := flags.Int("poll-seconds", 0, "github poll interval in seconds")
-	var repositories, labels, baseBranches repeatedFlag
+	enable := flags.Bool("enable", false, "start the trigger as soon as it is saved")
+	var repositories, labels, baseBranches, parameters repeatedFlag
+	flags.Var(&parameters, "param", "frozen run parameter k=v (repeatable)")
 	flags.Var(&repositories, "repo", "repository (repeatable)")
 	flags.Var(&labels, "label", "required label (repeatable)")
 	flags.Var(&baseBranches, "base-branch", "pull-request base branch (repeatable)")
@@ -481,6 +528,14 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return usageError(stderr, command, "--name is required", triggerCreateUsage)
 	case len(repositories) == 0:
 		return usageError(stderr, command, "at least one --repo is required", triggerCreateUsage)
+	case *kind == controlplane.TriggerSchedule && strings.TrimSpace(*cron) == "":
+		return usageError(stderr, command, "--cron is required", triggerCreateUsage)
+	case *kind == controlplane.TriggerSchedule && strings.TrimSpace(*timezone) == "":
+		return usageError(stderr, command, "--timezone is required", triggerCreateUsage)
+	}
+	frozen, problem := parseParameters(parameters)
+	if problem != "" {
+		return usageError(stderr, command, problem, triggerCreateUsage)
 	}
 	for i := range repositories {
 		repositories[i] = cliRepository(repositories[i])
@@ -495,6 +550,9 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 		BaseBranches:        baseBranches,
 		IncludeDrafts:       *includeDrafts,
 		PollIntervalSeconds: *pollSeconds,
+	}
+	if len(frozen) > 0 {
+		config.Parameters = frozen
 	}
 	if *kind == controlplane.TriggerSchedule {
 		for _, repository := range repositories {
@@ -519,6 +577,10 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "jig trigger create: %v\n", err)
 		return apiExit(err)
 	}
+	if code := checkParameters(ctx, *server, definitionID, *definitionRef, frozen,
+		command, triggerCreateUsage, stderr); code != exitAccepted {
+		return code
+	}
 	var trigger controlplane.Trigger
 	if err := apiCall(ctx, *server, http.MethodPost, "/api/triggers", controlplane.TriggerInput{
 		Name:         *name,
@@ -532,10 +594,29 @@ func triggerCreate(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "jig trigger create: %v\n", err)
 		return apiExit(err)
 	}
+	// The store saves every trigger disabled (U6: nothing fires until the
+	// operator says so). --enable is that say, given up front.
+	if *enable {
+		if err := apiCall(ctx, *server, http.MethodPost,
+			"/api/triggers/"+url.PathEscape(trigger.ID)+"/enable", nil, &trigger); err != nil {
+			fmt.Fprintf(stderr, "jig trigger create: saved %s, but enabling it failed: %v\n", trigger.ID, err)
+			return apiExit(err)
+		}
+	}
+	var hint string
+	if !trigger.Enabled {
+		hint = "created disabled — start it with: jig trigger enable " + trigger.ID
+	}
 	if *asJSON {
+		if hint != "" {
+			fmt.Fprintln(stderr, hint)
+		}
 		return emitJSON(stdout, stderr, trigger)
 	}
 	printTrigger(stdout, trigger)
+	if hint != "" {
+		fmt.Fprintln(stdout, hint)
+	}
 	return exitAccepted
 }
 
@@ -577,6 +658,7 @@ func triggerShow(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	var trigger controlplane.Trigger
 	if err := apiCall(ctx, *server, http.MethodGet,
 		"/api/triggers/"+url.PathEscape(flags.Arg(0)), nil, &trigger); err != nil {
+		err = notFoundAs(err, "trigger", flags.Arg(0))
 		fmt.Fprintf(stderr, "jig trigger show: %v\n", err)
 		return apiExit(err)
 	}
@@ -604,6 +686,7 @@ func triggerSetEnabled(
 	var trigger controlplane.Trigger
 	if err := apiCall(ctx, *server, http.MethodPost,
 		"/api/triggers/"+url.PathEscape(flags.Arg(0))+"/"+action, nil, &trigger); err != nil {
+		err = notFoundAs(err, "trigger", flags.Arg(0))
 		fmt.Fprintf(stderr, "jig trigger %s: %v\n", action, err)
 		return apiExit(err)
 	}
@@ -611,6 +694,36 @@ func triggerSetEnabled(
 		return emitJSON(stdout, stderr, trigger)
 	}
 	printTrigger(stdout, trigger)
+	return exitAccepted
+}
+
+// triggerDelete removes a trigger. The runs it admitted are their own
+// records and stay; only the standing admission goes. The store refuses an
+// enabled trigger (U6: deleting is not the stop button), so the refusal
+// names the command that is.
+func triggerDelete(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags, server, asJSON := defFlags("jig trigger delete", stderr, triggerIDUsage("delete"))
+	if err := parseFlags(flags, args); err != nil {
+		return flagExit(err)
+	}
+	if flags.NArg() != 1 {
+		return usageError(stderr, "jig trigger delete", "exactly one trigger id is required", triggerIDUsage("delete"))
+	}
+	id := flags.Arg(0)
+	if err := apiCall(ctx, *server, http.MethodDelete,
+		"/api/triggers/"+url.PathEscape(id), nil, nil); err != nil {
+		err = notFoundAs(err, "trigger", id)
+		fmt.Fprintf(stderr, "jig trigger delete: %v\n", err)
+		var rejection *apiError
+		if errors.As(err, &rejection) && rejection.Code == "trigger_enabled" {
+			fmt.Fprintf(stderr, "stop it first with: jig trigger disable %s\n", id)
+		}
+		return apiExit(err)
+	}
+	if *asJSON {
+		return emitJSON(stdout, stderr, map[string]any{"id": id, "deleted": true})
+	}
+	fmt.Fprintf(stdout, "deleted trigger %s\n", id)
 	return exitAccepted
 }
 
@@ -708,6 +821,9 @@ func apiCall(ctx context.Context, server, method, path string, body, into any) e
 	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
+		if isNoControlPlane(err) {
+			return &noControlPlaneError{server: server}
+		}
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer response.Body.Close()

@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/StructuPath/JIG-Software-Factory/internal/controlplane"
@@ -71,6 +72,13 @@ const (
 )
 
 func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	// `jig run list` is the run verbs typed one letter short: say so rather
+	// than complain that --def is missing from a harness invocation nobody
+	// meant to make.
+	if len(args) > 0 && isRunsVerb(args[0]) && !slices.ContainsFunc(args, isDefFlag) {
+		return usageError(stderr, "jig run",
+			"did you mean: jig runs "+args[0]+"?", runsUsage)
+	}
 	flags := flag.NewFlagSet("jig run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, runUsage) }
@@ -167,6 +175,15 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return exitAccepted
 	}
 	return exitRejected
+}
+
+func isRunsVerb(word string) bool {
+	return slices.ContainsFunc(runsVerbs, func(verb subcommand) bool { return verb.name == word })
+}
+
+func isDefFlag(arg string) bool {
+	name, _, _ := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+	return strings.HasPrefix(arg, "-") && name == "def"
 }
 
 // engineExecutor wires the phase engine into DirectRun's executor seam:

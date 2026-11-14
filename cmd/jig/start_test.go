@@ -27,16 +27,16 @@ func TestLocalCodexReady(t *testing.T) {
 				io.WriteString(w, test.body)
 			}))
 			defer server.Close()
-			running, ready, err := localCodexReady(context.Background(), server.Client(), server.URL, time.Time{}, false)
+			running, ready, err := localWorkerReady(context.Background(), server.Client(), server.URL, "codex", time.Time{}, false)
 			if !running || ready != test.ready || (err != nil) != test.bad {
 				t.Fatalf("running=%t ready=%t err=%v", running, ready, err)
 			}
 			if test.ready {
-				_, ready, _ := localCodexReady(context.Background(), server.Client(), server.URL, time.Time{}, true)
+				_, ready, _ := localWorkerReady(context.Background(), server.Client(), server.URL, "codex", time.Time{}, true)
 				if ready {
 					t.Fatal("worker without merge consent must not satisfy --allow-merge")
 				}
-				_, ready, _ = localCodexReady(context.Background(), server.Client(), server.URL, time.Now(), false)
+				_, ready, _ = localWorkerReady(context.Background(), server.Client(), server.URL, "codex", time.Now(), false)
 				if ready {
 					t.Fatal("old worker heartbeat must not count after server restart")
 				}
@@ -45,7 +45,7 @@ func TestLocalCodexReady(t *testing.T) {
 	}
 	server := httptest.NewServer(http.NotFoundHandler())
 	server.Close()
-	if running, _, err := localCodexReady(context.Background(), server.Client(), server.URL, time.Time{}, false); running || err != nil {
+	if running, _, err := localWorkerReady(context.Background(), server.Client(), server.URL, "codex", time.Time{}, false); running || err != nil {
 		t.Fatalf("stopped server: running=%t err=%v", running, err)
 	}
 }

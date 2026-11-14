@@ -641,8 +641,8 @@ func (s *Store) RetryJob(ctx context.Context, jobID string) (protocol.Job, error
 		return protocol.Job{}, unavailable(err)
 	}
 	defer tx.Rollback()
-	var state string
-	err = tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&state)
+	var state, runID string
+	err = tx.QueryRowContext(ctx, `SELECT state, run_id FROM jobs WHERE id = ?`, jobID).Scan(&state, &runID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return protocol.Job{}, ErrNotFound
 	}
@@ -650,7 +650,13 @@ func (s *Store) RetryJob(ctx context.Context, jobID string) (protocol.Job, error
 		return protocol.Job{}, unavailable(err)
 	}
 	if state != protocol.JobFailed {
-		return protocol.Job{}, conflict("retry_not_allowed", "only a failed job can be retried")
+		message := "job is " + state + "; only a failed job can be retried"
+		// A cancelled job's way back is its run, re-admitted at current HEAD
+		// (KTD9's escape hatch): name the command, not just the refusal.
+		if state == protocol.JobCancelled {
+			message += " — re-admit its run: jig runs readmit " + runID
+		}
+		return protocol.Job{}, conflict("retry_not_allowed", message)
 	}
 	var attemptNumber int
 	if err := tx.QueryRowContext(ctx, `
